@@ -6,9 +6,13 @@
  * T3 turn until the cell has said which run is T3's: the 202 to its prompt,
  * or, when that answer was lost, the request id T3 sent with the prompt found
  * on the run in the cell's state or on its opening event. From then on an
- * event is the turn's exactly when it carries that run id. The tenant must
- * speak cell protocol 3: every event numbered, every connection opening with
- * `state` and the `tasks` roster, and a paged event log to read a gap back.
+ * event is the turn's exactly when it carries that run id. The run T3 owns
+ * and the last number it applied are kept on the provider thread's head ref,
+ * which the orchestrator persists and hands back when a later session resumes
+ * the thread, so a run that outlives T3 is taken back or read to its end
+ * before anything else is sent. The tenant must speak cell protocol 3: every
+ * event numbered, every connection opening with `state` and the `tasks`
+ * roster, and a paged event log to read a gap back.
  * docs/internals/provider-cell.md records the rules.
  */
 import {
@@ -207,6 +211,12 @@ const WAKE_LOST_MESSAGE =
   "The cell finished this delegated work while T3 was disconnected; its result stayed in the cell. Send another message to continue the conversation there.";
 const ALREADY_RUNNING_MESSAGE =
   "The cell is already running a turn started from another client. Wait for it to finish, then send the message again.";
+/** The run in progress is the one T3 itself started before it last stopped. */
+const OWN_RUN_RUNNING_MESSAGE =
+  "The cell is still running the turn that was in progress when T3 Code last stopped; its output will follow in this thread. Wait for it to finish, then send the message again.";
+/** The run T3 owned when it stopped ended meanwhile, and the log no longer says how. */
+const RESTORED_LOST_MESSAGE =
+  "The cell's run for the turn in progress when T3 Code last stopped ended while T3 Code was down, and how it ended could not be read back; its result stayed in the cell. Send another message to continue the conversation there.";
 const WAKE_RESET_MESSAGE =
   "The cell conversation was reset from another client before this delegated result reached T3, and the reset discarded it. Send another message to continue there.";
 const UNNAMED_RUN_MESSAGE =
@@ -266,6 +276,8 @@ interface ActiveTurn {
   readonly candidates: Array<CellRunEvent>;
   /** The cell's state at the latest reconnect while the prompt was unanswered, judged once the 202 names the run. */
   snapshot: CellSnapshot | undefined;
+  /** The thread's head has named this turn's run; the turn's end writes the head that follows it. */
+  persisted: boolean;
 }
 
 /** A run of the cell's agent loop: its id and the number of its opening event. */
@@ -298,21 +310,35 @@ interface TaskRecord {
 }
 
 /**
- * A run the cell started on its own after a child finished. Each one is
- * offered to the orchestrator as a continuation with its own message id, so
- * the continuation turn that starts for it adopts exactly its output.
+ * A run no turn owns yet whose output is waiting for one. A `wake` is a run
+ * the cell started on its own after a child finished, offered to the
+ * orchestrator as a continuation with its own message id, so the continuation
+ * turn that starts for it adopts exactly its output. A `restored` run is the
+ * one the last session owned when it ended, read from the thread's persisted
+ * head: T3's own restart continuation adopts it, and failing that it is
+ * offered as a continuation when the next turn starts.
  */
 interface PendingWake {
+  readonly kind: "wake" | "restored";
   readonly messageId: MessageId;
   readonly runId: string;
-  /** The number of the `wake` event that opened the run. */
+  /** The number of the event that opened the run, or, for a restored run, the last one the earlier session applied. */
   readonly firstSeq: number;
   readonly events: Array<CellRunEvent>;
   ended: boolean;
   /** The run ended while T3 was disconnected and could not be read back, so the buffer is incomplete. */
   lost: boolean;
+  /** The run has been offered to the orchestrator as a continuation. */
+  offered: boolean;
   /** The orchestrator persisted the continuation, so a turn for it will come. */
   dispatched: boolean;
+}
+
+/** The run the last session owned, as the thread's persisted head names it. */
+interface RestoredRun {
+  readonly runId: string;
+  /** The last number that session applied; the log is read back from here. */
+  readonly cursor: number;
 }
 
 /**
@@ -360,6 +386,24 @@ const isSettled = (status: OrchestrationV2TurnItemStatus) =>
 
 const eventType = (raw: unknown) =>
   typeof raw === "object" && raw !== null && "type" in raw ? raw.type : undefined;
+
+/**
+ * A strong head is written only while a run is T3's, naming the run and the
+ * number applied up to; a weak one names a finished turn and restores nothing.
+ */
+function readRestoredRun(
+  head: OrchestrationV2ProviderRef | null | undefined,
+): RestoredRun | undefined {
+  if (
+    !head ||
+    head.driver !== CELL_PROVIDER ||
+    head.strength !== "strong" ||
+    head.nativeId === null ||
+    head.ordinal === undefined
+  )
+    return undefined;
+  return { runId: head.nativeId, cursor: head.ordinal };
+}
 
 export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
   options: CellAdapterV2Options,
@@ -446,8 +490,10 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       let connection: Connection | undefined;
       /** Connections dropped in a row before their snapshot could be used; a usable one resets it. */
       let consecutiveBreaks = 0;
-      /** The highest sequence number applied; the first connection's `state` sets it. */
+      /** The highest sequence number applied; the first connection's `state` sets it, unless a restored run says where the last session left off. */
       let lastSeq = 0;
+      /** Where the last session left off, when it owned a run: the first connection reads the log back from here. */
+      let resumeCursor: number | undefined;
       /**
        * Message ids of dispatched continuations whose wake a `reset` dropped,
        * so the turn that comes for each can say why it carries nothing. An
@@ -486,6 +532,25 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           type: "provider_thread.updated",
           driver: CELL_PROVIDER,
           providerThread: thread,
+        });
+      });
+      /**
+       * The thread's persisted head while a run is T3's: the run, the request
+       * id its prompt was posted with, and the last number applied. The
+       * orchestrator keeps it with the provider thread and hands it back when
+       * a later session resumes the thread, so that session can take the run
+       * back if the cell still runs it, or read its end from the log.
+       */
+      const publishHead = Effect.fnUntraced(function* (turn: ActiveTurn, runId: string) {
+        turn.persisted = true;
+        yield* updateThread({
+          nativeConversationHeadRef: {
+            driver: CELL_PROVIDER,
+            nativeId: runId,
+            strength: "strong",
+            fingerprint: turn.requestId,
+            ordinal: lastSeq,
+          },
         });
       });
       const request = (
@@ -927,9 +992,13 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           threadId: turn.scope.threadId,
           providerTurn: turn.providerTurn,
         });
+        // The head names this turn, weakly, once its run is over: completed,
+        // or ended any other way after the head had named its run. A session
+        // closing with the run still in the cell leaves the strong head in
+        // place: that run is what the next session takes back.
         yield* updateThread({
           status: disposition === "broken" ? "error" : "idle",
-          ...(status === "completed"
+          ...((status === "completed" || turn.persisted) && !closed
             ? { nativeConversationHeadRef: nativeRef(turn.scope.nativeId, "weak") }
             : {}),
         });
@@ -986,20 +1055,49 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           const index = wakes.indexOf(wake);
           if (index !== -1) wakes.splice(index, 1);
         });
+      const wakeMessageId = (kind: PendingWake["kind"], runId: string) =>
+        idAllocator.derive.messageFromProviderItem({
+          driver: CELL_PROVIDER,
+          nativeItemId: `${options.instanceId}:${project}:${kind === "wake" ? "run" : "restored"}:${runId}`,
+        });
       const enqueueWake = Effect.fnUntraced(function* (opening: CellRunEvent) {
         const wake: PendingWake = {
-          messageId: idAllocator.derive.messageFromProviderItem({
-            driver: CELL_PROVIDER,
-            nativeItemId: `${options.instanceId}:${project}:run:${opening.runId}`,
-          }),
+          kind: "wake",
+          messageId: wakeMessageId("wake", opening.runId),
           runId: opening.runId,
           firstSeq: opening.seq,
           events: [],
           ended: false,
           lost: false,
+          offered: false,
           dispatched: false,
         };
         wakes.push(wake);
+        yield* offerWake(wake);
+      });
+      /**
+       * The run the last session owned is queued like a wake, so what the cell
+       * still sends for it, live or read back, is kept for the turn that
+       * adopts it. It is not offered yet: T3's own restart continuation, if one
+       * comes, adopts it, and an offer made now would queue a second turn.
+       */
+      const restoreRun = (run: RestoredRun) =>
+        Effect.sync(() => {
+          wakes.push({
+            kind: "restored",
+            messageId: wakeMessageId("restored", run.runId),
+            runId: run.runId,
+            firstSeq: run.cursor,
+            events: [],
+            ended: false,
+            lost: false,
+            offered: false,
+            dispatched: false,
+          });
+          resumeCursor = run.cursor;
+        });
+      const offerWake = Effect.fnUntraced(function* (wake: PendingWake) {
+        wake.offered = true;
         if (!thread?.appThreadId || !options.continuationRequests) return;
         const notification = backgroundWorkNotification(finishedBackground.splice(0));
         yield* options.continuationRequests.offer({
@@ -1146,7 +1244,12 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           turn.candidates.push(event);
           return;
         }
-        if (event.runId === turn.run.id) return yield* applyToTurn(turn, event);
+        if (event.runId === turn.run.id) {
+          yield* applyToTurn(turn, event);
+          // The head follows every event of the run applied, so a session that ends here resumes from here.
+          if (isActive(turn)) yield* publishHead(turn, turn.run.id);
+          return;
+        }
         if (event.seq < turn.run.firstSeq) return yield* routeUnowned(event);
         yield* finish(turn, "failed", UNOBSERVED_END_MESSAGE, "transport_error");
         return yield* routeUnowned(event);
@@ -1168,6 +1271,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
        */
       const accept = Effect.fnUntraced(function* (turn: ActiveTurn, run: CellRun) {
         turn.run = run;
+        yield* publishHead(turn, run.id);
         const candidates = turn.candidates.splice(0).toSorted((a, b) => a.seq - b.seq);
         for (const event of candidates) yield* handleRunEvent(event);
         const snapshot = turn.snapshot;
@@ -1180,6 +1284,33 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         ) {
           yield* finish(turn, "failed", UNOBSERVED_END_MESSAGE, "transport_error");
         }
+      });
+      /**
+       * A continuation turn takes a queued run: the run is the turn's from
+       * here, its buffered events are replayed into it, and what the cell
+       * still sends for it arrives live. A run that lost events to a gap, or
+       * whose end T3 could not read back, ends as lost even when its `done`
+       * was read: what the buffer holds is not the whole run.
+       */
+      const adopt = Effect.fnUntraced(function* (turn: ActiveTurn, wake: PendingWake) {
+        turn.run = { id: wake.runId, firstSeq: wake.firstSeq };
+        // The turn carries the run either way, so its end writes the head that follows it.
+        turn.persisted = true;
+        for (const event of wake.events) {
+          if (!isActive(turn)) break;
+          if (wake.lost && event.type === "done") continue;
+          yield* applyToTurn(turn, event);
+        }
+        if (!isActive(turn)) return;
+        if (wake.lost) {
+          return yield* finish(
+            turn,
+            "failed",
+            wake.kind === "restored" ? RESTORED_LOST_MESSAGE : WAKE_LOST_MESSAGE,
+            "transport_error",
+          );
+        }
+        yield* publishHead(turn, wake.runId);
       });
       const dispatch: (event: CellEvent) => Effect.Effect<void> = Effect.fnUntraced(function* (
         event: CellEvent,
@@ -1361,13 +1492,22 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         snapshot: CellSnapshot,
         roster: Extract<CellEvent, { readonly type: "tasks" }>,
       ) {
-        if (link.ordinal === 1) {
-          // Nothing before T3 attached is T3's: the first snapshot is where the cursor starts.
-          lastSeq = snapshot.seq;
+        const first = link.ordinal === 1;
+        if (first) {
           consecutiveBreaks = 0;
-          yield* reconcileTasks(roster.tasks);
-          if (ready) yield* Deferred.succeed(ready, undefined);
-          return;
+          if (resumeCursor === undefined) {
+            // Nothing before T3 attached is T3's: the first snapshot is where the cursor starts.
+            lastSeq = snapshot.seq;
+            yield* reconcileTasks(roster.tasks);
+            if (ready) yield* Deferred.succeed(ready, undefined);
+            return;
+          }
+          // The last session left off at the persisted number with a run of
+          // its own in the cell. What the cell did since is read back as after
+          // a reconnect, so that run is ended or taken back before anything is
+          // sent to the cell.
+          lastSeq = resumeCursor;
+          resumeCursor = undefined;
         }
         if (snapshot.seq < lastSeq) {
           // The cell's counter never regresses, so a snapshot below the last
@@ -1392,16 +1532,31 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           lastSeq = snapshot.seq;
           consecutiveBreaks = 0;
           yield* reconcileTasks(roster.tasks);
+          if (first && ready) yield* Deferred.succeed(ready, undefined);
           return;
         }
         const caughtUp: CatchUp =
           snapshot.seq > lastSeq ? yield* catchUp(lastSeq, snapshot.seq) : { kind: "complete" };
         if (caughtUp.kind === "failed") {
-          // The cursor stays where the replay stopped; the next connection's snapshot presents the rest of the gap again.
-          return yield* breakConnection(
-            link,
-            `could not read back the events missed while disconnected: ${caughtUp.detail}`,
+          if (!first) {
+            // The cursor stays where the replay stopped; the next connection's snapshot presents the rest of the gap again.
+            return yield* breakConnection(
+              link,
+              `could not read back the events missed while disconnected: ${caughtUp.detail}`,
+            );
+          }
+          // The thread must still attach. The restored run is given up as
+          // lost, since what the socket delivers from here is not the whole
+          // run, and the adapter attaches at the snapshot as on a first
+          // connection.
+          yield* Effect.logWarning(
+            `Could not read back the events since the last session ended: ${caughtUp.detail}; attaching at the snapshot`,
           );
+          for (const wake of wakes) wake.lost = true;
+          lastSeq = snapshot.seq;
+          yield* reconcileTasks(roster.tasks);
+          if (ready) yield* Deferred.succeed(ready, undefined);
+          return;
         }
         consecutiveBreaks = 0;
         if (lastSeq < snapshot.seq) lastSeq = snapshot.seq;
@@ -1429,6 +1584,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           // socket delivers after the snapshot is not the whole run.
           if (caughtUp.kind === "truncated" || !runsRun(snapshot, wake.runId)) wake.lost = true;
         }
+        if (first && ready) yield* Deferred.succeed(ready, undefined);
       });
       /**
        * Frames follow the connection's phase: `state` first, then the `tasks`
@@ -1660,6 +1816,10 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             }),
           ),
         );
+        // A strong head on the thread handed back is a run the last session
+        // owned when it ended; the first connection reads the log from there.
+        const restored = readRestoredRun(existing?.nativeConversationHeadRef);
+        if (restored !== undefined) yield* restoreRun(restored);
         const createdAt = yield* DateTime.now;
         thread = existing
           ? {
@@ -1707,6 +1867,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
               ready = undefined;
               thread = undefined;
               project = undefined;
+              resumeCursor = undefined;
+              wakes.splice(0);
               const fiber = socketFiber;
               socketFiber = undefined;
               closed = true;
@@ -1810,6 +1972,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         const continuation =
           turnInput.message.createdBy === "agent" &&
           turnInput.message.creationSource === "provider";
+        const restart = turnInput.restartContinuationOfRunId !== undefined;
         const nativeId = `${project}:turn:${turnInput.providerTurnOrdinal}`;
         const startedAt = yield* DateTime.now;
         const requestId = yield* randomUuidV4;
@@ -1847,6 +2010,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           run: undefined,
           candidates: [],
           snapshot: undefined,
+          persisted: false,
         };
         yield* Effect.gen(function* () {
           thread = turnInput.providerThread;
@@ -1898,34 +2062,34 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
               "validation_error",
             );
           }
-          if (continuation) {
+          if (continuation || restart) {
             const messageId = turnInput.message.messageId;
-            const index = wakes.findIndex((wake) => wake.messageId === messageId);
-            // Only the wake this message was offered for: a continuation whose
-            // wake is gone ends with nothing, never with the next wake's output.
-            if (index === -1) {
+            // A provider continuation adopts only the wake this message was
+            // offered for, never the next wake's output. T3's own restart
+            // continuation adopts the run the last session owned, which the
+            // thread's persisted head named; with nothing restored, its text
+            // goes to the cell as a prompt like any other.
+            const index = continuation
+              ? wakes.findIndex((wake) => wake.messageId === messageId)
+              : wakes.findIndex((wake) => wake.kind === "restored");
+            if (index !== -1) return yield* adopt(turn, wakes.splice(index, 1)[0]!);
+            if (continuation) {
               return resetWakes.delete(messageId)
                 ? yield* finish(turn, "failed", WAKE_RESET_MESSAGE)
                 : yield* finish(turn, "completed");
             }
-            const wake = wakes.splice(index, 1)[0]!;
-            turn.run = { id: wake.runId, firstSeq: wake.firstSeq };
-            // A wake that lost events to a gap ends as lost even when its
-            // `done` was read: what the buffer holds is not the whole run.
-            for (const event of wake.events) {
-              if (active !== turn) break;
-              if (wake.lost && event.type === "done") continue;
-              yield* applyToTurn(turn, event);
-            }
-            if (active === turn && wake.lost) {
-              yield* finish(turn, "failed", WAKE_LOST_MESSAGE, "transport_error");
-            }
-            return;
           }
+          // No restart continuation came for the run the last session owned,
+          // so it is offered as a continuation now and its output follows this
+          // turn; a prompt sent while the cell still runs it is refused below,
+          // naming it.
+          const restored = wakes.find((wake) => wake.kind === "restored" && !wake.offered);
+          if (restored !== undefined) yield* offerWake(restored);
         }).pipe(eventPermit.withPermits(1));
         // `active` is read through a call: the guard above narrowed the captured
         // variable to undefined for the rest of this function, which is stale.
-        if (continuation || !isActive(turn)) return;
+        // A turn that adopted a run has nothing to post.
+        if (continuation || !isActive(turn) || turn.run !== undefined) return;
         const outcome = yield* request("POST", "/prompt", turnInput.message.text, {
           "x-request-id": turn.requestId,
         }).pipe(Effect.result);
@@ -1945,10 +2109,12 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             return yield* accept(turn, { id: accepted.runId, firstSeq: accepted.seq });
           }
           const refusal = readCellRefusal(response.body);
-          // A server error without the cell's own refusal in its body came
-          // from something between T3 and the cell, or from a cell that may
-          // already have started the run: an answer as lost as no answer.
-          if (response.status >= 500 && (refusal === undefined || refusal.error === null)) {
+          // A server error whose body is not the cell's own refusal, whatever
+          // else it carries (a proxy's HTML, a gateway's JSON error, nothing
+          // readable), came from something between T3 and the cell, or from a
+          // cell that may already have started the run: an answer as lost as
+          // no answer. Only the refusal shape itself fails the turn outright.
+          if (response.status >= 500 && refusal === undefined) {
             return yield* resolveLostPrompt(
               turn,
               `the cell answered ${response.status} to the prompt`,
@@ -1962,7 +2128,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
               turn,
               "failed",
               refusal?.runId
-                ? ALREADY_RUNNING_MESSAGE
+                ? wakes.some((wake) => wake.kind === "restored" && wake.runId === refusal.runId)
+                  ? OWN_RUN_RUNNING_MESSAGE
+                  : ALREADY_RUNNING_MESSAGE
                 : `The cell did not start the turn: ${reason || "the prompt was not started; check the tenant's model API key"}.`,
             );
           }

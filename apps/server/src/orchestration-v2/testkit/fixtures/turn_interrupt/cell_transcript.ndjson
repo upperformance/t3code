@@ -5,7 +5,7 @@
 {"type":"emit_inbound","label":"ws:state#1","frame":{"kind":"ws_event","event":{"type":"state","protocol":3,"version":"0.4.0","model":"gpt-6-astra","running":false,"runId":null,"requestId":null,"seq":0,"configured":true,"turns":0,"sockets":1,"parent":null,"depth":0,"tasks":0}}}
 {"type":"emit_inbound","label":"ws:tasks#1","frame":{"kind":"ws_event","event":{"type":"tasks","tasks":[],"seq":0}}}
 {"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Do not answer immediately. First run the local shell command `sleep 30`, then respond with exactly: interrupt fixture should not finish naturally."}}
-{"type":"emit_inbound","label":"ws:user#1","frame":{"kind":"ws_event","event":{"type":"user","text":"Do not answer immediately. First run the local shell command `sleep 30`, then respond with exactly: interrupt fixture should not finish naturally.","requestId":"<request-id>","runId":"run-1","origin":"user","seq":1}}}
+{"type":"emit_inbound","label":"ws:user#1","frame":{"kind":"ws_event","event":{"type":"user","text":"Do not answer immediately. First run the local shell command `sleep 30`, then respond with exactly: interrupt fixture should not finish naturally.","requestId":"<request-id:1>","runId":"run-1","origin":"user","seq":1}}}
 {"type":"emit_inbound","label":"ws:shell#1","frame":{"kind":"ws_event","event":{"type":"shell","command":"sleep 30","runId":"run-1","seq":2}}}
 {"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":"{\"runId\":\"run-1\",\"seq\":1}"}}
 {"type":"expect_outbound","label":"POST /cell/<project>/cancel","frame":{"kind":"http","method":"POST","path":"/cell/<project>/cancel"}}

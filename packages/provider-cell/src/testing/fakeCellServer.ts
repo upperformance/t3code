@@ -22,6 +22,8 @@ export type FakeCellStep =
       readonly exitCode: number;
     }
   | { readonly type: "shell_until_cancel"; readonly command: string }
+  /** The run waits here until the test releases it, so a test can act while the run is in progress. */
+  | { readonly type: "hold"; readonly until: Promise<void> }
   | {
       readonly type: "tool";
       readonly name: string;
@@ -350,6 +352,9 @@ export async function startFakeCellServer(
               timedOut: false,
               ...scope,
             });
+            break;
+          case "hold":
+            await step.until;
             break;
           case "shell_until_cancel": {
             broadcast(target, { type: "shell", command: step.command, ...scope });

@@ -134,9 +134,17 @@ describe("prompt and cancel answers", () => {
       runId: null,
       error: "The prompt is empty",
     });
-    // A proxy's error page is nobody's refusal.
+    // A proxy's error page is nobody's refusal, and neither is a gateway's
+    // JSON error without the run, nor a body naming no run and no reason.
     expect(readCellRefusal("The prompt was not started")).toBeUndefined();
     expect(readCellRefusal("<html>502 Bad Gateway</html>")).toBeUndefined();
+    expect(readCellRefusal('{"error":"upstream reset"}')).toBeUndefined();
+    expect(readCellRefusal('{"runId":null}')).toBeUndefined();
+    expect(readCellRefusal("")).toBeUndefined();
+    expect(readCellRefusal('{"runId":"run-3","error":"busy"}')).toEqual({
+      runId: "run-3",
+      error: "busy",
+    });
   });
 });
 

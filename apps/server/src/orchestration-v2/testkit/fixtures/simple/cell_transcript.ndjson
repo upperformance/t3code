@@ -5,7 +5,7 @@
 {"type":"emit_inbound","label":"ws:state#1","frame":{"kind":"ws_event","event":{"type":"state","protocol":3,"version":"0.4.0","model":"gpt-6-astra","running":false,"runId":null,"requestId":null,"seq":0,"configured":true,"turns":0,"sockets":1,"parent":null,"depth":0,"tasks":0}}}
 {"type":"emit_inbound","label":"ws:tasks#1","frame":{"kind":"ws_event","event":{"type":"tasks","tasks":[],"seq":0}}}
 {"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Respond with the following text: fixture simple ok"}}
-{"type":"emit_inbound","label":"ws:user#1","frame":{"kind":"ws_event","event":{"type":"user","text":"Respond with the following text: fixture simple ok","requestId":"<request-id>","runId":"run-1","origin":"user","seq":1}}}
+{"type":"emit_inbound","label":"ws:user#1","frame":{"kind":"ws_event","event":{"type":"user","text":"Respond with the following text: fixture simple ok","requestId":"<request-id:1>","runId":"run-1","origin":"user","seq":1}}}
 {"type":"emit_inbound","label":"ws:assistant#1","frame":{"kind":"ws_event","event":{"type":"assistant","text":"fixture simple ok","runId":"run-1","seq":2}}}
 {"type":"emit_inbound","label":"ws:done#1","frame":{"kind":"ws_event","event":{"type":"done","runId":"run-1","seq":3}}}
 {"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":"{\"runId\":\"run-1\",\"seq\":1}"}}

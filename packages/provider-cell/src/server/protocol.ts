@@ -215,10 +215,11 @@ export type CellPromptAccepted = typeof CellPromptAccepted.Type;
  * cell gives one. A 409 to a prompt names the active run; an empty prompt, a
  * missing API key or a cell busy with a fork or reset carry `runId: null`
  * and `error`; a cancel naming a run other than the active one answers the
- * active run's id and cancels nothing.
+ * active run's id and cancels nothing. `runId` is always present: a body
+ * without it, whatever else it carries, is not the cell's.
  */
 export const CellRefusal = Schema.Struct({
-  runId: Schema.optional(Schema.NullOr(Schema.String)),
+  runId: Schema.NullOr(Schema.String),
   error: Schema.optional(Schema.String),
 });
 
@@ -249,12 +250,18 @@ export function readPromptAccepted(body: string): CellPromptAccepted | undefined
   return Option.getOrUndefined(decodePromptAccepted(body));
 }
 
-/** The cell's own refusal, when the body is one; a proxy's error page or an empty body is not. */
+/**
+ * The cell's own refusal, when the body is exactly its shape: JSON with
+ * `runId` present, naming the run in progress or null with a string `error`.
+ * A proxy's error page, a gateway's `{ "error": ... }` without `runId`, an
+ * empty body or `{ "runId": null }` alone is not one: an answer like that
+ * says nothing about whether the cell started the run.
+ */
 export function readCellRefusal(body: string): CellRefusal | undefined {
   const refusal = Option.getOrUndefined(decodeRefusal(body));
-  return refusal === undefined
-    ? undefined
-    : { runId: refusal.runId ?? null, error: refusal.error ?? null };
+  if (refusal === undefined) return undefined;
+  if (refusal.runId === null && refusal.error === undefined) return undefined;
+  return { runId: refusal.runId, error: refusal.error ?? null };
 }
 
 export type CellDoneOutcome =

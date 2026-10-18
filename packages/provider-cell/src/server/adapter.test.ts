@@ -193,10 +193,12 @@ const turnInput = Effect.fnUntraced(function* (
   ordinal = 1,
   origin: {
     readonly createdBy: "user" | "agent";
-    readonly creationSource: "web" | "provider";
+    readonly creationSource: "web" | "provider" | "server";
     readonly messageId?: MessageId;
     readonly runtimePolicy?: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
     readonly model?: string;
+    /** The run T3's own restart continuation resumes, as the orchestrator names it. */
+    readonly restartContinuationOfRunId?: RunId;
   } = { createdBy: "user", creationSource: "web" },
 ): Effect.fn.Return<ProviderAdapter.ProviderAdapterV2TurnInput> {
   const now = yield* DateTime.now;
@@ -234,6 +236,9 @@ const turnInput = Effect.fnUntraced(function* (
     attemptId: RunAttemptId.make(`attempt-${ordinal}`),
     rootNodeId: NodeId.make(`root-${ordinal}`),
     providerThread,
+    ...(origin.restartContinuationOfRunId === undefined
+      ? {}
+      : { restartContinuationOfRunId: origin.restartContinuationOfRunId }),
     message: {
       messageId: origin.messageId ?? MessageId.make(`message-${ordinal}`),
       text,
@@ -614,6 +619,138 @@ describe("CellAdapterV2 over the fake cell", () => {
       assert.equal((yield* resumed.takeEvent("turn.terminal")).status, "completed");
       assert.deepEqual(fake.prompts(project), ["Respond with exactly: later"]);
     }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  /**
+   * A session that owns a run in progress and ends with it still running, as
+   * on a server stop: the cell holds the run until `release`, and `persisted`
+   * is the provider thread as the orchestrator last stored it, with the head
+   * naming the run at the number the session had applied.
+   */
+  const interruptedSession = Effect.fnUntraced(function* () {
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fake = yield* fakeCell({
+      script: () => [
+        { type: "assistant", text: "FIRST_HALF" },
+        { type: "hold", until: held },
+        { type: "assistant", text: "SECOND_HALF" },
+      ],
+    });
+    const transport = yield* liveTransport;
+    const made = yield* makeAdapter(transport, fake.baseUrl);
+    const project = yield* cellProjectName("t3-", THREAD_ID);
+    const sessionScope = yield* Scope.make();
+    const collectorScope = yield* Effect.scope;
+    const first = yield* openHarness(made, { collectorScope }).pipe(Scope.provide(sessionScope));
+    yield* first.runtime.startTurn(yield* turnInput(first.providerThread, "Work"));
+    // The head follows the run: after the first answer it names the run at that number.
+    const persisted = yield* first.takeEvent(
+      "provider_thread.updated",
+      (event) =>
+        event.providerThread.nativeConversationHeadRef?.nativeId === "run-1" &&
+        (event.providerThread.nativeConversationHeadRef.ordinal ?? 0) >= 2,
+    );
+    yield* Scope.close(sessionScope, Exit.void);
+    yield* Fiber.await(first.collector);
+    const closing = first.allEvents.findLast((event) => event.type === "provider_thread.updated");
+    assert.equal(
+      closing?.type === "provider_thread.updated"
+        ? closing.providerThread.nativeConversationHeadRef?.strength
+        : undefined,
+      "strong",
+      "closing the session must leave the head naming the run the cell still runs",
+    );
+    const resume = () =>
+      openHarness(made, {
+        providerSessionId: ProviderSessionId.make("session-cell-2"),
+        resume: persisted.providerThread,
+      });
+    return { fake, project, release, resume };
+  });
+
+  it.live(
+    "a restart continuation takes back the run the last session owned and carries its rest",
+    () =>
+      Effect.gen(function* () {
+        const { fake, project, release, resume } = yield* interruptedSession();
+        const resumed = yield* resume();
+        yield* resumed.runtime.startTurn(
+          yield* turnInput(resumed.providerThread, "Continue where you left off.", 2, {
+            createdBy: "agent",
+            creationSource: "server",
+            restartContinuationOfRunId: RunId.make("run-1"),
+          }),
+        );
+        // The turn owned the surviving run inside startTurn, before anything could be sent; the rest of the run is now its.
+        release();
+        const terminal = yield* resumed.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(assistantTexts(resumed.allEvents, 2), ["SECOND_HALF"]);
+        assert.deepEqual(fake.prompts(project), ["Work"], "the continuation posts no prompt");
+        const settled = resumed.allEvents.findLast(
+          (event) => event.type === "provider_thread.updated",
+        );
+        assert.equal(
+          settled?.type === "provider_thread.updated"
+            ? settled.providerThread.nativeConversationHeadRef?.strength
+            : undefined,
+          "weak",
+        );
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live("a run that ended while T3 was down settles its restart continuation from the log", () =>
+    Effect.gen(function* () {
+      const { fake, project, release, resume } = yield* interruptedSession();
+      release();
+      yield* Effect.promise(() => fake.onceIdle(project));
+      const resumed = yield* resume();
+      yield* resumed.runtime.startTurn(
+        yield* turnInput(resumed.providerThread, "Continue where you left off.", 2, {
+          createdBy: "agent",
+          creationSource: "server",
+          restartContinuationOfRunId: RunId.make("run-1"),
+        }),
+      );
+      const terminal = yield* resumed.takeEvent("turn.terminal");
+      assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+      assert.deepEqual(assistantTexts(resumed.allEvents, 2), ["SECOND_HALF"]);
+      assert.deepEqual(fake.prompts(project), ["Work"], "the continuation posts no prompt");
+    }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live(
+    "a message sent while the last session's run still runs is refused naming it, and a continuation carries it",
+    () =>
+      Effect.gen(function* () {
+        const { fake, project, release, resume } = yield* interruptedSession();
+        const resumed = yield* resume();
+        yield* resumed.runtime.startTurn(
+          yield* turnInput(resumed.providerThread, "Something new", 2),
+        );
+        const refused = yield* resumed.takeEvent("turn.terminal");
+        assert.equal(refused.status, "failed");
+        assert.include(failureOf(refused)?.message ?? "", "when T3 Code last stopped");
+        assert.deepEqual(fake.prompts(project), ["Work"]);
+        const offered = yield* resumed.takeContinuation;
+        yield* resumed.runtime.startTurn(
+          yield* turnInput(resumed.providerThread, "", 3, {
+            createdBy: "agent",
+            creationSource: "provider",
+            ...(offered.messageId === undefined ? {} : { messageId: offered.messageId }),
+          }),
+        );
+        release();
+        const terminal = yield* resumed.takeEvent(
+          "turn.terminal",
+          (event) => event.runOrdinal === 3,
+        );
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(assistantTexts(resumed.allEvents, 3), ["SECOND_HALF"]);
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
   );
 
   it.live("closing the session cancels its turn, settles its tasks and stops reconnecting", () =>
@@ -1140,7 +1277,7 @@ describe("CellAdapterV2 over a scripted socket", () => {
           expectHttp("GET", "/cell/<project>/state"),
           httpResponse(
             200,
-            stateBody({ running: true, runId: "run-1", requestId: "<request-id>", seq: 6 }),
+            stateBody({ running: true, runId: "run-1", requestId: "<request-id:1>", seq: 6 }),
           ),
           expectHttp("GET", "/cell/<project>/events?after=4&limit=1000"),
           httpResponse(
@@ -1150,7 +1287,7 @@ describe("CellAdapterV2 over a scripted socket", () => {
                 type: "user",
                 text: "Hi",
                 runId: "run-1",
-                requestId: "<request-id>",
+                requestId: "<request-id:1>",
                 seq: 5,
                 origin: "user",
               },
@@ -1706,6 +1843,32 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
         : [],
     );
   const drivenLayer = IdAllocator.layer;
+
+  it.live(
+    "a gateway's JSON error without the cell's refusal is a lost answer, owned by the opener already buffered",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* startParked(harness, "Hi");
+        yield* awaitRequests(() => cell.promptRequestIds.length, 1);
+        const requestId = cell.promptRequestIds[0]!;
+        yield* cell.send([
+          { type: "user", text: "Hi", runId: "run-1", requestId, seq: 1, origin: "user" },
+          { type: "assistant", text: "BUFFERED", runId: "run-1", seq: 2 },
+          { type: "done", runId: "run-1", seq: 3 },
+          marker(4),
+        ]);
+        yield* awaitMarker(harness);
+        // The same body as HTML would have gone through recovery; JSON without the cell's `runId` does too.
+        yield* cell.answerPrompt(502, '{"error":"upstream reset"}');
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents), ["BUFFERED"]);
+        assert.deepEqual(cell.replayRequests, [], "the opener among the candidates needs no log");
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
 
   it.live(
     "a 202 that overtakes the previous run's tail keeps the turn; a stranger after the run began still ends it",

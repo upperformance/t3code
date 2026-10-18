@@ -24,13 +24,45 @@ import {
 export const CELL_REPLAY_PROTOCOL = "cell.http-ws";
 const PROJECT_PLACEHOLDER = "<project>";
 /**
- * Stands for the `x-request-id` of the latest prompt in inbound frames: the
- * recorder puts it where the cell echoed the id, and replay binds it to the id
- * the adapter sends, so a transcript holds no minted id and a replayed opener
- * carries exactly the id the adapter is looking for.
+ * Stands for the n-th distinct `x-request-id` the adapter sent, in inbound
+ * frames: the recorder puts `<request-id:n>` where the cell echoed that id,
+ * and replay binds each placeholder to the n-th distinct id the adapter sends,
+ * so a transcript holds no minted id and a replayed opener, state or log page
+ * carries exactly the id the adapter is looking for, even when one page
+ * carries the openers of several turns.
  */
-const REQUEST_ID_PLACEHOLDER = "<request-id>";
+const requestIdPlaceholder = (index: number) => `<request-id:${index}>`;
+const REQUEST_ID_PLACEHOLDER_PATTERN = /<request-id:(\d+)>/g;
 const REQUEST_ID_HEADER = "x-request-id";
+
+/** Each distinct id is numbered once, in order of first use; a repeat keeps its number. */
+class RequestIdentities {
+  private readonly ids: Array<string> = [];
+
+  /** Records the id and answers its 1-based number. */
+  bind(id: string): number {
+    const index = this.ids.indexOf(id);
+    if (index !== -1) return index + 1;
+    this.ids.push(id);
+    return this.ids.length;
+  }
+
+  /** Writes a placeholder over every recorded id in `text`. */
+  anonymize(text: string): string {
+    return this.ids.reduce(
+      (result, id, index) => result.replaceAll(id, requestIdPlaceholder(index + 1)),
+      text,
+    );
+  }
+
+  /** Writes the recorded ids over the placeholders in `text`; one not yet bound stays as written. */
+  restore(text: string): string {
+    return text.replace(
+      REQUEST_ID_PLACEHOLDER_PATTERN,
+      (placeholder, index: string) => this.ids[Number(index) - 1] ?? placeholder,
+    );
+  }
+}
 
 export const CellReplayFrame = Schema.Union([
   Schema.Struct({
@@ -128,7 +160,7 @@ export class CellReplayController {
   private failure: CellReplayMismatchError | undefined;
   private listener: Listener | undefined;
   private boundProject: string | undefined;
-  private boundRequestId: string | undefined;
+  private readonly requestIds = new RequestIdentities();
   private chain: Promise<void> = Promise.resolve();
   private readonly abort = new AbortController();
   private readonly entries: ReadonlyArray<ProviderReplayEntry>;
@@ -190,7 +222,7 @@ export class CellReplayController {
         if (!this.takeOutbound(actual, project)) {
           return { kind: "failure", error: this.fail(operation) };
         }
-        if (requestId !== undefined) this.boundRequestId = requestId;
+        if (requestId !== undefined) this.requestIds.bind(requestId);
         // The cell broadcasts a prompt's first events before it answers 202, so
         // the socket frames recorded ahead of the response are delivered first.
         const response = await this.deliverInbound({ untilResponse: true });
@@ -347,11 +379,9 @@ export class CellReplayController {
     return undefined;
   }
 
-  /** The latest prompt's request id stands in for its placeholder in what the cell sends back. */
+  /** The adapter's own request ids stand in for their placeholders in what the cell sends back. */
   private bind(text: string): string {
-    return this.boundRequestId === undefined
-      ? text
-      : text.replaceAll(REQUEST_ID_PLACEHOLDER, this.boundRequestId);
+    return this.requestIds.restore(text);
   }
 
   /** Socket frames are delivered as soon as the transcript reaches them. */
@@ -392,10 +422,9 @@ export function makeRecordingCellTransport(
   options: { readonly gate?: CellReplayGate } = {},
 ): CellTransport {
   const eventCounts = new Map<string, number>();
-  let requestId: string | undefined;
-  /** The cell echoes the prompt's request id on its run; the transcript keeps the placeholder instead. */
-  const anonymizeRequestId = (text: string) =>
-    requestId === undefined ? text : text.replaceAll(requestId, REQUEST_ID_PLACEHOLDER);
+  const requestIds = new RequestIdentities();
+  /** The cell echoes a prompt's request id on its run; the transcript keeps that id's placeholder instead. */
+  const anonymizeRequestId = (text: string) => requestIds.anonymize(text);
   const record = (type: "expect_outbound" | "emit_inbound", frame: CellReplayFrame): string => {
     let label: string;
     if (frame.kind === "http") {
@@ -414,7 +443,8 @@ export function makeRecordingCellTransport(
   return {
     request: (request) =>
       Effect.gen(function* () {
-        requestId = requestIdOf(request) ?? requestId;
+        const requestId = requestIdOf(request);
+        if (requestId !== undefined) requestIds.bind(requestId);
         record("expect_outbound", {
           kind: "http",
           method: request.method,
