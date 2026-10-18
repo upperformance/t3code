@@ -72,11 +72,31 @@ cannot confirm is reported as failed with a note saying whether to send it
 again or to look in the cell for its result.
 
 If T3 Code stops while the cell is working on a message, the cell keeps
-working. When T3 Code starts again it takes that run back: the turn it
-resumes shows what the cell has done since and ends when the cell does, and
-nothing new is sent to the cell until then. If the cell finished while T3
-Code was down, the resumed turn shows the rest of the result at once. A
-message sent while that earlier run is still going is refused with a note
-saying so; wait for it to finish, then send the message again. Only a message
-whose acceptance had not yet reached T3 Code when it stopped is not taken
-back; the next message to that cell is refused until the run finishes.
+working, and so does any task the agent delegated to a child cell. T3 Code
+remembers, with the thread, which run is its own and how far into it the
+thread had got, saving that point after every piece of output it shows. The
+next session to open the thread starts from that saved point: it asks the
+cell for everything since, shows what the cell did meanwhile, and if the cell
+is still on that run, follows it to its end before sending anything new.
+
+When the project continues threads after a restart (the default; **Continue threads
+after restarts** in Settings turns it off), T3 Code opens the
+thread by itself when it starts again and resumes the turn this way; the turn
+posts no new message to the cell. It does not do so for a thread that is
+archived, snoozed or settled, and nothing it restarts can be a message whose
+acceptance had not yet reached T3 Code when it stopped: that run is not T3
+Code's to take back, and the next message to that cell is refused until it
+finishes. With automatic continuation off, the run is taken back when you
+next send a message: if the cell is still on it, that message is refused with
+a note saying so, and the earlier run's rest follows in the thread; send the
+message again once it has finished.
+
+What the next session can show is bounded by what the cell still holds. The
+cell keeps a bounded log of its recent events; if more happened than it kept,
+or the conversation was reset from the cell's page meanwhile, the resumed turn
+is reported as failed with a note saying so, and the cell's own page has the
+full transcript. The last piece of output shown before T3 Code stopped may
+appear again after the restart. A delegated task still running at the restart
+is shown as cancelled in the thread, which can no longer follow it; the task
+itself runs on, and when it finishes the cell wakes the thread with its result
+as usual, provided the thread is open at the time.

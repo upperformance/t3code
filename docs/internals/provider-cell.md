@@ -420,12 +420,28 @@ and Pi uses for its session leaf; `OrchestrationV2ProviderSession` has no
 field of its own for adapter state, and `nativeMetadata` is a closed struct.
 While a run is T3's the head is a strong ref: `nativeId` is the cell's run
 id, `fingerprint` the `x-request-id` the prompt was posted with, `ordinal`
-the last sequence number applied. It is written when the 202, the request id
-or a wake's adoption names the run, and again after every event of the run
-applied, so that it always says where T3 left off; when the turn ends in any
-way but the session closing it is replaced by the weak ref to the finished
-turn that was already written on completion. A closing session leaves the
-strong head in place: that run is what the next session takes back.
+the number up to which the run's output is applied. It is written when the
+202, the request id or a wake's adoption names the run, and again after every
+event of the run applied, so that it always says where T3 left off; when the
+turn ends in any way but the session closing it is replaced by the weak ref
+to the finished turn that was already written on completion. A closing
+session leaves the strong head in place: that run is what the next session
+takes back.
+
+The number is the output cursor, never the receive cursor. The cell
+broadcasts a run's first events before it answers the prompt, so by the time
+the 202 names the run the adapter has received, and numbered past, output it
+has not yet applied: those events waited as candidates. The first head
+therefore names the number before the earliest candidate of the run (the
+opener's number less one when the opener was received, the accepted number
+less one otherwise), and each head after it names the event just applied,
+emitted behind that event's items in the same ordered stream. The
+orchestrator persists both in order, so wherever a session ends, the stored
+head names a point below which everything was shown and above which the next
+session reads the log back. Adoption of a queued run follows the same rule:
+the head starts at the number the queue started the run at (a wake's opener,
+already consumed, or the persisted number) and follows each buffered event
+replayed.
 
 A session that resumes a thread whose head is strong queues the run it names
 like a wake, with the persisted number as where the last session left off,
@@ -440,32 +456,61 @@ replay that fails on this first connection does not drop it, since the thread
 must still attach: the run is marked lost and the adapter attaches at the
 snapshot. Nothing is sent to the cell before this.
 
+A `reset` read back in that gap discards the run: the cell's conversation,
+and with it the run, is gone, and the run's `done` will never come. The
+queued entry is not dropped with the other wakes the reset clears but kept as
+a tombstone, ended and marked reset, so the turn that comes to take the run
+back finds it. Dropping it would leave the restart continuation nothing to
+adopt, and its text, a note that T3 restarted, would go to the cell as a new
+prompt.
+
 T3's own restart continuation, the message the server dispatches with
 `restartContinuationOfRunId` after a restart, adopts the queued run instead
 of posting its text: the turn owns the run from the persisted number, replays
 what was buffered, and either waits for the live `done` or settles from the
 `done` the log supplied; a lost run fails the turn as a transport error
-saying how it ended could not be read back, and the head follows the turn's
-end either way. A restart continuation that finds nothing restored posts its
-text as a prompt, like any other message. When no restart continuation comes
-(the project has `continueThreadsAfterServerUpdate` off, or the thread is
-archived, snoozed or settled), the next turn that starts offers the queued
-run to the orchestrator as a continuation, exactly as a wake is offered, so
-its output follows that turn; the offer waits for that turn because an offer
-made at resume time would queue a second turn next to a restart continuation
-that is about to adopt the same run. A message typed while the cell still
-runs the restored run is refused by the cell with 409 naming it, and the
-adapter, recognising its own run, says the turn in progress when T3 last
-stopped is still running rather than that another client runs the cell.
+saying how it ended could not be read back, a reset one fails it as a
+transport error naming the reset after what the cell did for it before, and
+the head follows the turn's end either way. A restart continuation that finds
+nothing restored posts its text as a prompt, like any other message. When no
+restart continuation comes, the next turn that starts offers the queued run
+to the orchestrator as a continuation, exactly as a wake is offered, so its
+output follows that turn; the offer waits for that turn because an offer made
+at resume time would queue a second turn next to a restart continuation that
+is about to adopt the same run. A message typed while the cell still runs the
+restored run is refused by the cell with 409 naming it, and the adapter,
+recognising its own run, says the turn in progress when T3 last stopped is
+still running rather than that another client runs the cell.
+
+Whether a restart continuation comes is the orchestrator's decision, not the
+adapter's. It comes when the project has `continueThreadsAfterServerUpdate`
+on and the thread is not archived, snoozed or settled, and when the
+orchestrator's own restart recovery leaves the run adoptable. That recovery
+records, for every provider, the background work a restart cut off (native
+subagents of the cut run, the provider thread's pending task roster) and
+tells the continuation about it in a note that is prompted as text, dropping
+`restartContinuationOfRunId` on the way, because for a local provider that
+work is gone and the agent must restart it. For a cell nothing is cut off:
+the run and its delegated tasks live on the tenant. The adapter says so with
+`sessions.backgroundWorkSurvivesRestart`, and recovery then records none of
+the cell thread's work as cancelled, so no note is written, the continuation
+keeps its `restartContinuationOfRunId`, and the adapter adopts. Recovery
+still terminalizes the rows it can no longer follow: a delegated task's
+subagent row from before the restart shows as cancelled, since the next
+session has no owner to publish its end to, while the task itself runs on and
+its completion wakes the cell, which the next session receives as a wake if
+its socket is open then.
 
 What restoration does not survive: a prompt whose 202 had not arrived when T3
 stopped, a window of one round trip in which the head names no run yet, so
 the next prompt is refused naming a run T3 cannot prove is its own; the
-events applied after the last head update the orchestrator persisted, which
-a restoring turn shows again (at most the items between two consecutive
-updates, since the head moves with every one); a `reset` or a cell recreated
-in the gap, whose run is reported lost; and the cell's own retention, since a
-gap it no longer holds cannot be read back.
+events emitted after the last head update the orchestrator persisted, which
+a restoring turn shows again (at most the items of one event, since the head
+follows every one); a cell recreated in the gap, whose run is reported lost,
+and a `reset` in it, whose run is reported reset; the cell's own retention,
+since a gap it no longer holds cannot be read back; and a wake that started
+and ended while no session was open, since a weak head restores nothing and
+the next session attaches at its first snapshot.
 
 ## Failures
 
@@ -551,7 +596,13 @@ repeat; refusals as `{ runId, error }`; a cancel that names its run; replies
 to its own clients' socket prompts; standalone errors) and answers the shared
 fixture prompts the way the cell does. The checked-in transcripts were
 recorded against the fake cell; record them against a tenant once celld
-speaks level 3 with the request id.
+speaks level 3 with the request id. The restart itself is not a transcript:
+`CellRestartAdoption.integration.test.ts` runs two orchestrator runtimes over
+one database against the fake cell, stops the first the way the server stops
+(worker halted, continuation prepared, sessions shut down, state reconciled)
+while a turn with a delegated child is in progress, and checks that the
+second takes the run back without a prompt and that no turn is told its
+background work was cancelled.
 
 The adapter's own tests cover the rules above: the rejected prompt racing
 another run's events, a 202 overtaking the previous run's tail, a stranger
