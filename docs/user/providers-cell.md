@@ -49,11 +49,16 @@ each, in order.
 Provider status checks that the tenant answers and whether it has a model API
 key. If the tenant is unreachable, messages fail until it is back.
 
+T3 Code needs a tenant whose celld speaks cell protocol 3 or later. An older
+tenant shows an error in provider status naming the protocol it speaks and the
+one T3 Code needs, and a message to it fails before anything is sent; update
+celld on the tenant.
+
 The connection to a cell may be reset while the tenant moves it; T3 Code
-reconnects on its own. On a tenant that numbers its events, T3 Code reads back
-what it missed and the turn carries on. On an older tenant a turn that was
-running during the reset is reported as failed with a note that its result
-stayed in the cell; the work is not lost, and the next message continues the
-same conversation. If someone else is using the same cell from its page on the
-tenant, a message sent meanwhile fails with a note to wait for that run to
-finish.
+reconnects on its own, reads back what it missed, and the turn carries on. If
+the tenant no longer holds the events that were missed, or the cell's run ended
+while the connection was down without saying how, the turn is reported as
+failed with a note that its result stayed in the cell; the work is not lost,
+and the next message continues the same conversation. If someone else is using
+the same cell from its page on the tenant, a message sent meanwhile fails with
+a note to wait for that run to finish.
