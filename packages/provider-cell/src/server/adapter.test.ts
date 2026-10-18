@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
@@ -74,6 +75,7 @@ const fakeCell = (
     readonly script?: FakeCellScript;
     readonly configured?: boolean;
     readonly model?: string;
+    readonly delegateDelayMs?: number;
   } = {},
 ) =>
   Effect.acquireRelease(
@@ -83,6 +85,9 @@ const fakeCell = (
         ...(options.script ? { script: options.script } : {}),
         ...(options.configured === undefined ? {} : { configured: options.configured }),
         ...(options.model === undefined ? {} : { model: options.model }),
+        ...(options.delegateDelayMs === undefined
+          ? {}
+          : { delegateDelayMs: options.delegateDelayMs }),
       }),
     ),
     (fake: FakeCellServer) => Effect.promise(() => fake.close()),
@@ -95,6 +100,8 @@ interface HarnessOptions {
   readonly modelSelection?: { readonly instanceId: ProviderInstanceId; readonly model: string };
   readonly providerSessionId?: ProviderSessionId;
   readonly resume?: OrchestrationV2ProviderThread;
+  /** The thread's open native subagent items, handed back with it on resume. */
+  readonly openNativeSubagentItems?: ReadonlyArray<ProviderAdapter.ProviderAdapterV2OpenNativeSubagentItem>;
   readonly adapterOptions?: Partial<CellAdapterV2Options>;
   /** Where the event collector runs; defaults to the session's scope. */
   readonly collectorScope?: Scope.Scope;
@@ -146,7 +153,14 @@ const openHarness = Effect.fnUntraced(function* (
     Effect.forkIn(collectorScope),
   );
   const providerThread = options.resume
-    ? yield* runtime.resumeThread({ providerThread: options.resume, modelSelection, runtimePolicy })
+    ? yield* runtime.resumeThread({
+        providerThread: options.resume,
+        modelSelection,
+        runtimePolicy,
+        ...(options.openNativeSubagentItems === undefined
+          ? {}
+          : { openNativeSubagentItems: options.openNativeSubagentItems }),
+      })
     : yield* runtime.ensureThread({ threadId: THREAD_ID, modelSelection, runtimePolicy });
   const takeEvent = Effect.fnUntraced(function* <
     T extends ProviderAdapter.ProviderAdapterV2Event["type"],
@@ -753,56 +767,208 @@ describe("CellAdapterV2 over the fake cell", () => {
       }).pipe(Effect.scoped, Effect.provide(liveLayer)),
   );
 
-  it.live("closing the session cancels its turn, settles its tasks and stops reconnecting", () =>
-    Effect.gen(function* () {
-      const fake = yield* fakeCell({
-        script: () => [
-          {
-            type: "delegate",
-            taskId: "slow",
-            title: "Slow child",
-            summary: "never",
-            wake: [],
-          },
-          { type: "shell_until_cancel", command: "sleep 30" },
-        ],
+  it.live(
+    "closing the session cancels its turn, leaves its tasks to the next session and stops reconnecting",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* fakeCell({
+          script: () => [
+            {
+              type: "delegate",
+              taskId: "slow",
+              title: "Slow child",
+              summary: "never",
+              wake: [],
+            },
+            { type: "shell_until_cancel", command: "sleep 30" },
+          ],
+        });
+        const transport = yield* liveTransport;
+        const made = yield* makeAdapter(transport, fake.baseUrl);
+        const project = yield* cellProjectName("t3-", THREAD_ID);
+        const sessionScope = yield* Scope.make();
+        const collectorScope = yield* Effect.scope;
+        const harness = yield* openHarness(made, { collectorScope }).pipe(
+          Scope.provide(sessionScope),
+        );
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Work"));
+        yield* harness.takeEvent(
+          "turn_item.updated",
+          (event) =>
+            event.turnItem.type === "command_execution" && event.turnItem.status === "running",
+        );
+        const connected = fake.onceConnected(project);
+        yield* Scope.close(sessionScope, Exit.void);
+        // The event queue shuts down with the session, which ends the collector.
+        yield* Fiber.await(harness.collector);
+        const terminal = harness.allEvents.findLast((event) => event.type === "turn.terminal");
+        assert.isTrue(
+          terminal?.type === "turn.terminal",
+          `no terminal among ${harness.allEvents.map((event) => event.type).join(", ")}`,
+        );
+        if (terminal?.type !== "turn.terminal") return;
+        assert.equal(terminal.status, "cancelled");
+        assert.equal(terminal.threadDisposition, "broken");
+        // The child runs on in the cell: its rows and the roster are left as they are.
+        const subagent = itemsOfType(harness.allEvents, "subagent").at(-1);
+        assert.equal(subagent?.status, "running");
+        const thread = harness.allEvents.findLast(
+          (event) => event.type === "provider_thread.updated",
+        );
+        assert.deepEqual(
+          thread?.type === "provider_thread.updated"
+            ? thread.providerThread.pendingBackgroundTasks?.map((task) => task.taskId)
+            : [],
+          ["slow"],
+        );
+        fake.cancelRun(project);
+        yield* Effect.promise(() => fake.onceIdle(project));
+        const raced = yield* Effect.race(
+          Effect.promise(() => connected).pipe(Effect.as("reconnected" as const)),
+          Effect.sleep("150 millis").pipe(Effect.as("quiet" as const)),
+        );
+        assert.equal(raced, "quiet");
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live(
+    "a new session takes over the rows an earlier one started for a task still running, and the task's end lands there",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* fakeCell({
+          script: () => [
+            {
+              type: "delegate",
+              taskId: "ab12",
+              title: "review",
+              summary: "The review is done.",
+              wake: [{ type: "assistant", text: "WAKE_DONE" }],
+            },
+            { type: "assistant", text: "STARTED" },
+          ],
+          // The child works on well past the first session's end.
+          delegateDelayMs: 1_500,
+        });
+        const transport = yield* liveTransport;
+        const first = yield* makeAdapter(transport, fake.baseUrl);
+        const firstScope = yield* Scope.make();
+        const collectorScope = yield* Effect.scope;
+        const earlier = yield* openHarness(first, { collectorScope }).pipe(
+          Scope.provide(firstScope),
+        );
+        yield* earlier.runtime.startTurn(yield* turnInput(earlier.providerThread, "Delegate"));
+        const terminal = yield* earlier.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        const started = itemsOfType(earlier.allEvents, "subagent").at(-1);
+        assert.isTrue(started?.type === "subagent" && started.status === "running");
+        if (started?.type !== "subagent") return;
+        const handedBack = earlier.allEvents.findLast(
+          (event) => event.type === "provider_thread.updated",
+        );
+        if (handedBack?.type !== "provider_thread.updated") return;
+        yield* Scope.close(firstScope, Exit.void);
+        yield* Fiber.await(earlier.collector);
+
+        const later = yield* makeHarness(transport, fake.baseUrl, {
+          providerSessionId: ProviderSessionId.make("session-cell-2"),
+          resume: handedBack.providerThread,
+          openNativeSubagentItems: [started],
+        });
+        const request = yield* later.takeContinuation;
+        const continuation = yield* runContinuation(later, request, 2);
+        assert.equal(continuation.status, "completed", failureOf(continuation)?.message);
+        assert.deepEqual(assistantTexts(later.allEvents, 2), ["WAKE_DONE"]);
+        const rows = later.allEvents.flatMap((event) =>
+          event.type === "subagent.updated" ? [event.subagent] : [],
+        );
+        const ended = rows.at(-1);
+        assert.equal(
+          ended?.id,
+          started.subagentId,
+          "the end lands on the row the earlier session started",
+        );
+        assert.equal(ended?.status, "completed");
+        assert.equal(ended?.result, "The review is done.");
+        assert.equal(ended?.runId, "run-2", "the turn that took the rows over owns them");
+        assert.isTrue(
+          rows.every((row) => row.id === started.subagentId),
+          "no second row is made",
+        );
+        const item = itemsOfType(later.allEvents, "subagent").at(-1);
+        assert.equal(item?.id, started.id);
+        assert.equal(item?.ordinal, started.ordinal);
+        assert.equal(item?.status, "completed");
+        const thread = later.allEvents.findLast(
+          (event) => event.type === "provider_thread.updated",
+        );
+        assert.deepEqual(
+          thread?.type === "provider_thread.updated"
+            ? (thread.providerThread.pendingBackgroundTasks ?? [])
+            : null,
+          [],
+        );
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live(
+    "a misnamed cell is reported once per session, whether its name comes from a snapshot, the recorded error read back, or a live frame",
+    () => {
+      const warnings: Array<string> = [];
+      const capture = Logger.make(({ message }) => {
+        const [text] = Array.isArray(message) ? message : [message];
+        if (typeof text === "string" && text.includes("is misnamed")) warnings.push(text);
       });
-      const transport = yield* liveTransport;
-      const made = yield* makeAdapter(transport, fake.baseUrl);
-      const project = yield* cellProjectName("t3-", THREAD_ID);
-      const sessionScope = yield* Scope.make();
-      const collectorScope = yield* Effect.scope;
-      const harness = yield* openHarness(made, { collectorScope }).pipe(
-        Scope.provide(sessionScope),
+      return Effect.gen(function* () {
+        const fake = yield* fakeCell({ script: () => [{ type: "assistant", text: "ok" }] });
+        const transport = yield* liveTransport;
+        const project = yield* cellProjectName("t3-", THREAD_ID);
+        const moved = `runtime name fake/${project}-moved, stored name fake/${project}`;
+        // Recorded before T3 attaches: the first snapshot carries it, and
+        // the error the cell recorded for it is behind that snapshot.
+        fake.misname(project, moved);
+        const harness = yield* makeHarness(transport, fake.baseUrl);
+        assert.deepEqual(warnings, [
+          `The cell ${project} of thread ${THREAD_ID} is misnamed: ${moved}`,
+        ]);
+        // Every connection's snapshot says it again.
+        const reconnected = fake.onceConnected(project);
+        fake.dropSockets();
+        yield* Effect.promise(() => reconnected);
+        // Recorded while T3 is disconnected: the next snapshot carries the
+        // new text, and the recorded error is read back from the log.
+        const renamed = `runtime name fake/${project}-again, stored name fake/${project}`;
+        fake.rejectSockets(true);
+        const connectedAgain = fake.onceConnected(project);
+        fake.dropSockets();
+        fake.misname(project, renamed);
+        fake.rejectSockets(false);
+        yield* Effect.promise(() => connectedAgain);
+        // Raised live, once more.
+        fake.misname(project, renamed);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Go"));
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(warnings, [
+          `The cell ${project} of thread ${THREAD_ID} is misnamed: ${moved}`,
+          `The cell ${project} of thread ${THREAD_ID} is misnamed: ${renamed}`,
+        ]);
+        // The next session reports what it finds once more.
+        yield* makeHarness(transport, fake.baseUrl, {
+          providerSessionId: ProviderSessionId.make("session-cell-2"),
+          resume: harness.providerThread,
+        });
+        assert.lengthOf(warnings, 3);
+        assert.equal(
+          warnings[2],
+          `The cell ${project} of thread ${THREAD_ID} is misnamed: ${renamed}`,
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(liveLayer, Logger.layer([capture], { mergeWithExisting: false })),
+        ),
       );
-      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Work"));
-      yield* harness.takeEvent(
-        "turn_item.updated",
-        (event) =>
-          event.turnItem.type === "command_execution" && event.turnItem.status === "running",
-      );
-      const connected = fake.onceConnected(project);
-      yield* Scope.close(sessionScope, Exit.void);
-      // The event queue shuts down with the session, which ends the collector.
-      yield* Fiber.await(harness.collector);
-      const terminal = harness.allEvents.findLast((event) => event.type === "turn.terminal");
-      assert.isTrue(
-        terminal?.type === "turn.terminal",
-        `no terminal among ${harness.allEvents.map((event) => event.type).join(", ")}`,
-      );
-      if (terminal?.type !== "turn.terminal") return;
-      assert.equal(terminal.status, "cancelled");
-      assert.equal(terminal.threadDisposition, "broken");
-      const subagent = itemsOfType(harness.allEvents, "subagent").at(-1);
-      assert.equal(subagent?.status, "cancelled");
-      fake.cancelRun(project);
-      yield* Effect.promise(() => fake.onceIdle(project));
-      const raced = yield* Effect.race(
-        Effect.promise(() => connected).pipe(Effect.as("reconnected" as const)),
-        Effect.sleep("150 millis").pipe(Effect.as("quiet" as const)),
-      );
-      assert.equal(raced, "quiet");
-    }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+    },
   );
 
   it.live("refuses every permission mode but Full access before and after the session opens", () =>

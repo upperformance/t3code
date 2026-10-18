@@ -45,6 +45,18 @@ export class CellProtocolError extends Schema.TaggedError<CellProtocolError>()(
   }
 }
 
+/**
+ * The cell's identity, in `GET state` and the `state` frame: its name,
+ * `<tenant>/<project>`, and `misnamed`, text saying the runtime's and the
+ * stored names disagreed when the cell was activated, or null when they
+ * agreed. The cell also records a disagreement once as a numbered standalone
+ * `error` of kind `identity`.
+ */
+const identified = {
+  name: Schema.optional(Schema.String),
+  misnamed: Schema.optional(Schema.NullOr(Schema.String)),
+};
+
 export const CellState = Schema.Struct({
   protocol: Schema.Number,
   model: Schema.String,
@@ -59,6 +71,7 @@ export const CellState = Schema.Struct({
   turns: Schema.optional(Schema.Number),
   depth: Schema.optional(Schema.Number),
   tasks: Schema.optional(Schema.Number),
+  ...identified,
 });
 export type CellState = typeof CellState.Type;
 
@@ -124,6 +137,7 @@ export const CellEvent = Schema.Union([
     type: Schema.Literal("state"),
     running: Schema.Boolean,
     runId: Schema.NullOr(Schema.String),
+    ...identified,
     ...sequenced,
   }),
   Schema.Struct({ type: Schema.Literal("tasks"), tasks: Schema.Array(CellTask), ...sequenced }),
@@ -173,7 +187,13 @@ export const CellEvent = Schema.Union([
   }),
   /** An error inside a run (a failed `apply_patch`) is the run's; one outside any run is standalone. */
   Schema.Struct({ type: Schema.Literal("error"), text: Schema.String, ...runScoped }),
-  Schema.Struct({ type: Schema.Literal("error"), text: Schema.String, ...sequenced }),
+  /** A standalone error may say what kind it is: `identity` is the misnaming `state` reports. */
+  Schema.Struct({
+    type: Schema.Literal("error"),
+    text: Schema.String,
+    kind: Schema.optional(Schema.String),
+    ...sequenced,
+  }),
   Schema.Struct({
     type: Schema.Literal("done"),
     error: Schema.optional(Schema.NullOr(CellDoneError)),

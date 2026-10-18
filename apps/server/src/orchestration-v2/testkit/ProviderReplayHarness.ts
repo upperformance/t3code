@@ -512,7 +512,13 @@ export function layerWithRegistry<Error>(
   // shut down; a test of a restart drives the shutdown half itself.
   const layerRecoveryProvided = ProviderRuntimeRecoveryService.layer.pipe(
     Layer.provide(
-      Layer.mergeAll(layerStores, layerEventSinkProvided, IdAllocator.layer, layerServerSettings),
+      Layer.mergeAll(
+        layerStores,
+        layerEventSinkProvided,
+        IdAllocator.layer,
+        layerServerSettings,
+        layerProvidedRegistry,
+      ),
     ),
   );
   const layerReplayRuntime = Layer.mergeAll(
@@ -532,7 +538,7 @@ export function layerWithRegistry<Error>(
   // the effect worker claims anything, as in serverRuntimeStartup.
   const layerStartupRecovery: Layer.Layer<
     never,
-    MigrationError | PlatformError.PlatformError | SqlError
+    Error | MigrationError | PlatformError.PlatformError | SqlError
   > =
     options.recoverOnStartup === true
       ? Layer.effectDiscard(

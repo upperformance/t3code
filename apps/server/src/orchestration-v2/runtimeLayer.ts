@@ -320,6 +320,7 @@ const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
 const layerEffectWorkerProvided = EffectWorker.layer.pipe(
   Layer.provide(Layer.merge(layerStores, layerEffectExecutorProvided)),
 );
+// The registry answers for a session record stored before a capability existed.
 const layerProviderRuntimeRecoveryProvided = ProviderRuntimeRecoveryService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -328,6 +329,7 @@ const layerProviderRuntimeRecoveryProvided = ProviderRuntimeRecoveryService.laye
       layerEventSinkProvided,
       IdAllocator.layer,
       ProjectionStore.layer,
+      layerProviderAdapterRegistryProvided,
     ),
   ),
 );

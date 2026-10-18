@@ -313,12 +313,24 @@ type CatchUp =
   | { readonly kind: "truncated"; readonly after: number; readonly upTo: number }
   | { readonly kind: "failed"; readonly detail: string };
 
+/** The rows a task is published to: its subagent node and item, and its place among the turn's items. */
+interface TaskRows extends OpenItem {
+  readonly nodeId: NodeId;
+  readonly itemId: TurnItemId;
+}
+
 /** A delegated task, remembered where it was first seen so later reports land on the same rows. */
 interface TaskRecord {
   task: CellTask;
-  readonly owner:
-    | (TurnScope & OpenItem & { readonly nodeId: NodeId; readonly itemId: TurnItemId })
-    | undefined;
+  /** The turn the task is published in and its rows there; undefined until a turn gives it a place. */
+  owner: (TurnScope & TaskRows) | undefined;
+  /**
+   * The rows an earlier session started for the task, handed back with the
+   * thread. The first turn of this session to publish the task takes them
+   * over, so the task's end lands on the rows that showed it start rather
+   * than on new ones.
+   */
+  restored: TaskRows | undefined;
   endedAt: DateTime.Utc | undefined;
 }
 
@@ -528,6 +540,32 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
        * events, so they are published again when the next turn starts.
        */
       const republish = new Set<TaskRecord>();
+      /**
+       * Rows an earlier session started for tasks still open when the thread
+       * was handed back, by task id. The first roster says which of them the
+       * cell still has; each is taken by the record of its task, or settled
+       * as cancelled when the cell no longer lists the task.
+       */
+      const restorable = new Map<string, TaskRows & { readonly title: string | undefined }>();
+      const takeRestored = (taskId: string) => {
+        const rows = restorable.get(taskId);
+        if (rows !== undefined) restorable.delete(taskId);
+        return rows;
+      };
+      /**
+       * A misnaming is the cell's diagnostic, reported where a standalone
+       * error goes: once per session, by its text, since every connection's
+       * snapshot carries it again and the error the cell recorded for it
+       * may be read back.
+       */
+      const reportedMisnamings = new Set<string>();
+      const reportMisnamed = Effect.fnUntraced(function* (misnamed: string | null | undefined) {
+        if (misnamed == null || reportedMisnamings.has(misnamed)) return;
+        reportedMisnamings.add(misnamed);
+        yield* Effect.logWarning(
+          `The cell ${project ?? "?"} of thread ${input.threadId} is misnamed: ${misnamed}`,
+        );
+      });
 
       const emit = (event: ProviderAdapter.ProviderAdapterV2Event) =>
         Queue.offer(events, event).pipe(Effect.asVoid);
@@ -614,13 +652,15 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           return yield* protocolError("The cell tenant rejected the access token");
         if (response.status !== 200)
           return yield* protocolError(`The cell answered ${response.status} to GET state`);
-        return yield* readCellState(response.body).pipe(
+        const state = yield* readCellState(response.body).pipe(
           Effect.mapError((cause) =>
             cause._tag === "CellProtocolError"
               ? cause
               : protocolError(`${baseUrl} answered GET state without a cell state`, cause),
           ),
         );
+        yield* reportMisnamed(state.misnamed);
+        return state;
       });
 
       const itemIdentity = (scopeOf: TurnScope, ordinal: number) =>
@@ -833,9 +873,27 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             : [],
         );
       const syncBackground = () => updateThread({ pendingBackgroundTasks: roster() });
+      /** The rows a task gets in a turn: the ones an earlier session started for it, or new ones allocated here. */
+      const placeIn = Effect.fnUntraced(function* (record: TaskRecord, turn: ActiveTurn) {
+        let rows = record.restored;
+        if (rows === undefined) {
+          const ordinal = allocate(turn);
+          const ids = itemIds(turn.scope, ordinal);
+          rows = { ordinal, startedAt: yield* DateTime.now, nodeId: ids.nodeId, itemId: ids.id };
+        }
+        record.restored = undefined;
+        record.owner = { ...turn.scope, ...rows };
+      });
       const publishTask = Effect.fnUntraced(function* (record: TaskRecord) {
+        if (record.owner === undefined && record.restored !== undefined && active) {
+          yield* placeIn(record, active);
+        }
         const owner = record.owner;
-        if (!owner) return;
+        if (!owner) {
+          // Rows handed back for a task no turn of this session has published yet: the next turn does.
+          if (record.restored !== undefined) republish.add(record);
+          return;
+        }
         if (!active) republish.add(record);
         const time = yield* DateTime.now;
         const status = taskStatus(record.task.status);
@@ -921,20 +979,13 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         const previousStatus = previous ? taskStatus(previous.task.status) : undefined;
         let record = previous;
         if (!record) {
-          let owner: TaskRecord["owner"];
-          if (active) {
-            const startedAt = yield* DateTime.now;
-            const ordinal = allocate(active);
-            const ids = itemIds(active.scope, ordinal);
-            owner = {
-              ...active.scope,
-              ordinal,
-              startedAt,
-              nodeId: ids.nodeId,
-              itemId: ids.id,
-            };
-          }
-          record = { task, owner, endedAt: undefined };
+          record = {
+            task,
+            owner: undefined,
+            restored: takeRestored(task.taskId),
+            endedAt: undefined,
+          };
+          if (active) yield* placeIn(record, active);
           tasks.set(task.taskId, record);
         } else {
           record.task = task;
@@ -963,7 +1014,14 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             yield* publishTask(record);
           } else {
             changed = true;
-            tasks.set(task.taskId, { task, owner: undefined, endedAt: undefined });
+            const record: TaskRecord = {
+              task,
+              owner: undefined,
+              restored: takeRestored(task.taskId),
+              endedAt: undefined,
+            };
+            tasks.set(task.taskId, record);
+            yield* publishTask(record);
           }
         }
         for (const [taskId, record] of tasks) {
@@ -975,15 +1033,20 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           }
           tasks.delete(taskId);
         }
-        if (changed) yield* syncBackground();
-      });
-      const settleTasks = Effect.fnUntraced(function* (status: "cancelled" | "failed") {
-        for (const record of tasks.values()) {
-          if (taskStatus(record.task.status) !== "running") continue;
-          record.task = { ...record.task, status };
-          yield* publishTask(record);
+        // Rows handed back for tasks the cell no longer lists: those tasks
+        // ended while no session was open, and the next turn settles the rows.
+        for (const [taskId, rows] of restorable) {
+          restorable.delete(taskId);
+          if (tasks.has(taskId)) continue;
+          changed = true;
+          yield* publishTask({
+            task: { taskId, status: "cancelled", ...(rows.title ? { title: rows.title } : {}) },
+            owner: undefined,
+            restored: rows,
+            endedAt: undefined,
+          });
         }
-        if (thread?.pendingBackgroundTasks?.length) yield* syncBackground();
+        if (changed) yield* syncBackground();
       });
       const closeOpenItems = Effect.fnUntraced(function* (
         turn: ActiveTurn,
@@ -1411,6 +1474,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             if (isCellRunEvent(event)) return yield* handleRunEvent(event);
             // An error outside any run (a cleanup that failed, a root repaired) is the cell's diagnostic, not a turn's output.
             if (event.type === "error") {
+              if (event.kind === "identity") return yield* reportMisnamed(event.text);
               return yield* Effect.logWarning(
                 `The cell reported an error outside any run (event ${event.seq}): ${event.text}`,
               );
@@ -1663,6 +1727,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             if (event.type !== "state") {
               return yield* breakConnection(link, `the cell sent ${event.type} before state`);
             }
+            yield* reportMisnamed(event.misnamed);
             const timer = yield* Effect.sleep(ROSTER_TIMEOUT_MS).pipe(
               Effect.andThen(
                 Queue.offer(inbox, { type: "roster_timeout", connection: link.ordinal }),
@@ -1826,7 +1891,10 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             active.candidates.splice(0);
             yield* finish(active, "cancelled", "Cell session closed", "provider_error", "broken");
           }
-          yield* settleTasks("cancelled");
+          // A delegated task runs on in the cell after the session closes:
+          // its rows and the thread's roster are left as they are, and the
+          // next session is handed the rows with the thread to publish the
+          // task's end to.
           yield* Queue.shutdown(inbox);
           // `end`, not `shutdown`: the terminal just emitted must still reach the consumer.
           yield* Queue.end(events);
@@ -1879,6 +1947,21 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         const restored = readRestoredRun(existing?.nativeConversationHeadRef);
         if (restored !== undefined) yield* restoreRun(restored);
         const createdAt = yield* DateTime.now;
+        // The rows an earlier session started for tasks still open: the first
+        // roster, which the socket sends before anything else, decides which
+        // of them the cell still has.
+        restorable.clear();
+        for (const item of args.openNativeSubagentItems ?? []) {
+          const taskId = item.nativeItemRef?.nativeId;
+          if (taskId == null || item.driver !== CELL_PROVIDER) continue;
+          restorable.set(taskId, {
+            nodeId: item.subagentId,
+            itemId: item.id,
+            ordinal: item.ordinal,
+            startedAt: item.startedAt ?? createdAt,
+            title: item.title ?? item.prompt,
+          });
+        }
         thread = existing
           ? {
               ...existing,
@@ -2232,6 +2315,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             modelSelection: args.modelSelection ?? input.modelSelection,
             runtimePolicy: args.runtimePolicy ?? input.runtimePolicy,
             existingProviderThread: args.providerThread,
+            ...(args.openNativeSubagentItems === undefined
+              ? {}
+              : { openNativeSubagentItems: args.openNativeSubagentItems }),
           }).pipe(
             commands.withPermits(1),
             Effect.mapError(

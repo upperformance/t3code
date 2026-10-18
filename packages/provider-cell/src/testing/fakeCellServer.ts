@@ -81,6 +81,12 @@ export interface FakeCellServer {
   ) => boolean;
   /** Broadcasts a numbered error outside any run, as the cell does when a cleanup or a report fails. */
   readonly raiseError: (project: string, text: string) => void;
+  /**
+   * Records that the runtime's and the stored names disagreed when the cell
+   * was activated: `state` carries the text as `misnamed` from here on, and
+   * it is raised once as a numbered standalone error of kind `identity`.
+   */
+  readonly misname: (project: string, text: string) => void;
   readonly close: () => Promise<void>;
 }
 
@@ -96,6 +102,8 @@ interface Run {
 type PersistedEvent = Record<string, unknown> & { readonly seq: number };
 
 interface Project {
+  /** `<tenant>/<project>`, as the cell names itself. */
+  readonly name: string;
   readonly prompts: Array<string>;
   readonly cancels: Array<string | null>;
   readonly sockets: Set<WebSocket>;
@@ -113,6 +121,7 @@ interface Project {
   seq: number;
   model: string;
   configured: boolean;
+  misnamed: string | null;
 }
 
 const PROTOCOL_LEVEL = 3;
@@ -186,6 +195,7 @@ export async function startFakeCellServer(
     let existing = projects.get(name);
     if (!existing) {
       existing = {
+        name: `fake/${name}`,
         prompts: [],
         cancels: [],
         sockets: new Set(),
@@ -201,6 +211,7 @@ export async function startFakeCellServer(
         seq: 0,
         model: options.model ?? "gpt-6-astra",
         configured: options.configured ?? true,
+        misnamed: null,
       };
       projects.set(name, existing);
     }
@@ -221,6 +232,8 @@ export async function startFakeCellServer(
     parent: null,
     depth: 0,
     tasks: target.tasks.size,
+    name: target.name,
+    misnamed: target.misnamed,
   });
   const send = (target: Project, event: Record<string, unknown>) => {
     const payload = JSON.stringify(event);
@@ -614,6 +627,11 @@ export async function startFakeCellServer(
     startForeignRun: (name, prompt, steps) =>
       startRun(project(name), prompt, "user", steps) !== undefined,
     raiseError: (name, text) => broadcast(project(name), { type: "error", text }),
+    misname: (name, text) => {
+      const target = project(name);
+      target.misnamed = text;
+      broadcast(target, { type: "error", kind: "identity", text });
+    },
     close: async () => {
       for (const timer of timers) clearTimeout(timer);
       timers.clear();

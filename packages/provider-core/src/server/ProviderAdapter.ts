@@ -397,6 +397,12 @@ export interface ProviderAdapterV2OpenSessionInput {
   readonly initialProviderItemIdentityVersion?: 2;
 }
 
+/** A provider-native subagent item of the thread, as the orchestrator stores it. */
+export type ProviderAdapterV2OpenNativeSubagentItem = Extract<
+  OrchestrationV2TurnItem,
+  { readonly type: "subagent" }
+>;
+
 export interface ProviderAdapterV2EnsureThreadInput {
   readonly threadId: ThreadId;
   readonly title?: string;
@@ -404,6 +410,14 @@ export interface ProviderAdapterV2EnsureThreadInput {
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
   readonly providerSessionId?: ProviderSessionId;
   readonly existingProviderThread?: OrchestrationV2ProviderThread;
+  /**
+   * Provider-native subagent items still open on the provider thread handed
+   * back, keyed by `nativeItemRef`. A provider whose tasks outlive the session
+   * that started them (`sessions.backgroundWorkSurvivesRestart`) publishes
+   * their end to these rows instead of to new ones; every other adapter
+   * ignores them.
+   */
+  readonly openNativeSubagentItems?: ReadonlyArray<ProviderAdapterV2OpenNativeSubagentItem>;
 }
 
 export interface ProviderAdapterV2TurnInput {
@@ -573,6 +587,8 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly threadId?: ThreadId;
     readonly modelSelection?: ModelSelection;
     readonly runtimePolicy?: ProviderAdapterV2RuntimePolicy;
+    /** As on `ensureThread`: the thread's open native subagent rows. */
+    readonly openNativeSubagentItems?: ReadonlyArray<ProviderAdapterV2OpenNativeSubagentItem>;
   }) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;
   /** False means the native protocol explicitly does not support history injection. */
   readonly injectHistory?: (

@@ -83,6 +83,24 @@ describe("readCellState", () => {
     }),
   );
 
+  it.effect("reads the cell's name and a misnaming when the state carries them", () =>
+    Effect.gen(function* () {
+      const unnamed = yield* readCellState(state({}));
+      assert.isUndefined(unnamed.name);
+      assert.isUndefined(unnamed.misnamed);
+      const agreed = yield* readCellState(state({ name: "acme/t3-abc", misnamed: null }));
+      assert.equal(agreed.name, "acme/t3-abc");
+      assert.isNull(agreed.misnamed);
+      const disagreed = yield* readCellState(
+        state({
+          name: "acme/t3-abc",
+          misnamed: "runtime name acme/t3-abd, stored name acme/t3-abc",
+        }),
+      );
+      assert.equal(disagreed.misnamed, "runtime name acme/t3-abd, stored name acme/t3-abc");
+    }),
+  );
+
   it.effect("refuses a state whose number is not a non-negative integer", () =>
     Effect.gen(function* () {
       assert.equal(
@@ -205,5 +223,38 @@ describe("classifyCellDone", () => {
     assert.isTrue(transport.kind === "failed" && transport.failureClass === "transport_error");
     const tool = classifyCellDone({ code: "tool_error", message: "tsc exited 2" });
     assert.isTrue(tool.kind === "failed" && tool.failureClass === "provider_error");
+  });
+});
+
+describe("CellEvent identity fields", () => {
+  const decode = Schema.decodeUnknownSync(CellEvent);
+
+  it("carries the cell's name and misnaming on the state frame", () => {
+    const named = decode({
+      type: "state",
+      running: false,
+      runId: null,
+      seq: 4,
+      name: "acme/t3-abc",
+      misnamed: "runtime name acme/t3-abd, stored name acme/t3-abc",
+    });
+    assert.isTrue(named.type === "state" && named.name === "acme/t3-abc");
+    assert.isTrue(
+      named.type === "state" &&
+        named.misnamed === "runtime name acme/t3-abd, stored name acme/t3-abc",
+    );
+    const plain = decode({ type: "state", running: true, runId: "run-1", seq: 5 });
+    assert.isTrue(plain.type === "state" && plain.misnamed === undefined);
+  });
+
+  it("reads the kind of a standalone error and leaves a run's error without one", () => {
+    const identity = decode({ type: "error", text: "names disagree", kind: "identity", seq: 6 });
+    assert.isTrue(identity.type === "error" && !isCellRunEvent(identity));
+    assert.isTrue(identity.type === "error" && "kind" in identity && identity.kind === "identity");
+    const plain = decode({ type: "error", text: "cleanup failed", seq: 7 });
+    assert.isTrue(plain.type === "error" && !isCellRunEvent(plain));
+    assert.isUndefined((plain as { readonly kind?: string }).kind);
+    const inRun = decode({ type: "error", text: "apply_patch failed", runId: "run-1", seq: 8 });
+    assert.isTrue(inRun.type === "error" && isCellRunEvent(inRun) && !("kind" in inRun));
   });
 });
