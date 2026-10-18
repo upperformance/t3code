@@ -3,7 +3,9 @@
  * reads the cell's broadcast events over its WebSocket, which it keeps open
  * for the life of the session and reopens whenever celld closes it. The cell
  * broadcasts the same events to every client, so nothing is attributed to a
- * T3 turn until the 202 to its prompt has named the run; from then on an
+ * T3 turn until the cell has said which run is T3's: the 202 to its prompt,
+ * or, when that answer was lost, the request id T3 sent with the prompt found
+ * on the run in the cell's state or on its opening event. From then on an
  * event is the turn's exactly when it carries that run id. The tenant must
  * speak cell protocol 3: every event numbered, every connection opening with
  * `state` and the `tasks` roster, and a paged event log to read a gap back.
@@ -46,6 +48,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import type * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
+import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import {
   backgroundWorkNotification,
   type BackgroundWorkReport,
@@ -66,9 +69,9 @@ import {
   isCellRunEvent,
   isCellWakeEvent,
   isKnownCellEventType,
+  readCellRefusal,
   readCellState,
   readPromptAccepted,
-  readPromptRejectedRunId,
   type CellRunEvent,
   type CellTask,
 } from "./protocol.ts";
@@ -190,6 +193,11 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const EVENTS_PAGE_LIMIT = 1_000;
 /** How long a connection may go without its `tasks` roster after `state` before it is dropped. */
 const ROSTER_TIMEOUT_MS = 10_000;
+/**
+ * How many connections in a row may fail to deliver a usable snapshot before
+ * the active turn stops waiting on them. Reconnecting goes on regardless.
+ */
+const MAX_CONSECUTIVE_BROKEN_CONNECTIONS = 3;
 const FULL_ACCESS = "full-access";
 const DEFAULT_MODEL_SENTINEL = "default";
 
@@ -203,6 +211,18 @@ const WAKE_RESET_MESSAGE =
   "The cell conversation was reset from another client before this delegated result reached T3, and the reset discarded it. Send another message to continue there.";
 const UNNAMED_RUN_MESSAGE =
   "The cell accepted the prompt without naming its run and the number of its first event, so T3 cannot tell which output is this turn's. Its result stays in the cell; send another message to continue there.";
+/** The prompt's answer was lost and nothing in the cell names the request id T3 sent, while the cell runs something. */
+const unconfirmedPromptMessage = (detail: string) =>
+  `The cell did not answer the prompt (${detail}), and neither its state nor its log shows a run started with the request id T3 sent, so T3 cannot tell whether this message ran. If it did, its result stays in the cell; wait for the cell to be idle, then send another message.`;
+/** The prompt's answer was lost, the cell is idle, and no run carries the request id T3 sent. */
+const neverStartedMessage = (detail: string) =>
+  `The cell did not answer the prompt (${detail}) and is idle with no run started with the request id T3 sent, so the message most likely never started. Send it again.`;
+/** Three connections in a row failed before their snapshot could be used; the turn stops waiting on the socket. */
+const reconnectGivenUpMessage = (reason: string) =>
+  `The connection to the cell could not be re-established: ${MAX_CONSECUTIVE_BROKEN_CONNECTIONS} connections in a row were dropped because ${reason}. The turn's result stays in the cell; send another message once the tenant is healthy.`;
+/** The cell's numbering went backwards, so what T3 was following is not this cell's history any more. */
+const seqRegressedMessage = (from: number, to: number) =>
+  `The cell's event numbering went backwards, from ${from} to ${to}, so the history T3 was following is gone. The turn's result, if any, stays in the cell; T3 has attached afresh at the new numbering, so send another message to continue there.`;
 /** The cell's log no longer reaches back to the gap, so what the turn produced in it cannot be read. */
 const gapLostMessage = (after: number, upTo: number) =>
   `The connection to the cell dropped while the turn ran, and the cell no longer retains the events numbered ${after + 1} to ${upTo} that T3 missed, so part of this turn's output cannot be read back. The cell's own transcript has all of it; send another message to continue there.`;
@@ -231,14 +251,19 @@ interface ActiveTurn {
   readonly done: Deferred.Deferred<void>;
   interruptRequested: boolean;
   /**
-   * The cell's run this turn owns, once the 202 named it or a wake was
-   * adopted. Until then `POST prompt` is unanswered and run events are
-   * candidates, not yet T3's.
+   * The `x-request-id` the prompt is posted with, fresh for every turn. The
+   * cell keeps it on the run it starts, so a lost answer can be recovered by
+   * finding it on the run in progress or on a run's opening event, and never
+   * by the prompt's text, which another client may have sent too.
+   */
+  readonly requestId: string;
+  /**
+   * The cell's run this turn owns, once the 202 named it, the request id
+   * recovered it, or a wake was adopted. Until then `POST prompt` is
+   * unanswered and run events are candidates, not yet T3's.
    */
   run: CellRun | undefined;
   readonly candidates: Array<CellRunEvent>;
-  /** The last number applied before the prompt was posted, where a lost answer's recovery starts reading. */
-  readonly seqBeforePrompt: number;
   /** The cell's state at the latest reconnect while the prompt was unanswered, judged once the 202 names the run. */
   snapshot: CellSnapshot | undefined;
 }
@@ -419,6 +444,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       let socketFiber: Fiber.Fiber<void> | undefined;
       let connections = 0;
       let connection: Connection | undefined;
+      /** Connections dropped in a row before their snapshot could be used; a usable one resets it. */
+      let consecutiveBreaks = 0;
       /** The highest sequence number applied; the first connection's `state` sets it. */
       let lastSeq = 0;
       /**
@@ -461,7 +488,12 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           providerThread: thread,
         });
       });
-      const request = (method: "GET" | "POST", path: string, body?: string) =>
+      const request = (
+        method: "GET" | "POST",
+        path: string,
+        body?: string,
+        extraHeaders: Readonly<Record<string, string>> = {},
+      ) =>
         options.transport
           .request({
             method,
@@ -469,6 +501,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             headers: {
               ...headers,
               "x-client": `t3-${input.providerSessionId}`,
+              ...extraHeaders,
             },
             ...(body === undefined ? {} : { body }),
           })
@@ -1184,10 +1217,15 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             }
             return;
           case "fs":
-          case "exec":
             return;
           default:
             if (isCellRunEvent(event)) return yield* handleRunEvent(event);
+            // An error outside any run (a cleanup that failed, a root repaired) is the cell's diagnostic, not a turn's output.
+            if (event.type === "error") {
+              return yield* Effect.logWarning(
+                `The cell reported an error outside any run (event ${event.seq}): ${event.text}`,
+              );
+            }
             return;
         }
       });
@@ -1197,11 +1235,23 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         lastSeq = event.seq;
         yield* dispatch(event);
       });
+      /**
+       * Drops a connection that did not keep the protocol. Reconnecting goes
+       * on with backoff, but a turn cannot wait on it for ever: after three
+       * connections in a row dropped before their snapshot could be used, the
+       * active turn ends as a transport error that says why.
+       */
       const breakConnection = Effect.fnUntraced(function* (link: Connection, reason: string) {
         if (link.phase.kind === "broken") return;
         if (link.phase.kind === "roster") yield* Fiber.interrupt(link.phase.timer);
         link.phase = { kind: "broken" };
+        consecutiveBreaks += 1;
         yield* Effect.logWarning(`Dropping the cell socket: ${reason}`);
+        const turn = active;
+        if (turn !== undefined && consecutiveBreaks >= MAX_CONSECUTIVE_BROKEN_CONNECTIONS) {
+          // The candidates stay with the turn: a wake among them is still queued when the prompt's answer releases them.
+          yield* finish(turn, "failed", reconnectGivenUpMessage(reason), "transport_error");
+        }
         yield* Deferred.succeed(link.broken, reason);
       });
       const decodeRaw: (
@@ -1269,13 +1319,28 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
                 detail: "the cell answered GET events without an event page",
               };
             }
-            if (page.success.truncated === true) return { kind: "truncated", after, upTo };
+            const { nextAfter, complete, truncated } = page.success;
+            if (truncated === true) return { kind: "truncated", after, upTo };
             for (const raw of page.success.events) {
               const event = yield* decodeReplayed(raw);
               if (event !== undefined && event.seq <= upTo) yield* applyEvent(event);
             }
-            if (page.success.complete || page.success.nextAfter <= cursor) break;
-            cursor = page.success.nextAfter;
+            // A page that moves the cursor nowhere, or a log that claims to end
+            // before the number the cell's own state reported, is not reading
+            // the gap back: the cursor stays where it was and the recovery fails.
+            if (nextAfter <= cursor) {
+              return {
+                kind: "failed",
+                detail: `the cell answered GET events?after=${cursor} with no progress (nextAfter ${nextAfter})`,
+              };
+            }
+            if (complete && nextAfter < upTo) {
+              return {
+                kind: "failed",
+                detail: `the cell's log claims to end at ${nextAfter}, before the ${upTo} its state reported`,
+              };
+            }
+            cursor = nextAfter;
           }
           return { kind: "complete" };
         },
@@ -1299,19 +1364,46 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         if (link.ordinal === 1) {
           // Nothing before T3 attached is T3's: the first snapshot is where the cursor starts.
           lastSeq = snapshot.seq;
+          consecutiveBreaks = 0;
           yield* reconcileTasks(roster.tasks);
           if (ready) yield* Deferred.succeed(ready, undefined);
+          return;
+        }
+        if (snapshot.seq < lastSeq) {
+          // The cell's counter never regresses, so a snapshot below the last
+          // number applied is not the history T3 was following. Nothing from
+          // it carries over: the turn and the queued wakes end as lost, and
+          // the adapter attaches afresh at the new snapshot, as on a first
+          // connection.
+          yield* Effect.logWarning(
+            `The cell's event numbering went backwards from ${lastSeq} to ${snapshot.seq}; attaching afresh`,
+          );
+          const turn = active;
+          if (turn !== undefined) {
+            turn.candidates.splice(0);
+            yield* finish(
+              turn,
+              "failed",
+              seqRegressedMessage(lastSeq, snapshot.seq),
+              "transport_error",
+            );
+          }
+          for (const wake of wakes) wake.lost = true;
+          lastSeq = snapshot.seq;
+          consecutiveBreaks = 0;
+          yield* reconcileTasks(roster.tasks);
           return;
         }
         const caughtUp: CatchUp =
           snapshot.seq > lastSeq ? yield* catchUp(lastSeq, snapshot.seq) : { kind: "complete" };
         if (caughtUp.kind === "failed") {
-          // The next connection's snapshot presents the rest of the gap again.
+          // The cursor stays where the replay stopped; the next connection's snapshot presents the rest of the gap again.
           return yield* breakConnection(
             link,
             `could not read back the events missed while disconnected: ${caughtUp.detail}`,
           );
         }
+        consecutiveBreaks = 0;
         if (lastSeq < snapshot.seq) lastSeq = snapshot.seq;
         yield* reconcileTasks(roster.tasks);
         const turn = active;
@@ -1331,14 +1423,19 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           }
         }
         for (const wake of wakes) {
-          if (!wake.ended && !runsRun(snapshot, wake.runId)) wake.lost = true;
+          if (wake.ended) continue;
+          // A gap that cannot be read back took part of every wake still open
+          // across it, whether or not the cell still runs that wake: what the
+          // socket delivers after the snapshot is not the whole run.
+          if (caughtUp.kind === "truncated" || !runsRun(snapshot, wake.runId)) wake.lost = true;
         }
       });
       /**
        * Frames follow the connection's phase: `state` first, then the `tasks`
-       * roster, then events applied by their numbers. A frame out of that
-       * order means the tenant is not keeping the protocol, and the connection
-       * is dropped rather than applied around.
+       * roster numbered at the same point, then events applied by their
+       * numbers. A frame out of that order, or a roster numbered elsewhere
+       * than its state, means the tenant is not keeping the protocol, and the
+       * connection is dropped rather than applied around.
        */
       const handleEvent: (event: CellEvent) => Effect.Effect<void> = Effect.fnUntraced(function* (
         event: CellEvent,
@@ -1374,6 +1471,12 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
               );
             }
             const { snapshot, timer } = link.phase;
+            if (event.seq !== snapshot.seq) {
+              return yield* breakConnection(
+                link,
+                `the cell sent a tasks roster numbered ${event.seq} after a state numbered ${snapshot.seq}`,
+              );
+            }
             yield* Fiber.interrupt(timer);
             link.phase = { kind: "events" };
             return yield* handleRoster(link, snapshot, event);
@@ -1431,12 +1534,20 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
                   );
                 }
                 return yield* Effect.logDebug(`Cell socket closed: ${entry.detail}`);
-              case "frame":
+              case "frame": {
+                // A frame that is not an event of the protocol (not JSON, a
+                // known type with a bad number or a missing field) is a
+                // violation like a frame out of order: the connection is
+                // dropped and the gap read back from the log.
+                const link = connection;
                 return yield* handleFrame(entry.text).pipe(
                   Effect.catch((cause) =>
-                    Effect.logWarning("Skipped an unreadable cell event", cause),
+                    link === undefined
+                      ? Effect.logWarning("Skipped an unreadable cell frame", cause)
+                      : breakConnection(link, cause.detail),
                   ),
                 );
+              }
             }
           }).pipe(eventPermit.withPermits(1)),
         ),
@@ -1618,33 +1729,37 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         candidate.providerInstanceId === options.instanceId &&
         candidate.appThreadId === thread.appThreadId &&
         candidate.nativeThreadRef?.nativeId === project;
-      const UNPROVABLE_PROMPT_MESSAGE = (detail: string) =>
-        `The cell did not confirm the prompt and is running a turn T3 cannot prove is this one: ${detail}. Its result stays in the cell; send another message once it is idle.`;
-      /** The opening `user` event of T3's prompt: numbered after the prompt went out, user-originated, same text. */
-      const findEcho = (turn: ActiveTurn) =>
+      /** The opening `user` event of T3's prompt: the one carrying the request id T3 posted it with. */
+      const findOpener = (turn: ActiveTurn) =>
         turn.candidates.find(
-          (event) =>
-            event.type === "user" &&
-            event.origin === "user" &&
-            event.seq > turn.seqBeforePrompt &&
-            event.text.trim() === turn.input.message.text.trim(),
+          (event): event is Extract<CellRunEvent, { readonly type: "user" }> =>
+            event.type === "user" && event.requestId === turn.requestId,
         );
       /**
-       * The prompt's answer never came. The cell may still have started the
-       * run: its opening event, among the candidates or in the event log read
-       * from where T3 left off, names the run and its number, which is what
-       * the 202 would have said. Anything less fails the turn with a message
-       * that says what T3 could not confirm.
+       * The prompt's answer never came: a timeout, a dropped socket, or a
+       * status from something between T3 and the cell. The cell may still
+       * have started the run, and only the request id T3 sent with the prompt
+       * can say so: the run's opening event carries it, among the candidates
+       * or in the event log read from where T3 left off up to what `GET
+       * state` reports, and the state names the id of the run in progress.
+       * Nothing else is evidence; the prompt's text is not, since another
+       * client may have sent the same words. Anything less fails the turn
+       * with a message that says what T3 could not confirm.
        */
       const resolveLostPrompt = Effect.fnUntraced(function* (turn: ActiveTurn, detail: string) {
-        const echoed = findEcho(turn);
+        const echoed = findOpener(turn);
         if (echoed !== undefined) {
           return yield* accept(turn, { id: echoed.runId, firstSeq: echoed.seq });
         }
         const state = yield* readState().pipe(Effect.result);
         if (Result.isFailure(state)) {
           yield* releaseCandidates(turn);
-          return yield* finish(turn, "failed", detail, "transport_error");
+          return yield* finish(
+            turn,
+            "failed",
+            unconfirmedPromptMessage(`${detail}; ${state.failure.message}`),
+            "transport_error",
+          );
         }
         if (state.success.seq > lastSeq) {
           const caughtUp = yield* catchUp(lastSeq, state.success.seq);
@@ -1661,17 +1776,23 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           }
         }
         if (!isActive(turn)) return;
-        const replayed = findEcho(turn);
+        const replayed = findOpener(turn);
         if (replayed !== undefined) {
           return yield* accept(turn, { id: replayed.runId, firstSeq: replayed.seq });
+        }
+        const current = state.success;
+        if (current.running && current.runId !== null && current.requestId === turn.requestId) {
+          // The cell names T3's request id on the run in progress though its
+          // opener is not among what T3 holds: the run is T3's from the
+          // number the cell confirmed it at, and nothing numbered before that
+          // is evidence about it.
+          return yield* accept(turn, { id: current.runId, firstSeq: current.seq });
         }
         yield* releaseCandidates(turn);
         return yield* finish(
           turn,
           "failed",
-          state.success.running
-            ? UNPROVABLE_PROMPT_MESSAGE(detail)
-            : `The cell did not confirm the prompt and is idle, so the message most likely never started: ${detail}. Send it again.`,
+          current.running ? unconfirmedPromptMessage(detail) : neverStartedMessage(detail),
           "transport_error",
         );
       });
@@ -1691,6 +1812,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           turnInput.message.creationSource === "provider";
         const nativeId = `${project}:turn:${turnInput.providerTurnOrdinal}`;
         const startedAt = yield* DateTime.now;
+        const requestId = yield* randomUuidV4;
         const providerTurn: OrchestrationV2ProviderTurn = {
           id: idAllocator.derive.providerTurn({
             driver: CELL_PROVIDER,
@@ -1721,9 +1843,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           openTools: [],
           done: yield* Deferred.make<void>(),
           interruptRequested: false,
+          requestId,
           run: undefined,
           candidates: [],
-          seqBeforePrompt: lastSeq,
           snapshot: undefined,
         };
         yield* Effect.gen(function* () {
@@ -1788,8 +1910,12 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             }
             const wake = wakes.splice(index, 1)[0]!;
             turn.run = { id: wake.runId, firstSeq: wake.firstSeq };
+            // A wake that lost events to a gap ends as lost even when its
+            // `done` was read: what the buffer holds is not the whole run.
             for (const event of wake.events) {
-              if (active === turn) yield* applyToTurn(turn, event);
+              if (active !== turn) break;
+              if (wake.lost && event.type === "done") continue;
+              yield* applyToTurn(turn, event);
             }
             if (active === turn && wake.lost) {
               yield* finish(turn, "failed", WAKE_LOST_MESSAGE, "transport_error");
@@ -1800,9 +1926,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         // `active` is read through a call: the guard above narrowed the captured
         // variable to undefined for the rest of this function, which is stale.
         if (continuation || !isActive(turn)) return;
-        const outcome = yield* request("POST", "/prompt", turnInput.message.text).pipe(
-          Effect.result,
-        );
+        const outcome = yield* request("POST", "/prompt", turnInput.message.text, {
+          "x-request-id": turn.requestId,
+        }).pipe(Effect.result);
         yield* Effect.gen(function* () {
           // A turn that ended while the prompt was in flight leaves its candidates to the unowned path.
           if (!isActive(turn)) return yield* releaseCandidates(turn);
@@ -1818,23 +1944,33 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             }
             return yield* accept(turn, { id: accepted.runId, firstSeq: accepted.seq });
           }
+          const refusal = readCellRefusal(response.body);
+          // A server error without the cell's own refusal in its body came
+          // from something between T3 and the cell, or from a cell that may
+          // already have started the run: an answer as lost as no answer.
+          if (response.status >= 500 && (refusal === undefined || refusal.error === null)) {
+            return yield* resolveLostPrompt(
+              turn,
+              `the cell answered ${response.status} to the prompt`,
+            );
+          }
           // Nothing broadcast before the refusal was T3's run.
           yield* releaseCandidates(turn);
+          const reason = refusal?.error ?? response.body.trim().slice(0, 500);
           if (response.status === 409) {
-            const body = response.body.trim();
             return yield* finish(
               turn,
               "failed",
-              readPromptRejectedRunId(body) !== undefined
+              refusal?.runId
                 ? ALREADY_RUNNING_MESSAGE
-                : `The cell did not start the turn: ${body || "the prompt was not started"}. Check the tenant's model API key.`,
+                : `The cell did not start the turn: ${reason || "the prompt was not started; check the tenant's model API key"}.`,
             );
           }
           yield* finish(
             turn,
             "failed",
-            `The cell answered ${response.status} to the prompt${response.body.trim() ? `: ${response.body.trim().slice(0, 500)}` : ""}`,
-            response.status === 401 || response.status === 403
+            `The cell answered ${response.status} to the prompt${reason ? `: ${reason}` : ""}`,
+            refusal !== undefined || response.status === 401 || response.status === 403
               ? "provider_error"
               : "transport_error",
           );
@@ -1905,17 +2041,43 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           ),
         interruptTurn: (args) =>
           Effect.gen(function* () {
-            const turn = active;
-            if (
-              !turn ||
-              turn.providerTurn.id !== args.providerTurnId ||
-              !validateThread(args.providerThread)
-            )
+            if (!validateThread(args.providerThread))
               return yield* protocolError("This cell turn is no longer active");
-            turn.interruptRequested = true;
-            const response = yield* request("POST", "/cancel");
-            if (response.status >= 400)
+            // Decided under the event permit, behind whatever reconciliation
+            // is in progress: a replay that has just ended the turn leaves
+            // nothing to cancel, and the run the cancel names keeps the cell
+            // from ending a later run instead.
+            const target = yield* eventPermit.withPermits(1)(
+              Effect.sync(() => {
+                const turn = active;
+                if (turn === undefined || turn.providerTurn.id !== args.providerTurnId) {
+                  return lastProviderTurn?.id === args.providerTurnId
+                    ? ("settled" as const)
+                    : ("unknown" as const);
+                }
+                turn.interruptRequested = true;
+                return turn;
+              }),
+            );
+            // A settled turn has nothing left to stop.
+            if (target === "settled") return;
+            if (target === "unknown")
+              return yield* protocolError("This cell turn is no longer active");
+            const turn = target;
+            if (turn.run === undefined)
+              return yield* protocolError("The cell has not named this turn's run yet");
+            const response = yield* request("POST", "/cancel", undefined, {
+              "x-run-id": turn.run.id,
+            });
+            if (response.status === 409) {
+              // The cell runs another run now, so this turn's has ended; its
+              // `done` reaches the turn live or by replay and settles it.
+              yield* Effect.logDebug(
+                `The cell refused to cancel run ${turn.run.id}: it runs ${readCellRefusal(response.body)?.runId ?? "another run"}`,
+              );
+            } else if (response.status >= 400) {
               return yield* protocolError(`The cell answered ${response.status} to cancel`);
+            }
             yield* Deferred.await(turn.done).pipe(
               Effect.timeout(requestTimeoutMs),
               Effect.catchTags({

@@ -1,23 +1,23 @@
 {"type":"transcript_start","provider":"cell","protocol":"cell.http-ws","version":"fake-cell","scenario":"cell_wake","metadata":{"generatedBy":"fake-cell-recorder","model":"gpt-6-astra"}}
 {"type":"expect_outbound","label":"GET /cell/<project>/state","frame":{"kind":"http","method":"GET","path":"/cell/<project>/state"}}
-{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":200,"body":"{\"protocol\":3,\"version\":\"0.4.0\",\"model\":\"gpt-6-astra\",\"running\":false,\"runId\":null,\"seq\":0,\"configured\":true,\"turns\":0,\"sockets\":0,\"parent\":null,\"depth\":0,\"tasks\":0}"}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":200,"body":"{\"protocol\":3,\"version\":\"0.4.0\",\"model\":\"gpt-6-astra\",\"running\":false,\"runId\":null,\"requestId\":null,\"seq\":0,\"configured\":true,\"turns\":0,\"sockets\":0,\"parent\":null,\"depth\":0,\"tasks\":0}"}}
 {"type":"expect_outbound","label":"ws_connect","frame":{"kind":"ws_connect","path":"/cell/<project>/ws"}}
-{"type":"emit_inbound","label":"ws:state#1","frame":{"kind":"ws_event","event":{"type":"state","protocol":3,"version":"0.4.0","model":"gpt-6-astra","running":false,"runId":null,"seq":0,"configured":true,"turns":0,"sockets":1,"parent":null,"depth":0,"tasks":0}}}
+{"type":"emit_inbound","label":"ws:state#1","frame":{"kind":"ws_event","event":{"type":"state","protocol":3,"version":"0.4.0","model":"gpt-6-astra","running":false,"runId":null,"requestId":null,"seq":0,"configured":true,"turns":0,"sockets":1,"parent":null,"depth":0,"tasks":0}}}
 {"type":"emit_inbound","label":"ws:tasks#1","frame":{"kind":"ws_event","event":{"type":"tasks","tasks":[],"seq":0}}}
 {"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Delegate a review to a child cell. Reply with exactly: STARTED. When the child reports, reply with exactly: WAKE_DONE"}}
-{"type":"emit_inbound","label":"ws:user#1","frame":{"kind":"ws_event","event":{"type":"user","text":"Delegate a review to a child cell. Reply with exactly: STARTED. When the child reports, reply with exactly: WAKE_DONE","runId":"run-1","origin":"user","seq":1}}}
+{"type":"emit_inbound","label":"ws:user#1","frame":{"kind":"ws_event","event":{"type":"user","text":"Delegate a review to a child cell. Reply with exactly: STARTED. When the child reports, reply with exactly: WAKE_DONE","requestId":"<request-id>","runId":"run-1","origin":"user","seq":1}}}
 {"type":"emit_inbound","label":"ws:tool#1","frame":{"kind":"ws_event","event":{"type":"tool","name":"delegate_task","arguments":{"title":"review"},"runId":"run-1","seq":2}}}
 {"type":"emit_inbound","label":"ws:tool_output#1","frame":{"kind":"ws_event","event":{"type":"tool_output","name":"delegate_task","output":"{\"taskId\":\"ab12\",\"status\":\"running\"}","runId":"run-1","seq":3}}}
-{"type":"emit_inbound","label":"ws:task#1","frame":{"kind":"ws_event","event":{"type":"task","task":{"taskId":"ab12","title":"review","status":"running","created":1792354731525,"finished":null},"seq":4}}}
+{"type":"emit_inbound","label":"ws:task#1","frame":{"kind":"ws_event","event":{"type":"task","task":{"taskId":"ab12","title":"review","status":"running","created":1792357229511,"finished":null},"seq":4}}}
 {"type":"emit_inbound","label":"ws:assistant#1","frame":{"kind":"ws_event","event":{"type":"assistant","text":"STARTED","runId":"run-1","seq":5}}}
 {"type":"emit_inbound","label":"ws:done#1","frame":{"kind":"ws_event","event":{"type":"done","runId":"run-1","seq":6}}}
 {"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":"{\"runId\":\"run-1\",\"seq\":1}"}}
-{"type":"emit_inbound","label":"ws:task#2","frame":{"kind":"ws_event","event":{"type":"task","task":{"taskId":"ab12","title":"review","status":"completed","created":1792354731525,"finished":1792354731545,"summary":"The review is done.","changes":[]},"seq":7}}}
+{"type":"emit_inbound","label":"ws:task#2","frame":{"kind":"ws_event","event":{"type":"task","task":{"taskId":"ab12","title":"review","status":"completed","created":1792357229511,"finished":1792357229531,"summary":"The review is done.","changes":[]},"seq":7}}}
 {"type":"emit_inbound","label":"ws:wake#1","frame":{"kind":"ws_event","event":{"type":"wake","text":"[Delegated task ab12 \"review\" completed]\nThe review is done.","runId":"run-2","origin":"wake","seq":8}}}
 {"type":"emit_inbound","label":"ws:assistant#2","frame":{"kind":"ws_event","event":{"type":"assistant","text":"WAKE_DONE","runId":"run-2","seq":9}}}
 {"type":"emit_inbound","label":"ws:done#2","frame":{"kind":"ws_event","event":{"type":"done","runId":"run-2","seq":10}}}
 {"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Respond with exactly: USER_REPLY"}}
-{"type":"emit_inbound","label":"ws:user#2","frame":{"kind":"ws_event","event":{"type":"user","text":"Respond with exactly: USER_REPLY","runId":"run-3","origin":"user","seq":11}}}
+{"type":"emit_inbound","label":"ws:user#2","frame":{"kind":"ws_event","event":{"type":"user","text":"Respond with exactly: USER_REPLY","requestId":"<request-id>","runId":"run-3","origin":"user","seq":11}}}
 {"type":"emit_inbound","label":"ws:assistant#3","frame":{"kind":"ws_event","event":{"type":"assistant","text":"USER_REPLY","runId":"run-3","seq":12}}}
 {"type":"emit_inbound","label":"ws:done#3","frame":{"kind":"ws_event","event":{"type":"done","runId":"run-3","seq":13}}}
 {"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":"{\"runId\":\"run-3\",\"seq\":11}"}}

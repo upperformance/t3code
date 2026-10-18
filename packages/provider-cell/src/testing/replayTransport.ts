@@ -23,6 +23,14 @@ import {
 
 export const CELL_REPLAY_PROTOCOL = "cell.http-ws";
 const PROJECT_PLACEHOLDER = "<project>";
+/**
+ * Stands for the `x-request-id` of the latest prompt in inbound frames: the
+ * recorder puts it where the cell echoed the id, and replay binds it to the id
+ * the adapter sends, so a transcript holds no minted id and a replayed opener
+ * carries exactly the id the adapter is looking for.
+ */
+const REQUEST_ID_PLACEHOLDER = "<request-id>";
+const REQUEST_ID_HEADER = "x-request-id";
 
 export const CellReplayFrame = Schema.Union([
   Schema.Struct({
@@ -97,6 +105,11 @@ function requestPath(url: string): string {
   return `${parsed.pathname}${parsed.search}`;
 }
 
+function requestIdOf(request: CellHttpRequest): string | undefined {
+  const value = request.headers[REQUEST_ID_HEADER];
+  return value === undefined || value.length === 0 ? undefined : value;
+}
+
 export interface CellReplayGate {
   readonly beforeEmit: (label: string | undefined, signal?: AbortSignal) => Promise<void>;
 }
@@ -115,6 +128,7 @@ export class CellReplayController {
   private failure: CellReplayMismatchError | undefined;
   private listener: Listener | undefined;
   private boundProject: string | undefined;
+  private boundRequestId: string | undefined;
   private chain: Promise<void> = Promise.resolve();
   private readonly abort = new AbortController();
   private readonly entries: ReadonlyArray<ProviderReplayEntry>;
@@ -169,12 +183,14 @@ export class CellReplayController {
     };
     const operation = `${request.method} ${request.url}`;
     const project = projectSegment(requestPath(request.url));
+    const requestId = requestIdOf(request);
     return Effect.promise(() =>
       this.enqueue(async (): Promise<PendingResponse> => {
         await this.deliverInbound();
         if (!this.takeOutbound(actual, project)) {
           return { kind: "failure", error: this.fail(operation) };
         }
+        if (requestId !== undefined) this.boundRequestId = requestId;
         // The cell broadcasts a prompt's first events before it answers 202, so
         // the socket frames recorded ahead of the response are delivered first.
         const response = await this.deliverInbound({ untilResponse: true });
@@ -195,7 +211,7 @@ export class CellReplayController {
         }
         return {
           kind: "response",
-          response: { status: response.status, body: response.body },
+          response: { status: response.status, body: this.bind(response.body) },
         };
       }),
     ).pipe(
@@ -325,10 +341,17 @@ export class CellReplayController {
       if (this.gate !== undefined) await this.gate.beforeEmit(entry.label, this.abort.signal);
       if (this.abort.signal.aborted) return undefined;
       this.cursor += 1;
-      if (frame.kind === "ws_event") this.listener?.deliver([encodeJson(frame.event)]);
+      if (frame.kind === "ws_event") this.listener?.deliver([this.bind(encodeJson(frame.event))]);
       else if (frame.kind === "ws_closed") this.listener?.close(frame.code);
     }
     return undefined;
+  }
+
+  /** The latest prompt's request id stands in for its placeholder in what the cell sends back. */
+  private bind(text: string): string {
+    return this.boundRequestId === undefined
+      ? text
+      : text.replaceAll(REQUEST_ID_PLACEHOLDER, this.boundRequestId);
   }
 
   /** Socket frames are delivered as soon as the transcript reaches them. */
@@ -369,6 +392,10 @@ export function makeRecordingCellTransport(
   options: { readonly gate?: CellReplayGate } = {},
 ): CellTransport {
   const eventCounts = new Map<string, number>();
+  let requestId: string | undefined;
+  /** The cell echoes the prompt's request id on its run; the transcript keeps the placeholder instead. */
+  const anonymizeRequestId = (text: string) =>
+    requestId === undefined ? text : text.replaceAll(requestId, REQUEST_ID_PLACEHOLDER);
   const record = (type: "expect_outbound" | "emit_inbound", frame: CellReplayFrame): string => {
     let label: string;
     if (frame.kind === "http") {
@@ -387,6 +414,7 @@ export function makeRecordingCellTransport(
   return {
     request: (request) =>
       Effect.gen(function* () {
+        requestId = requestIdOf(request) ?? requestId;
         record("expect_outbound", {
           kind: "http",
           method: request.method,
@@ -405,7 +433,7 @@ export function makeRecordingCellTransport(
         record("emit_inbound", {
           kind: "http_response",
           status: response.status,
-          body: response.body,
+          body: anonymizeRequestId(response.body),
         });
         return response;
       }),
@@ -431,7 +459,7 @@ export function makeRecordingCellTransport(
             if (buffered.length === 0) return [];
           }
           const frame = buffered.shift()!;
-          const event = yield* decodeEventFrame(frame).pipe(
+          const event = yield* decodeEventFrame(anonymizeRequestId(frame)).pipe(
             Effect.orElseSucceed((): unknown => frame),
           );
           const label = record("emit_inbound", { kind: "ws_event", event });

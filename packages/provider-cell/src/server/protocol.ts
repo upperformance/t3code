@@ -1,11 +1,15 @@
 /**
  * The cell's wire shapes at cell protocol level 3: `GET state`, the WebSocket
- * events, the prompt responses, the event-log page, and the project naming
- * the adapter and the status probe share. Every event carries the cell's
- * sequence number, every run-scoped event names its run, and a tenant that
- * states a lower level, or none, is refused before anything is sent to it.
- * Events the cell adds after this build are ignored rather than failing the
- * socket, so this T3 keeps working against a newer tenant.
+ * events, the prompt and cancel answers, the event-log page, and the project
+ * naming the adapter and the status probe share. Every event carries the
+ * cell's sequence number, a non-negative integer that only grows; run-scoped
+ * events name their run; a tenant that states a lower level, or none, is
+ * refused before anything is sent to it. Events the cell adds after this
+ * build are ignored rather than failing the socket, so this T3 keeps working
+ * against a newer tenant. What the cell sends a client in answer to that
+ * client's own socket message (an `exec` result, a refused socket prompt) is
+ * a reply, not an event: it carries no number and is not modelled here, since
+ * T3 sends no socket commands.
  */
 import { ProviderDriverKind } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -23,6 +27,9 @@ const CELL_PROTOCOL_LEVEL = 3;
  * of a SHA-256 over the whole thread id, never a slice of the id itself.
  */
 const PROJECT_HASH_BYTES = 10;
+
+/** A sequence number: the cell's per-project counter, which never regresses or fractions. */
+const Seq = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
 
 /** The tenant speaks an older cell protocol; the message says which and what this provider needs. */
 export class CellProtocolError extends Schema.TaggedError<CellProtocolError>()(
@@ -43,8 +50,10 @@ export const CellState = Schema.Struct({
   model: Schema.String,
   running: Schema.Boolean,
   runId: Schema.NullOr(Schema.String),
+  /** The `x-request-id` the run in progress was started with; null when it has none or nothing runs. */
+  requestId: Schema.optional(Schema.NullOr(Schema.String)),
   /** The last sequence number the cell emitted. */
-  seq: Schema.Number,
+  seq: Seq,
   configured: Schema.Boolean,
   version: Schema.optional(Schema.String),
   turns: Schema.optional(Schema.Number),
@@ -106,7 +115,7 @@ export const CellDoneError = Schema.Struct({
 export type CellDoneError = typeof CellDoneError.Type;
 
 /** Every event is numbered; run-scoped ones name their run; `user` and `wake` say who started it. */
-const sequenced = { seq: Schema.Number };
+const sequenced = { seq: Seq };
 const runScoped = { ...sequenced, runId: Schema.String };
 const prompted = { ...runScoped, origin: Schema.Literals(["user", "wake"]) };
 
@@ -123,7 +132,13 @@ export const CellEvent = Schema.Union([
     task: Schema.Union([CellTaskRemoved, CellTask]),
     ...sequenced,
   }),
-  Schema.Struct({ type: Schema.Literal("user"), text: Schema.String, ...prompted }),
+  /** A run's opening event carries the `x-request-id` its prompt was posted with, null when it had none. */
+  Schema.Struct({
+    type: Schema.Literal("user"),
+    text: Schema.String,
+    requestId: Schema.optional(Schema.NullOr(Schema.String)),
+    ...prompted,
+  }),
   Schema.Struct({ type: Schema.Literal("wake"), text: Schema.String, ...prompted }),
   Schema.Struct({ type: Schema.Literal("assistant"), text: Schema.String, ...runScoped }),
   Schema.Struct({ type: Schema.Literal("shell"), command: Schema.String, ...runScoped }),
@@ -156,7 +171,9 @@ export const CellEvent = Schema.Union([
     text: Schema.optional(Schema.String),
     ...runScoped,
   }),
+  /** An error inside a run (a failed `apply_patch`) is the run's; one outside any run is standalone. */
   Schema.Struct({ type: Schema.Literal("error"), text: Schema.String, ...runScoped }),
+  Schema.Struct({ type: Schema.Literal("error"), text: Schema.String, ...sequenced }),
   Schema.Struct({
     type: Schema.Literal("done"),
     error: Schema.optional(Schema.NullOr(CellDoneError)),
@@ -164,7 +181,6 @@ export const CellEvent = Schema.Union([
   }),
   Schema.Struct({ type: Schema.Literal("reset"), ...sequenced }),
   Schema.Struct({ type: Schema.Literal("fs"), changes: Schema.Unknown, ...sequenced }),
-  Schema.Struct({ type: Schema.Literal("exec"), ...sequenced }),
 ]);
 export type CellEvent = typeof CellEvent.Type;
 
@@ -175,39 +191,12 @@ const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set(
 export const isKnownCellEventType = (type: unknown): boolean =>
   typeof type === "string" && KNOWN_EVENT_TYPES.has(type);
 
-export type CellRunEvent = Extract<
-  CellEvent,
-  {
-    readonly type:
-      | "user"
-      | "wake"
-      | "assistant"
-      | "shell"
-      | "shell_output"
-      | "tool"
-      | "tool_output"
-      | "patch"
-      | "error"
-      | "done";
-  }
->;
+/** The events that belong to one agent run: every member that names its run. */
+export type CellRunEvent = Extract<CellEvent, { readonly runId: string }>;
 
-const RUN_EVENT_TYPES: ReadonlySet<string> = new Set<CellRunEvent["type"]>([
-  "user",
-  "wake",
-  "assistant",
-  "shell",
-  "shell_output",
-  "tool",
-  "tool_output",
-  "patch",
-  "error",
-  "done",
-]);
-
-/** Events that belong to one agent run, as opposed to connection snapshots and task bookkeeping. */
+/** Events that belong to one agent run, as opposed to connection snapshots, task bookkeeping and standalone errors. */
 export const isCellRunEvent = (event: CellEvent): event is CellRunEvent =>
-  RUN_EVENT_TYPES.has(event.type);
+  event.type !== "state" && "runId" in event && typeof event.runId === "string";
 
 /** A `wake` event, or a `user` event the cell marked as wake-originated. */
 export const isCellWakeEvent = (event: CellEvent): boolean =>
@@ -216,14 +205,27 @@ export const isCellWakeEvent = (event: CellEvent): boolean =>
 /** Body of a 202 to `POST prompt`: the run's id and the number of its opening `user` event. */
 export const CellPromptAccepted = Schema.Struct({
   runId: Schema.String,
-  seq: Schema.Number,
+  seq: Seq,
 });
 export type CellPromptAccepted = typeof CellPromptAccepted.Type;
 
-/** Body of a 409 to `POST prompt` that names the run already in progress. */
-export const CellPromptRejected = Schema.Struct({
+/**
+ * Body of every other answer to `POST prompt`, and of a 409 to `POST cancel`:
+ * the run in progress, if the refusal is about one, and the reason when the
+ * cell gives one. A 409 to a prompt names the active run; an empty prompt, a
+ * missing API key or a cell busy with a fork or reset carry `runId: null`
+ * and `error`; a cancel naming a run other than the active one answers the
+ * active run's id and cancels nothing.
+ */
+export const CellRefusal = Schema.Struct({
   runId: Schema.optional(Schema.NullOr(Schema.String)),
+  error: Schema.optional(Schema.String),
 });
+
+export interface CellRefusal {
+  readonly runId: string | null;
+  readonly error: string | null;
+}
 
 /**
  * A page of `GET events?after=<seq>&limit=<n>`, ordered by number. `complete`
@@ -233,22 +235,26 @@ export const CellPromptRejected = Schema.Struct({
  */
 export const CellEventsPage = Schema.Struct({
   events: Schema.Array(Schema.Unknown),
-  nextAfter: Schema.Number,
+  nextAfter: Seq,
   complete: Schema.Boolean,
   truncated: Schema.optional(Schema.Boolean),
-  earliest: Schema.optional(Schema.Number),
+  earliest: Schema.optional(Seq),
 });
 export type CellEventsPage = typeof CellEventsPage.Type;
 
 const decodePromptAccepted = Schema.decodeUnknownOption(Schema.fromJsonString(CellPromptAccepted));
-const decodePromptRejected = Schema.decodeUnknownOption(Schema.fromJsonString(CellPromptRejected));
+const decodeRefusal = Schema.decodeUnknownOption(Schema.fromJsonString(CellRefusal));
 
 export function readPromptAccepted(body: string): CellPromptAccepted | undefined {
   return Option.getOrUndefined(decodePromptAccepted(body));
 }
 
-export function readPromptRejectedRunId(body: string): string | undefined {
-  return Option.getOrUndefined(decodePromptRejected(body))?.runId ?? undefined;
+/** The cell's own refusal, when the body is one; a proxy's error page or an empty body is not. */
+export function readCellRefusal(body: string): CellRefusal | undefined {
+  const refusal = Option.getOrUndefined(decodeRefusal(body));
+  return refusal === undefined
+    ? undefined
+    : { runId: refusal.runId ?? null, error: refusal.error ?? null };
 }
 
 export type CellDoneOutcome =

@@ -6,7 +6,9 @@
  * does, so transcripts recorded against it carry the real protocol shape:
  * every event numbered and persisted, run-scoped events naming their run,
  * `state` then the numbered `tasks` roster first on every socket, a paged
- * event log with bounded retention, and structured `done` errors.
+ * event log with bounded retention, structured `done` errors, the request id
+ * a prompt is posted with kept on the run and answered again for a repeat,
+ * refusals as `{ runId, error }`, and a cancel that names the run it is for.
  */
 import * as NodeHttp from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -57,6 +59,8 @@ export type FakeCellScript = (
 export interface FakeCellServer {
   readonly baseUrl: string;
   readonly prompts: (project: string) => ReadonlyArray<string>;
+  /** The `x-run-id` of every cancel the project received, null where the header was absent. */
+  readonly cancels: (project: string) => ReadonlyArray<string | null>;
   /** Closes every socket as celld does when a cell moves; clients are expected to reconnect. */
   readonly dropSockets: () => void;
   /** While set, socket upgrades are refused, as when the origin is briefly unreachable. */
@@ -73,11 +77,17 @@ export interface FakeCellServer {
     prompt: string,
     steps?: ReadonlyArray<FakeCellStep>,
   ) => boolean;
+  /** Broadcasts a numbered error outside any run, as the cell does when a cleanup or a report fails. */
+  readonly raiseError: (project: string, text: string) => void;
   readonly close: () => Promise<void>;
 }
 
 interface Run {
   readonly runId: string;
+  /** The number of the run's opening event. */
+  readonly seq: number;
+  /** The `x-request-id` the prompt was posted with; a wake or a socket prompt has none. */
+  readonly requestId: string | null;
   cancel: () => void;
 }
 
@@ -85,6 +95,7 @@ type PersistedEvent = Record<string, unknown> & { readonly seq: number };
 
 interface Project {
   readonly prompts: Array<string>;
+  readonly cancels: Array<string | null>;
   readonly sockets: Set<WebSocket>;
   readonly connectionWaiters: Array<() => void>;
   readonly idleWaiters: Array<() => void>;
@@ -94,6 +105,8 @@ interface Project {
   readonly tasks: Map<string, Record<string, unknown>>;
   readonly answers: Array<string>;
   run: Run | null;
+  /** The run that ended last: a repeat of its request id is answered with it, not run again. */
+  lastRun: Run | null;
   runs: number;
   seq: number;
   model: string;
@@ -104,6 +117,7 @@ const PROTOCOL_LEVEL = 3;
 const EVENT_RETENTION = 20_000;
 const RUN_RETENTION = 200;
 const PAGE_LIMIT = 1_000;
+const REQUEST_ID_MAX_LENGTH = 128;
 
 /**
  * Answers the shared fixture prompts: "Respond with exactly: X", a shell that
@@ -171,6 +185,7 @@ export async function startFakeCellServer(
     if (!existing) {
       existing = {
         prompts: [],
+        cancels: [],
         sockets: new Set(),
         connectionWaiters: [],
         idleWaiters: [],
@@ -179,6 +194,7 @@ export async function startFakeCellServer(
         tasks: new Map(),
         answers: [],
         run: null,
+        lastRun: null,
         runs: 0,
         seq: 0,
         model: options.model ?? "gpt-6-astra",
@@ -195,6 +211,7 @@ export async function startFakeCellServer(
     model: target.model,
     running: target.run !== null,
     runId: target.run?.runId ?? null,
+    requestId: target.run?.requestId ?? null,
     seq: target.seq,
     configured: target.configured,
     turns: target.prompts.length,
@@ -270,30 +287,45 @@ export async function startFakeCellServer(
     startRun(target, text, "wake", step.wake);
   };
 
+  /** Why a prompt cannot start a run now, as the cell words it; undefined when it can. */
+  const refusalOf = (target: Project, prompt: string): string | undefined =>
+    target.run
+      ? "A run is already in progress"
+      : !target.configured
+        ? "OPENAI_API_KEY is not configured for this cell"
+        : !prompt.trim()
+          ? "The prompt is empty"
+          : undefined;
   const startRun = (
     target: Project,
     prompt: string,
     origin: "user" | "wake",
     scripted?: ReadonlyArray<FakeCellStep>,
+    requestId: string | null = null,
   ): { readonly runId: string; readonly seq: number } | undefined => {
-    if (target.run || !target.configured || !prompt.trim()) return undefined;
+    if (refusalOf(target, prompt) !== undefined) return undefined;
     if (origin === "user") target.prompts.push(prompt);
     const steps = [...(scripted ?? script(prompt, target.prompts.length, target.answers))];
     const runId = `run-${++target.runs}`;
     const scope = { runId };
     let cancelled = false;
     let wakeCancel: (() => void) | undefined;
+    const opening = target.seq + 1;
     const run: Run = {
       runId,
+      seq: opening,
+      requestId,
       cancel: () => {
         cancelled = true;
         wakeCancel?.();
       },
     };
     target.run = run;
-    const opening = broadcast(
+    broadcast(
       target,
-      { type: origin === "wake" ? "wake" : "user", text: prompt, ...scope, origin },
+      origin === "wake"
+        ? { type: "wake", text: prompt, ...scope, origin }
+        : { type: "user", text: prompt, requestId, ...scope, origin },
       { opensRun: true },
     );
     const accepted = { runId, seq: opening };
@@ -409,6 +441,7 @@ export async function startFakeCellServer(
         error === undefined ? { type: "done", ...scope } : { type: "done", error, ...scope },
       );
       if (target.run === run) target.run = null;
+      target.lastRun = run;
       for (const waiter of target.idleWaiters.splice(0)) waiter();
       for (const step of delegated) later(delegateDelayMs, () => finishDelegated(target, step));
     })();
@@ -433,16 +466,43 @@ export async function startFakeCellServer(
     if (path === "/state" && request.method === "GET") {
       return json(200, stateOf(target));
     }
+    // A prompt repeated with the request id of the run in progress, or of the
+    // run that ended last, is answered with that run rather than run again, so
+    // a client whose answer was lost can ask once more. Another id while a run
+    // is in progress is refused naming that run; every other refusal names no
+    // run and gives its reason.
     if (path === "/prompt" && request.method === "POST") {
+      const header = request.headers["x-request-id"];
+      const requestId = typeof header === "string" && header.length > 0 ? header : null;
       const body = await readBody(request);
+      if (requestId !== null && requestId.length > REQUEST_ID_MAX_LENGTH) {
+        return json(400, {
+          runId: target.run?.runId ?? null,
+          error: `x-request-id is longer than ${REQUEST_ID_MAX_LENGTH} characters`,
+        });
+      }
+      const repeated = [target.run, target.lastRun].find(
+        (run) => run !== null && requestId !== null && run.requestId === requestId,
+      );
+      if (repeated) return json(202, { runId: repeated.runId, seq: repeated.seq });
       if (target.run) return json(409, { runId: target.run.runId });
-      if (!target.configured) return text(409, "OPENAI_API_KEY is not configured for this cell");
-      const accepted = startRun(target, body, "user");
-      if (accepted === undefined) return text(409, "The prompt was not started");
+      const refusal = refusalOf(target, body);
+      if (refusal !== undefined) return json(409, { runId: null, error: refusal });
+      const accepted = startRun(target, body, "user", undefined, requestId);
+      if (accepted === undefined)
+        return json(409, { runId: null, error: "The prompt was not started" });
       return json(202, accepted);
     }
+    // A cancel that names a run cancels only that run: another run in
+    // progress is named back and left alone; no run at all is a no-op.
     if (path === "/cancel" && request.method === "POST") {
-      target.run?.cancel();
+      const runId = request.headers["x-run-id"];
+      target.cancels.push(typeof runId === "string" ? runId : null);
+      if (!target.run) return text(204);
+      if (typeof runId === "string" && runId !== target.run.runId) {
+        return json(409, { runId: target.run.runId });
+      }
+      target.run.cancel();
       return text(204);
     }
     if (path === "/reset" && request.method === "POST") {
@@ -497,8 +557,12 @@ export async function startFakeCellServer(
         }
         if (typeof message !== "object" || message === null) return;
         const { type, text } = message as { type?: unknown; text?: unknown };
-        if (type === "prompt") startRun(target, String(text ?? ""), "user");
-        else if (type === "cancel") target.run?.cancel();
+        if (type === "prompt") {
+          // A refusal is the reply to this client's message, unnumbered and not an event.
+          const refusal = refusalOf(target, String(text ?? ""));
+          if (refusal !== undefined) ws.send(JSON.stringify({ type: "error", text: refusal }));
+          else startRun(target, String(text ?? ""), "user");
+        } else if (type === "cancel") target.run?.cancel();
       });
       // Every socket begins with the state and the roster at that number; a
       // client that names where it left off gets the persisted events after it.
@@ -522,6 +586,7 @@ export async function startFakeCellServer(
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     prompts: (name) => projects.get(name)?.prompts ?? [],
+    cancels: (name) => projects.get(name)?.cancels ?? [],
     dropSockets: () => {
       for (const target of projects.values()) {
         for (const ws of target.sockets) ws.close(1001, "The cell moved");
@@ -543,6 +608,7 @@ export async function startFakeCellServer(
     cancelRun: (name) => projects.get(name)?.run?.cancel(),
     startForeignRun: (name, prompt, steps) =>
       startRun(project(name), prompt, "user", steps) !== undefined,
+    raiseError: (name, text) => broadcast(project(name), { type: "error", text }),
     close: async () => {
       for (const timer of timers) clearTimeout(timer);
       timers.clear();

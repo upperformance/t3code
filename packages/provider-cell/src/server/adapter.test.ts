@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -309,10 +310,13 @@ describe("CellAdapterV2 over the fake cell", () => {
       const harness = yield* makeHarness(transport, fake.baseUrl);
       const project = yield* cellProjectName("t3-", THREAD_ID);
       assert.equal(harness.providerThread.nativeThreadRef?.nativeId, project);
+      // An error outside any run is the cell's diagnostic: logged, never an item of the turn.
+      fake.raiseError(project, "Could not report to the parent cell");
       yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Do the thing"));
       const terminal = yield* harness.takeEvent("turn.terminal");
       assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
       assert.deepEqual(fake.prompts(project), ["Do the thing"]);
+      assert.lengthOf(itemsOfType(harness.allEvents, "system_notice"), 0);
 
       const shells = itemsOfType(harness.allEvents, "command_execution");
       assert.deepEqual(
@@ -378,6 +382,8 @@ describe("CellAdapterV2 over the fake cell", () => {
       const shell = itemsOfType(harness.allEvents, "command_execution").at(-1);
       assert.equal(shell?.status, "interrupted");
       assert.lengthOf(itemsOfType(harness.allEvents, "assistant_message"), 0);
+      // The cancel names the run it is for; the fake refuses any other.
+      assert.deepEqual(fake.cancels(yield* cellProjectName("t3-", THREAD_ID)), ["run-1"]);
     }).pipe(Effect.scoped, Effect.provide(liveLayer)),
   );
 
@@ -794,6 +800,72 @@ describe("CellAdapterV2 over the fake cell", () => {
     }).pipe(Effect.scoped, Effect.provide(liveLayer)),
   );
 
+  it.live(
+    "the fake cell keeps a prompt's request id on its run and cancels only the run named",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* fakeCell({
+          script: () => [{ type: "shell_until_cancel", command: "sleep 30" }],
+        });
+        const transport = yield* liveTransport;
+        const project = "t3-direct";
+        const auth = { authorization: "Bearer secret-token" };
+        const post = (path: string, headers: Record<string, string>, body?: string) =>
+          transport.request({
+            method: "POST",
+            url: `${fake.baseUrl}/cell/${project}${path}`,
+            headers: { ...auth, ...headers },
+            ...(body === undefined ? {} : { body }),
+          });
+        const first = yield* post("/prompt", { "x-request-id": "req-1" }, "Run `sleep 30`");
+        assert.equal(first.status, 202);
+        assert.equal(first.body, '{"runId":"run-1","seq":1}');
+        const repeated = yield* post("/prompt", { "x-request-id": "req-1" }, "Run `sleep 30`");
+        assert.equal(repeated.status, 202, "a repeat with the run's request id is that run again");
+        assert.equal(repeated.body, '{"runId":"run-1","seq":1}');
+        const other = yield* post("/prompt", { "x-request-id": "req-2" }, "Something else");
+        assert.equal(other.status, 409);
+        assert.equal(other.body, '{"runId":"run-1"}');
+        const state = yield* transport.request({
+          method: "GET",
+          url: `${fake.baseUrl}/cell/${project}/state`,
+          headers: auth,
+        });
+        assert.include(state.body, '"requestId":"req-1"');
+        const wrongRun = yield* post("/cancel", { "x-run-id": "run-9" });
+        assert.equal(wrongRun.status, 409, "a cancel for another run cancels nothing");
+        assert.equal(wrongRun.body, '{"runId":"run-1"}');
+        const cancelled = yield* post("/cancel", { "x-run-id": "run-1" });
+        assert.equal(cancelled.status, 204);
+        yield* Effect.promise(() => fake.onceIdle(project));
+        const afterEnd = yield* post("/prompt", { "x-request-id": "req-1" }, "Run `sleep 30`");
+        assert.equal(afterEnd.status, 202, "the run that ended last still answers its request id");
+        assert.equal(afterEnd.body, '{"runId":"run-1","seq":1}');
+        assert.equal(
+          (yield* post("/cancel", { "x-run-id": "run-1" })).status,
+          204,
+          "no run: no-op",
+        );
+        assert.deepEqual(fake.cancels(project), ["run-9", "run-1", "run-1"]);
+        const empty = yield* post("/prompt", { "x-request-id": "req-3" }, "   ");
+        assert.equal(empty.status, 409);
+        assert.equal(empty.body, '{"runId":null,"error":"The prompt is empty"}');
+        assert.deepEqual(fake.prompts(project), ["Run `sleep 30`"]);
+        const unconfigured = yield* fakeCell({ configured: false });
+        const refused = yield* transport.request({
+          method: "POST",
+          url: `${unconfigured.baseUrl}/cell/${project}/prompt`,
+          headers: auth,
+          body: "Hi",
+        });
+        assert.equal(refused.status, 409);
+        assert.equal(
+          refused.body,
+          '{"runId":null,"error":"OPENAI_API_KEY is not configured for this cell"}',
+        );
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
   it.live("reports the tenant's model and key through the status probe", () =>
     Effect.gen(function* () {
       const transport = yield* liveTransport;
@@ -1057,31 +1129,72 @@ describe("CellAdapterV2 over a scripted socket", () => {
     }).pipe(Effect.scoped, Effect.provide(scriptedLayer)),
   );
 
-  it.effect("a lost prompt response is recovered from the cell's state and event log", () =>
-    Effect.gen(function* () {
-      const controller = scripted("prompt-lost-recovered", [
-        ...prelude({ seq: 4 }),
-        expectHttp("POST", "/cell/<project>/prompt", "Hi"),
-        httpFailure("socket hang up"),
-        expectHttp("GET", "/cell/<project>/state"),
-        httpResponse(200, stateBody({ running: true, runId: "run-1", seq: 6 })),
-        expectHttp("GET", "/cell/<project>/events?after=4&limit=1000"),
-        httpResponse(
-          200,
-          eventsPage([
-            { type: "user", text: "Hi", runId: "run-1", seq: 5, origin: "user" },
-            { type: "assistant", text: "RECOVERED", runId: "run-1", seq: 6 },
-          ]),
-        ),
-        ws({ type: "done", runId: "run-1", seq: 7 }),
-      ]);
-      const harness = yield* makeHarness(controller.transport, "https://cell.test");
-      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Hi"));
-      const terminal = yield* harness.takeEvent("turn.terminal");
-      assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
-      assert.deepEqual(assistantTexts(harness.allEvents), ["RECOVERED"]);
-      controller.assertComplete();
-    }).pipe(Effect.scoped, Effect.provide(scriptedLayer)),
+  it.effect(
+    "a lost prompt response is recovered by its request id on the opener in the event log",
+    () =>
+      Effect.gen(function* () {
+        const controller = scripted("prompt-lost-recovered", [
+          ...prelude({ seq: 4 }),
+          expectHttp("POST", "/cell/<project>/prompt", "Hi"),
+          httpFailure("socket hang up"),
+          expectHttp("GET", "/cell/<project>/state"),
+          httpResponse(
+            200,
+            stateBody({ running: true, runId: "run-1", requestId: "<request-id>", seq: 6 }),
+          ),
+          expectHttp("GET", "/cell/<project>/events?after=4&limit=1000"),
+          httpResponse(
+            200,
+            eventsPage([
+              {
+                type: "user",
+                text: "Hi",
+                runId: "run-1",
+                requestId: "<request-id>",
+                seq: 5,
+                origin: "user",
+              },
+              { type: "assistant", text: "RECOVERED", runId: "run-1", seq: 6 },
+            ]),
+          ),
+          ws({ type: "done", runId: "run-1", seq: 7 }),
+        ]);
+        const harness = yield* makeHarness(controller.transport, "https://cell.test");
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Hi"));
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents), ["RECOVERED"]);
+        controller.assertComplete();
+      }).pipe(Effect.scoped, Effect.provide(scriptedLayer)),
+  );
+
+  it.effect(
+    "a server error without the cell's refusal is a lost answer; one carrying it is a refusal",
+    () =>
+      Effect.gen(function* () {
+        const controller = scripted("prompt-5xx", [
+          ...prelude(),
+          expectHttp("POST", "/cell/<project>/prompt", "Hi"),
+          httpResponse(502, "<html>Bad Gateway</html>"),
+          expectHttp("GET", "/cell/<project>/state"),
+          httpResponse(200, stateBody()),
+          expectHttp("POST", "/cell/<project>/prompt", "Again"),
+          httpResponse(500, '{"runId":null,"error":"The body did not arrive"}'),
+        ]);
+        const harness = yield* makeHarness(controller.transport, "https://cell.test");
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Hi"));
+        const lost = yield* harness.takeEvent("turn.terminal");
+        assert.equal(lost.status, "failed");
+        assert.equal(failureOf(lost)?.class, "transport_error");
+        assert.include(failureOf(lost)?.message ?? "", "answered 502");
+        assert.include(failureOf(lost)?.message ?? "", "never started");
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Again", 2));
+        const refused = yield* harness.takeEvent("turn.terminal");
+        assert.equal(refused.status, "failed");
+        assert.equal(failureOf(refused)?.class, "provider_error");
+        assert.include(failureOf(refused)?.message ?? "", "The body did not arrive");
+        controller.assertComplete();
+      }).pipe(Effect.scoped, Effect.provide(scriptedLayer)),
   );
 
   it.effect("a lost prompt response against an idle cell fails the turn as never started", () =>
@@ -1400,13 +1513,28 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
     /** Ends the current connection as a dropped socket; the next one opens with `opensWith`. */
     readonly close: Effect.Effect<void>;
     readonly opensWith: (frames: ReadonlyArray<Record<string, unknown>>) => void;
-    /** What `GET events` answers from now on: the whole log in one complete page, or a page per request. */
+    /**
+     * What `GET events` answers from now on: the whole log in one complete
+     * page, or a page per request, which may be an effect the test releases.
+     */
     readonly replays: (
-      log: ReadonlyArray<Record<string, unknown>> | ((after: number) => Record<string, unknown>),
+      log:
+        | ReadonlyArray<Record<string, unknown>>
+        | ((after: number) => Record<string, unknown> | Effect.Effect<Record<string, unknown>>),
     ) => void;
+    /** What `GET state` answers from now on, over the idle default. */
+    readonly states: (over: Record<string, unknown>) => void;
     /** Answers the next `POST prompt`; given before the prompt, it answers at once. */
     readonly answerPrompt: (status: number, body?: string) => Effect.Effect<void>;
+    /** Fails the next `POST prompt` at the transport, as a dropped socket would. */
+    readonly failPrompt: (detail: string) => Effect.Effect<void>;
+    /** Answers the next `POST cancel`; without one queued, a cancel answers 204. */
+    readonly answerCancel: (status: number, body?: string) => Effect.Effect<void>;
     readonly replayRequests: Array<string>;
+    /** The `x-request-id` of every prompt posted, in order. */
+    readonly promptRequestIds: Array<string | undefined>;
+    /** The `x-run-id` of every cancel posted, in order. */
+    readonly cancels: Array<string | undefined>;
     /** How many sockets the adapter has opened. */
     readonly connects: () => number;
   }
@@ -1415,6 +1543,10 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
     const page = events.filter((event) => Number(event.seq) > after);
     return { events: page, nextAfter: page.at(-1)?.seq ?? after, complete: true };
   };
+  interface Answer {
+    readonly status: number;
+    readonly body: string;
+  }
   /**
    * A transport the test drives by hand, for races the transcript walk cannot
    * express: the prompt's answer is released when the test says, and frames
@@ -1424,17 +1556,23 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
   const driven = () =>
     Effect.gen(function* () {
       const incoming = yield* Queue.unbounded<ReadonlyArray<string> | "close">();
-      const answers = yield* Queue.unbounded<{ readonly status: number; readonly body: string }>();
+      const answers = yield* Queue.unbounded<Answer>();
+      const cancelAnswers = yield* Queue.unbounded<Answer>();
       let opening: ReadonlyArray<Record<string, unknown>> = [];
-      let replay: (after: number) => Record<string, unknown> = wholeLog([]);
+      let replay: (
+        after: number,
+      ) => Record<string, unknown> | Effect.Effect<Record<string, unknown>> = wholeLog([]);
       const replayRequests: Array<string> = [];
+      const promptRequestIds: Array<string | undefined> = [];
+      const cancels: Array<string | undefined> = [];
       let connects = 0;
-      const state = {
+      let state: Record<string, unknown> = {
         protocol: 3,
         model: "gpt-6-astra",
         running: false,
         configured: true,
         runId: null,
+        requestId: null,
         seq: 0,
         version: "0.4.0",
       };
@@ -1445,16 +1583,34 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
         ).pipe(Effect.asVoid);
       const transport: CellTransport = {
         request: (request) => {
-          if (request.method === "POST") return Queue.take(answers);
           const url = new URL(request.url);
+          if (request.method === "POST" && url.pathname.endsWith("/prompt")) {
+            promptRequestIds.push(request.headers["x-request-id"]);
+            // Status 0 stands for no answer at all.
+            return Queue.take(answers).pipe(
+              Effect.filterOrFail(
+                (answer) => answer.status !== 0,
+                (answer) =>
+                  new CellTransportError({ operation: "POST prompt", detail: answer.body }),
+              ),
+            );
+          }
+          if (request.method === "POST" && url.pathname.endsWith("/cancel")) {
+            cancels.push(request.headers["x-run-id"]);
+            return Queue.poll(cancelAnswers).pipe(
+              Effect.map(Option.getOrElse((): Answer => ({ status: 204, body: "" }))),
+            );
+          }
           if (url.pathname.endsWith("/events")) {
             replayRequests.push(`/events${url.search}`);
-            return Effect.succeed({
-              status: 200,
-              body: JSON.stringify(replay(Number(url.searchParams.get("after") ?? "0"))),
+            return Effect.suspend(() => {
+              const page = replay(Number(url.searchParams.get("after") ?? "0"));
+              return (Effect.isEffect(page) ? page : Effect.succeed(page)).pipe(
+                Effect.map((body) => ({ status: 200, body: JSON.stringify(body) })),
+              );
             });
           }
-          return Effect.succeed({ status: 200, body: JSON.stringify(state) });
+          return Effect.sync(() => ({ status: 200, body: JSON.stringify(state) }));
         },
         connect: () =>
           Effect.gen(function* () {
@@ -1486,9 +1642,18 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
         replays: (log) => {
           replay = typeof log === "function" ? log : wholeLog(log);
         },
+        states: (over) => {
+          state = { ...state, ...over };
+        },
         answerPrompt: (status, body = "") =>
           Queue.offer(answers, { status, body }).pipe(Effect.asVoid),
+        failPrompt: (detail) =>
+          Queue.offer(answers, { status: 0, body: detail }).pipe(Effect.asVoid),
+        answerCancel: (status, body = "") =>
+          Queue.offer(cancelAnswers, { status, body }).pipe(Effect.asVoid),
         replayRequests,
+        promptRequestIds,
+        cancels,
         connects: () => connects,
       };
       return cell;
@@ -1502,22 +1667,27 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
     ];
   };
   /** A task row sent last on a connection: once it reaches the roster, everything before it was processed. */
-  const marker = (seq: number) => ({
+  const marker = (seq: number, taskId = "marker") => ({
     type: "task",
-    task: { taskId: "marker", title: "Marker", status: "running" },
+    task: { taskId, title: "Marker", status: "running" },
     seq,
   });
   /** Lets the fibers behind the queues and the test clock run on. */
   const settle = Effect.gen(function* () {
     for (let index = 0; index < 100; index++) yield* Effect.yieldNow;
   });
-  const awaitMarker = (harness: Harness) =>
+  const awaitMarker = (harness: Harness, taskId = "marker") =>
     harness.takeEvent(
       "provider_thread.updated",
       (event) =>
-        event.providerThread.pendingBackgroundTasks?.some((task) => task.taskId === "marker") ===
+        event.providerThread.pendingBackgroundTasks?.some((task) => task.taskId === taskId) ===
         true,
     );
+  /** Waits on the live clock until the cell has seen as many requests of a kind. */
+  const awaitRequests = (count: () => number, expected: number) =>
+    Effect.gen(function* () {
+      while (count() < expected) yield* Effect.sleep("5 millis");
+    });
   /** Starts a turn and leaves it waiting on its unanswered prompt. */
   const startParked = Effect.fnUntraced(function* (harness: Harness, text: string, ordinal = 1) {
     const started = yield* harness.runtime
@@ -1604,7 +1774,10 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
         const harness = yield* makeHarness(cell.transport, "https://cell.test");
         const started = yield* startParked(harness, "Mine");
         yield* cell.send([{ type: "user", text: "Mine", runId: "A", seq: 1, origin: "user" }]);
-        cell.replays([]);
+        cell.replays([
+          { type: "fs", changes: [], seq: 2 },
+          { type: "fs", changes: [], seq: 3 },
+        ]);
         cell.opensWith([...prelude({ seq: 3 }), marker(4)]);
         yield* cell.close;
         yield* awaitMarker(harness);
@@ -2038,6 +2211,407 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
         assert.equal(failureOf(continuation)?.class, "transport_error");
         assert.include(failureOf(continuation)?.message ?? "", "while T3 was disconnected");
         assert.deepEqual(assistantTexts(harness.allEvents, 2), ["PARTIAL"]);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a lost 409 never adopts another client's identical prompt: without T3's request id on a run, the turn fails",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        // Another client's prompt with the same words ran and ended; the 409 to T3's own was lost.
+        const started = yield* startParked(harness, "Continue");
+        yield* cell.send([
+          { type: "user", text: "Continue", runId: "F", requestId: null, seq: 1, origin: "user" },
+          { type: "assistant", text: "FOREIGN ANSWER", runId: "F", seq: 2 },
+          { type: "done", runId: "F", seq: 3 },
+          marker(4),
+        ]);
+        yield* awaitMarker(harness);
+        cell.states({ seq: 4 });
+        yield* cell.failPrompt("socket hang up");
+        yield* Fiber.join(started);
+        const idle = yield* harness.takeEvent("turn.terminal");
+        assert.equal(idle.status, "failed");
+        assert.equal(failureOf(idle)?.class, "transport_error");
+        assert.include(failureOf(idle)?.message ?? "", "never started");
+        assert.deepEqual(assistantTexts(harness.allEvents), []);
+        assert.match(cell.promptRequestIds[0] ?? "", /^[0-9a-f-]{36}$/);
+
+        // The same words again, while the other client's run is still going: T3 cannot tell, and says so.
+        const again = yield* startParked(harness, "Continue", 2);
+        yield* cell.send([
+          { type: "user", text: "Continue", runId: "G", requestId: null, seq: 5, origin: "user" },
+          { type: "assistant", text: "FOREIGN AGAIN", runId: "G", seq: 6 },
+          marker(7, "marker-2"),
+        ]);
+        yield* awaitMarker(harness, "marker-2");
+        cell.states({ running: true, runId: "G", requestId: null, seq: 7 });
+        yield* cell.failPrompt("socket hang up");
+        yield* Fiber.join(again);
+        const running = yield* harness.takeEvent("turn.terminal");
+        assert.equal(running.status, "failed");
+        assert.equal(failureOf(running)?.class, "transport_error");
+        assert.include(failureOf(running)?.message ?? "", "cannot tell whether this message ran");
+        assert.deepEqual(assistantTexts(harness.allEvents), []);
+        assert.notEqual(cell.promptRequestIds[1], cell.promptRequestIds[0]);
+        assert.deepEqual(cell.replayRequests, []);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a lost prompt answer is recovered by T3's request id on the run's opener, or on the run the state names",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        const started = yield* startParked(harness, "Hi");
+        yield* awaitRequests(() => cell.promptRequestIds.length, 1);
+        const requestId = cell.promptRequestIds[0]!;
+        yield* cell.send([
+          { type: "user", text: "Hi", runId: "A", requestId, seq: 1, origin: "user" },
+          { type: "assistant", text: "BY_OPENER", runId: "A", seq: 2 },
+          marker(3),
+        ]);
+        yield* awaitMarker(harness);
+        yield* cell.failPrompt("socket hang up");
+        yield* Fiber.join(started);
+        yield* cell.send([{ type: "done", runId: "A", seq: 4 }]);
+        const first = yield* harness.takeEvent("turn.terminal");
+        assert.equal(first.status, "completed", failureOf(first)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents, 1), ["BY_OPENER"]);
+
+        // No opener among what T3 holds, but the state names T3's id on the run in progress.
+        const again = yield* startParked(harness, "Again", 2);
+        yield* awaitRequests(() => cell.promptRequestIds.length, 2);
+        const second = cell.promptRequestIds[1]!;
+        assert.notEqual(second, requestId);
+        cell.states({ running: true, runId: "B", requestId: second, seq: 4 });
+        yield* cell.failPrompt("socket hang up");
+        yield* Fiber.join(again);
+        yield* cell.send([
+          { type: "assistant", text: "BY_STATE", runId: "B", seq: 5 },
+          { type: "done", runId: "B", seq: 6 },
+        ]);
+        const terminal = yield* harness.takeEvent(
+          "turn.terminal",
+          (event) => event.runOrdinal === 2,
+        );
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents, 2), ["BY_STATE"]);
+        assert.deepEqual(cell.replayRequests, []);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "Stop decided behind a replay that ends the turn sends no cancel, so the run that followed is left alone",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+        yield* harness.takeEvent("provider_turn.updated");
+        yield* cell.send([{ type: "user", text: "Mine", runId: "A", seq: 1, origin: "user" }]);
+        // A ended and a child woke B while T3 was disconnected; the page saying so is held until released.
+        const replayStarted = yield* Deferred.make<void>();
+        const releaseReplay = yield* Deferred.make<void>();
+        cell.replays(() =>
+          Deferred.succeed(replayStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseReplay)),
+            Effect.as({
+              events: [
+                { type: "done", runId: "A", seq: 2 },
+                {
+                  type: "wake",
+                  text: "[Delegated task a done]",
+                  runId: "B",
+                  seq: 3,
+                  origin: "wake",
+                },
+                { type: "assistant", text: "WAKE", runId: "B", seq: 4 },
+              ],
+              nextAfter: 4,
+              complete: true,
+            }),
+          ),
+        );
+        cell.opensWith(prelude({ running: true, runId: "B", seq: 4 }));
+        yield* cell.close;
+        yield* Deferred.await(replayStarted);
+        const stop = yield* harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: activeTurnId(harness.allEvents),
+          })
+          .pipe(Effect.forkScoped);
+        yield* Effect.sleep("50 millis");
+        assert.deepEqual(cell.cancels, [], "the cancel waits behind the replay");
+        yield* Deferred.succeed(releaseReplay, undefined);
+        yield* Fiber.join(stop);
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(cell.cancels, [], "a turn the replay ended has nothing left to stop");
+        const request = yield* harness.takeContinuation;
+        yield* cell.send([{ type: "done", runId: "B", seq: 5 }]);
+        const wake = yield* runContinuation(harness, request, 2);
+        assert.equal(wake.status, "completed", failureOf(wake)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents, 2), ["WAKE"]);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a cancel the cell refuses because another run is active means the run ended: the replayed done settles the turn",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+        yield* harness.takeEvent("provider_turn.updated");
+        yield* cell.send([{ type: "user", text: "Mine", runId: "A", seq: 1, origin: "user" }]);
+        // By the time the cancel reaches the cell, A has ended and B runs: the cell names B and cancels nothing.
+        yield* cell.answerCancel(409, '{"runId":"B"}');
+        const stop = yield* harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: activeTurnId(harness.allEvents),
+          })
+          .pipe(Effect.forkScoped);
+        yield* awaitRequests(() => cell.cancels.length, 1);
+        assert.deepEqual(cell.cancels, ["A"]);
+        cell.replays([
+          { type: "assistant", text: "MINE", runId: "A", seq: 2 },
+          { type: "done", runId: "A", seq: 3 },
+          { type: "wake", text: "[Delegated task a done]", runId: "B", seq: 4, origin: "wake" },
+          { type: "assistant", text: "WAKE", runId: "B", seq: 5 },
+          { type: "done", runId: "B", seq: 6 },
+        ]);
+        cell.opensWith(prelude({ seq: 6 }));
+        yield* cell.close;
+        yield* Fiber.join(stop);
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents, 1), ["MINE"]);
+        const request = yield* harness.takeContinuation;
+        const wake = yield* runContinuation(harness, request, 2);
+        assert.equal(wake.status, "completed", failureOf(wake)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents, 2), ["WAKE"]);
+        assert.deepEqual(cell.cancels, ["A"]);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a gap the cell no longer retains marks a wake it still runs lost, and the loss outranks the wake's done",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* cell.send([
+          { type: "wake", text: "[Delegated task a done]", runId: "W", seq: 1, origin: "wake" },
+          { type: "assistant", text: "BEFORE GAP", runId: "W", seq: 2 },
+        ]);
+        const request = yield* harness.takeContinuation;
+        cell.replays((after) => ({
+          events: [],
+          nextAfter: after,
+          complete: false,
+          truncated: true,
+          earliest: 50,
+        }));
+        cell.opensWith([...prelude({ running: true, runId: "W", seq: 60 }), marker(61)]);
+        yield* cell.close;
+        yield* awaitMarker(harness);
+        yield* cell.send([
+          { type: "assistant", text: "AFTER GAP", runId: "W", seq: 62 },
+          { type: "done", runId: "W", seq: 63 },
+          marker(64, "marker-2"),
+        ]);
+        yield* awaitMarker(harness, "marker-2");
+        const continuation = yield* runContinuation(harness, request, 1);
+        assert.equal(continuation.status, "failed");
+        assert.equal(failureOf(continuation)?.class, "transport_error");
+        assert.include(failureOf(continuation)?.message ?? "", "while T3 was disconnected");
+        assert.deepEqual(assistantTexts(harness.allEvents, 1), ["BEFORE GAP", "AFTER GAP"]);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "an error outside any run is the cell's diagnostic, live or read back; a run's error is a notice; replies and unknown frames are ignored",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+        yield* cell.send([
+          { type: "user", text: "Mine", runId: "A", seq: 1, origin: "user" },
+          { type: "error", text: "Could not report to the parent cell", seq: 2 },
+          { type: "exec", id: "x", stdout: "", stderr: "", exitCode: 0, timedOut: false },
+          { type: "error", text: "apply_patch failed", runId: "A", seq: 3 },
+          { type: "assistant", text: "MINE", runId: "A", seq: 4 },
+          { type: "done", runId: "A", seq: 5 },
+        ]);
+        const first = yield* harness.takeEvent("turn.terminal");
+        assert.equal(first.status, "completed", failureOf(first)?.message);
+        assert.deepEqual(
+          itemsOfType(harness.allEvents, "system_notice").map((item) =>
+            item.type === "system_notice" ? item.message : "",
+          ),
+          ["apply_patch failed"],
+        );
+        yield* cell.answerPrompt(202, '{"runId":"B","seq":6}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Again", 2));
+        yield* cell.send([{ type: "user", text: "Again", runId: "B", seq: 6, origin: "user" }]);
+        cell.replays([
+          { type: "error", text: "Repaired /project: made a directory again", seq: 7 },
+          { type: "assistant", text: "LATE", runId: "B", seq: 8 },
+          { type: "done", runId: "B", seq: 9 },
+        ]);
+        cell.opensWith(prelude({ seq: 9 }));
+        yield* cell.close;
+        const second = yield* harness.takeEvent("turn.terminal", (event) => event.runOrdinal === 2);
+        assert.equal(second.status, "completed", failureOf(second)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents, 2), ["LATE"]);
+        assert.lengthOf(itemsOfType(harness.allEvents, "system_notice"), 1);
+        assert.equal(cell.connects(), 2);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.effect(
+    "a replay page that makes no progress, or ends the log before the snapshot, fails the recovery and keeps the cursor",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+        yield* cell.send([{ type: "user", text: "Mine", runId: "A", seq: 1, origin: "user" }]);
+        const log = [
+          { type: "assistant", text: "LATE", runId: "A", seq: 2 },
+          { type: "done", runId: "A", seq: 3 },
+        ];
+        let pages = 0;
+        cell.replays((after) => {
+          pages += 1;
+          // The first page stalls; the second claims the log ends at 2 though the snapshot said 3; the third is honest.
+          if (pages === 1) return { events: [], nextAfter: after, complete: false };
+          if (pages === 2) return { events: [log[0]!], nextAfter: 2, complete: true };
+          return wholeLog(log)(after);
+        });
+        cell.opensWith(prelude({ seq: 3 }));
+        yield* cell.close;
+        for (const backoff of ["500 millis", "1 seconds", "2 seconds"] as const) {
+          yield* TestClock.adjust(backoff);
+          yield* settle;
+        }
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents), ["LATE"]);
+        assert.deepEqual(cell.replayRequests, [
+          "/events?after=1&limit=1000",
+          "/events?after=1&limit=1000",
+          "/events?after=2&limit=1000",
+        ]);
+        assert.equal(cell.connects(), 4);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.effect(
+    "three connections in a row without a roster fail the active turn naming the reason; reconnecting goes on",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+        yield* cell.send([{ type: "user", text: "Mine", runId: "A", seq: 1, origin: "user" }]);
+        // Every connection from now on sends its state and nothing else.
+        cell.opensWith([prelude({ running: true, runId: "A", seq: 1 })[0]!]);
+        yield* cell.close;
+        for (const backoff of ["500 millis", "1 seconds", "2 seconds"] as const) {
+          yield* TestClock.adjust(backoff);
+          yield* settle;
+          yield* TestClock.adjust("10 seconds");
+          yield* settle;
+        }
+        assert.equal(cell.connects(), 4);
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "failed");
+        assert.equal(failureOf(terminal)?.class, "transport_error");
+        assert.include(failureOf(terminal)?.message ?? "", "no tasks roster");
+        assert.include(failureOf(terminal)?.message ?? "", "3 connections in a row");
+        yield* TestClock.adjust("5 seconds");
+        yield* settle;
+        assert.equal(cell.connects(), 5, "the socket keeps reconnecting while the thread is idle");
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a snapshot numbered below the last applied fails the turn as a transport error and attaches afresh",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude({ seq: 100 }));
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":101}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+        yield* cell.send([{ type: "user", text: "Mine", runId: "A", seq: 101, origin: "user" }]);
+        cell.opensWith([...prelude({ seq: 0 }), marker(1)]);
+        yield* cell.close;
+        const first = yield* harness.takeEvent("turn.terminal");
+        assert.equal(first.status, "failed");
+        assert.equal(failureOf(first)?.class, "transport_error");
+        assert.include(failureOf(first)?.message ?? "", "went backwards");
+        yield* awaitMarker(harness);
+        // The new numbering is followed from its snapshot: a run numbered 2 is not dropped as old.
+        yield* cell.answerPrompt(202, '{"runId":"B","seq":2}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Again", 2));
+        yield* cell.send([
+          { type: "user", text: "Again", runId: "B", seq: 2, origin: "user" },
+          { type: "assistant", text: "NEW", runId: "B", seq: 3 },
+          { type: "done", runId: "B", seq: 4 },
+        ]);
+        const second = yield* harness.takeEvent("turn.terminal", (event) => event.runOrdinal === 2);
+        assert.equal(second.status, "completed", failureOf(second)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents, 2), ["NEW"]);
+        assert.deepEqual(cell.replayRequests, []);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.effect(
+    "a roster numbered elsewhere than its state, and an event with a fractional number, each drop the connection",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        cell.opensWith([
+          { type: "state", running: false, runId: null, seq: 0 },
+          { type: "tasks", tasks: [], seq: 5 },
+        ]);
+        yield* cell.close;
+        yield* TestClock.adjust("500 millis");
+        yield* settle;
+        assert.equal(cell.connects(), 2);
+        cell.opensWith([...prelude(), { type: "fs", changes: [], seq: 1.5 }]);
+        yield* TestClock.adjust("1 seconds");
+        yield* settle;
+        assert.equal(cell.connects(), 3);
+        cell.opensWith([...prelude(), marker(1)]);
+        yield* TestClock.adjust("2 seconds");
+        yield* settle;
+        assert.equal(cell.connects(), 4);
+        yield* awaitMarker(harness);
       }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
   );
 });
