@@ -146,6 +146,20 @@ export const MUSE_DEFAULT_MODEL = "default";
 /** The cell runs the model its tenant configured; the adapter never sends a model. */
 const CELL_DEFAULT_MODEL = "default";
 
+/**
+ * Providers whose model is decided elsewhere: Antigravity by its signed-in
+ * session, a cell by its tenant. A custom model slug would never reach them,
+ * so clients offer none and the server catalogs none.
+ */
+const PROVIDERS_WITHOUT_CUSTOM_MODELS: ReadonlySet<string> = new Set([
+  "antigravity",
+  CELL_DRIVER_KIND,
+]);
+
+export function providerSupportsCustomModels(driver: string | null | undefined): boolean {
+  return driver == null || !PROVIDERS_WITHOUT_CUSTOM_MODELS.has(driver);
+}
+
 export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, string>> = {
   [CODEX_DRIVER_KIND]: DEFAULT_MODEL,
   [CLAUDE_DRIVER_KIND]: "claude-fable-5-1",

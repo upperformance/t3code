@@ -30,6 +30,7 @@ import {
   type ProviderDriverKind,
   type ServerProvider,
   type ServerProviderModel,
+  providerSupportsCustomModels,
 } from "@t3tools/contracts";
 
 import {
@@ -718,10 +719,9 @@ export function ProviderInstanceCard({
     instance.config !== null && typeof instance.config === "object"
       ? (instance.config as Record<string, unknown>).customModels
       : undefined;
-  const customModels =
-    instance.driver === "antigravity"
-      ? NO_CUSTOM_MODELS
-      : readCustomModelEntries(storedCustomModels);
+  const customModels = providerSupportsCustomModels(instance.driver)
+    ? readCustomModelEntries(storedCustomModels)
+    : NO_CUSTOM_MODELS;
   const modelsForDisplay = deriveProviderModelsForDisplay({
     liveModels: liveProvider?.models,
     customModels,
