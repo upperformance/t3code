@@ -1,11 +1,11 @@
 /**
- * The cell's wire shapes: `GET state`, the WebSocket events, the prompt
- * responses, and the project naming the adapter and the status probe share.
- * Events the cell added after this build are ignored rather than failing the
- * socket, so an older T3 keeps working against a newer tenant. Run ids,
- * sequence numbers and structured `done` errors are optional for the same
- * reason in the other direction: a tenant without them still works, with the
- * conservative behaviour docs/internals/provider-cell.md describes.
+ * The cell's wire shapes at cell protocol level 3: `GET state`, the WebSocket
+ * events, the prompt responses, the event-log page, and the project naming
+ * the adapter and the status probe share. Every event carries the cell's
+ * sequence number, every run-scoped event names its run, and a tenant that
+ * states a lower level, or none, is refused before anything is sent to it.
+ * Events the cell adds after this build are ignored rather than failing the
+ * socket, so this T3 keeps working against a newer tenant.
  */
 import { ProviderDriverKind } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -14,6 +14,9 @@ import * as Schema from "effect/Schema";
 
 export const CELL_PROVIDER = ProviderDriverKind.make("cell");
 
+/** The cell protocol this adapter speaks; `GET state` must report it or a later one. */
+const CELL_PROTOCOL_LEVEL = 3;
+
 /**
  * Durable Object names are capped at 64 and children append `.<id>` to the
  * parent's name, so the thread's share is a fixed 20 hex characters: 80 bits
@@ -21,18 +24,53 @@ export const CELL_PROVIDER = ProviderDriverKind.make("cell");
  */
 const PROJECT_HASH_BYTES = 10;
 
+/** The tenant speaks an older cell protocol; the message says which and what this provider needs. */
+export class CellProtocolError extends Schema.TaggedError<CellProtocolError>()(
+  "CellProtocolError",
+  { level: Schema.NullOr(Schema.Number) },
+) {
+  override get message(): string {
+    const spoken =
+      this.level === null
+        ? `a cell protocol older than ${CELL_PROTOCOL_LEVEL}, stating no level`
+        : `cell protocol ${this.level}`;
+    return `This cell tenant speaks ${spoken}; this provider needs ${CELL_PROTOCOL_LEVEL}. Update celld on the tenant.`;
+  }
+}
+
 export const CellState = Schema.Struct({
+  protocol: Schema.Number,
   model: Schema.String,
   running: Schema.Boolean,
+  runId: Schema.NullOr(Schema.String),
+  /** The last sequence number the cell emitted. */
+  seq: Schema.Number,
   configured: Schema.Boolean,
-  turns: Schema.optional(Schema.Number),
   version: Schema.optional(Schema.String),
+  turns: Schema.optional(Schema.Number),
   depth: Schema.optional(Schema.Number),
   tasks: Schema.optional(Schema.Number),
-  runId: Schema.optional(Schema.NullOr(Schema.String)),
-  seq: Schema.optional(Schema.Number),
 });
 export type CellState = typeof CellState.Type;
+
+const decodeProtocolLevel = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({ protocol: Schema.optional(Schema.Number) })),
+);
+const decodeState = Schema.decodeUnknownEffect(Schema.fromJsonString(CellState));
+
+/**
+ * Reads a `GET state` body. The level is read first, so a tenant below level
+ * 3 is refused with the level it states rather than with a decoding error
+ * about the fields it lacks; a body that is not a JSON object is not a cell
+ * state at all.
+ */
+export const readCellState = Effect.fnUntraced(function* (body: string) {
+  const { protocol } = yield* decodeProtocolLevel(body);
+  if (protocol === undefined || protocol < CELL_PROTOCOL_LEVEL) {
+    return yield* new CellProtocolError({ level: protocol ?? null });
+  }
+  return yield* decodeState(body);
+});
 
 export const CellTask = Schema.Struct({
   taskId: Schema.String,
@@ -67,18 +105,17 @@ export const CellDoneError = Schema.Struct({
 });
 export type CellDoneError = typeof CellDoneError.Type;
 
-const sequenced = { seq: Schema.optional(Schema.Number) };
-const runScoped = { ...sequenced, runId: Schema.optional(Schema.String) };
-const prompted = { ...runScoped, origin: Schema.optional(Schema.Literals(["user", "wake"])) };
+/** Every event is numbered; run-scoped ones name their run; `user` and `wake` say who started it. */
+const sequenced = { seq: Schema.Number };
+const runScoped = { ...sequenced, runId: Schema.String };
+const prompted = { ...runScoped, origin: Schema.Literals(["user", "wake"]) };
 
 export const CellEvent = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("state"),
     running: Schema.Boolean,
-    parent: Schema.optional(Schema.Unknown),
-    depth: Schema.optional(Schema.Number),
-    runId: Schema.optional(Schema.NullOr(Schema.String)),
-    seq: Schema.optional(Schema.Number),
+    runId: Schema.NullOr(Schema.String),
+    ...sequenced,
   }),
   Schema.Struct({ type: Schema.Literal("tasks"), tasks: Schema.Array(CellTask), ...sequenced }),
   Schema.Struct({
@@ -122,7 +159,7 @@ export const CellEvent = Schema.Union([
   Schema.Struct({ type: Schema.Literal("error"), text: Schema.String, ...runScoped }),
   Schema.Struct({
     type: Schema.Literal("done"),
-    error: Schema.optional(Schema.NullOr(Schema.Union([Schema.String, CellDoneError]))),
+    error: Schema.optional(Schema.NullOr(CellDoneError)),
     ...runScoped,
   }),
   Schema.Struct({ type: Schema.Literal("reset"), ...sequenced }),
@@ -176,10 +213,10 @@ export const isCellRunEvent = (event: CellEvent): event is CellRunEvent =>
 export const isCellWakeEvent = (event: CellEvent): boolean =>
   event.type === "wake" || (event.type === "user" && event.origin === "wake");
 
-/** Body of a 202 to `POST prompt`; a tenant without run ids answers with an empty body. */
+/** Body of a 202 to `POST prompt`: the run's id and the number of its opening `user` event. */
 export const CellPromptAccepted = Schema.Struct({
   runId: Schema.String,
-  seq: Schema.optional(Schema.Number),
+  seq: Schema.Number,
 });
 export type CellPromptAccepted = typeof CellPromptAccepted.Type;
 
@@ -187,6 +224,21 @@ export type CellPromptAccepted = typeof CellPromptAccepted.Type;
 export const CellPromptRejected = Schema.Struct({
   runId: Schema.optional(Schema.NullOr(Schema.String)),
 });
+
+/**
+ * A page of `GET events?after=<seq>&limit=<n>`, ordered by number. `complete`
+ * says the log has nothing after `nextAfter`; `truncated` says the cell no
+ * longer retains events as far back as `after`, and `earliest` is the oldest
+ * it keeps.
+ */
+export const CellEventsPage = Schema.Struct({
+  events: Schema.Array(Schema.Unknown),
+  nextAfter: Schema.Number,
+  complete: Schema.Boolean,
+  truncated: Schema.optional(Schema.Boolean),
+  earliest: Schema.optional(Schema.Number),
+});
+export type CellEventsPage = typeof CellEventsPage.Type;
 
 const decodePromptAccepted = Schema.decodeUnknownOption(Schema.fromJsonString(CellPromptAccepted));
 const decodePromptRejected = Schema.decodeUnknownOption(Schema.fromJsonString(CellPromptRejected));
@@ -206,30 +258,13 @@ export type CellDoneOutcome =
       readonly kind: "failed";
       readonly failureClass: "usage_limit" | "provider_error" | "transport_error";
       readonly message: string;
-      readonly code: string | null;
+      readonly code: string;
       readonly resetAt: string | null;
     };
 
-const USAGE_LIMIT_TEXT = /insufficient_quota|rate[\s_-]?limit|\b429\b|quota/i;
-
-/**
- * A structured `done.error` is classified by its code; a plain string, which
- * is all the current protocol sends, by the words providers use for quota.
- */
-export function classifyCellDone(
-  error: string | CellDoneError | null | undefined,
-): CellDoneOutcome {
+/** A `done` without an error completed; with one, the error's code names the failure class. */
+export function classifyCellDone(error: CellDoneError | null | undefined): CellDoneOutcome {
   if (error === null || error === undefined) return { kind: "completed" };
-  if (typeof error === "string") {
-    if (error === "Cancelled") return { kind: "cancelled" };
-    return {
-      kind: "failed",
-      failureClass: USAGE_LIMIT_TEXT.test(error) ? "usage_limit" : "provider_error",
-      message: error,
-      code: null,
-      resetAt: null,
-    };
-  }
   if (error.code === "cancelled") return { kind: "cancelled" };
   const message =
     error.status === undefined ? error.message : `${error.message} (HTTP ${error.status})`;

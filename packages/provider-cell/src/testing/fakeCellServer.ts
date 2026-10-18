@@ -1,16 +1,15 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off preferSchemaOverJson:off - a plain Node stand-in for celld, used by recorders and tests.
 /**
- * A stand-in for a celld tenant: the cell's HTTP API and WebSocket on a local
- * port, with a scripted model instead of the Responses API. It answers the
- * shared fixture prompts the way the real cell does, so transcripts recorded
- * against it carry the real protocol shape. `protocol: "current"` speaks the
- * protocol with run ids, sequence numbers, event replay and structured `done`
- * errors; `protocol: "legacy"` is the tenant before those were added.
+ * A stand-in for a celld tenant speaking cell protocol 3: the cell's HTTP API
+ * and WebSocket on a local port, with a scripted model instead of the
+ * Responses API. It answers the shared fixture prompts the way the real cell
+ * does, so transcripts recorded against it carry the real protocol shape:
+ * every event numbered and persisted, run-scoped events naming their run,
+ * `state` then the numbered `tasks` roster first on every socket, a paged
+ * event log with bounded retention, and structured `done` errors.
  */
 import * as NodeHttp from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
-
-export type FakeCellProtocol = "current" | "legacy";
 
 export type FakeCellStep =
   | { readonly type: "assistant"; readonly text: string }
@@ -57,7 +56,6 @@ export type FakeCellScript = (
 
 export interface FakeCellServer {
   readonly baseUrl: string;
-  readonly protocol: FakeCellProtocol;
   readonly prompts: (project: string) => ReadonlyArray<string>;
   /** Closes every socket as celld does when a cell moves; clients are expected to reconnect. */
   readonly dropSockets: () => void;
@@ -83,12 +81,16 @@ interface Run {
   cancel: () => void;
 }
 
+type PersistedEvent = Record<string, unknown> & { readonly seq: number };
+
 interface Project {
   readonly prompts: Array<string>;
   readonly sockets: Set<WebSocket>;
   readonly connectionWaiters: Array<() => void>;
   readonly idleWaiters: Array<() => void>;
-  readonly events: Array<Record<string, unknown>>;
+  readonly events: Array<PersistedEvent>;
+  /** The opening event's number of each retained run, oldest first. */
+  readonly runStarts: Array<number>;
   readonly tasks: Map<string, Record<string, unknown>>;
   readonly answers: Array<string>;
   run: Run | null;
@@ -98,7 +100,10 @@ interface Project {
   configured: boolean;
 }
 
+const PROTOCOL_LEVEL = 3;
 const EVENT_RETENTION = 20_000;
+const RUN_RETENTION = 200;
+const PAGE_LIMIT = 1_000;
 
 /**
  * Answers the shared fixture prompts: "Respond with exactly: X", a shell that
@@ -151,15 +156,12 @@ export async function startFakeCellServer(
     readonly configured?: boolean;
     readonly version?: string;
     readonly token?: string;
-    readonly protocol?: FakeCellProtocol;
     /** How long a delegated child works after its parent's run ended. */
     readonly delegateDelayMs?: number;
   } = {},
 ): Promise<FakeCellServer> {
   const script = options.script ?? defaultFakeCellScript;
-  const protocol = options.protocol ?? "current";
-  const current = protocol === "current";
-  const version = options.version ?? (current ? "0.3.0" : "0.2.0");
+  const version = options.version ?? "0.4.0";
   const delegateDelayMs = options.delegateDelayMs ?? 20;
   const projects = new Map<string, Project>();
   const timers = new Set<NodeJS.Timeout>();
@@ -173,6 +175,7 @@ export async function startFakeCellServer(
         connectionWaiters: [],
         idleWaiters: [],
         events: [],
+        runStarts: [],
         tasks: new Map(),
         answers: [],
         run: null,
@@ -185,19 +188,54 @@ export async function startFakeCellServer(
     }
     return existing;
   };
+  /** The same fields over HTTP and as the first frame of every socket. */
+  const stateOf = (target: Project) => ({
+    protocol: PROTOCOL_LEVEL,
+    version,
+    model: target.model,
+    running: target.run !== null,
+    runId: target.run?.runId ?? null,
+    seq: target.seq,
+    configured: target.configured,
+    turns: target.prompts.length,
+    sockets: target.sockets.size,
+    parent: null,
+    depth: 0,
+    tasks: target.tasks.size,
+  });
   const send = (target: Project, event: Record<string, unknown>) => {
     const payload = JSON.stringify(event);
     for (const socket of target.sockets) {
       if (socket.readyState === socket.OPEN) socket.send(payload);
     }
   };
-  /** Persisted events carry the next sequence number and can be replayed. */
-  const broadcast = (target: Project, event: Record<string, unknown>) => {
-    if (!current) return send(target, event);
-    const sequenced = { ...event, seq: ++target.seq };
+  /** The log keeps the last 20,000 events or the last 200 runs, whichever is smaller. */
+  const prune = (target: Project) => {
+    if (target.runStarts.length > RUN_RETENTION) {
+      target.runStarts.splice(0, target.runStarts.length - RUN_RETENTION);
+    }
+    if (target.runStarts.length === RUN_RETENTION) {
+      const oldestRun = target.runStarts[0]!;
+      const kept = target.events.findIndex((event) => event.seq >= oldestRun);
+      target.events.splice(0, kept === -1 ? target.events.length : kept);
+    }
+    if (target.events.length > EVENT_RETENTION) {
+      target.events.splice(0, target.events.length - EVENT_RETENTION);
+    }
+  };
+  /** Every event is numbered and persisted before it is broadcast. */
+  const broadcast = (
+    target: Project,
+    event: Record<string, unknown>,
+    options: { readonly opensRun?: boolean } = {},
+  ): number => {
+    const seq = ++target.seq;
+    const sequenced: PersistedEvent = { ...event, seq };
     target.events.push(sequenced);
-    if (target.events.length > EVENT_RETENTION) target.events.shift();
+    if (options.opensRun === true) target.runStarts.push(seq);
+    prune(target);
     send(target, sequenced);
+    return seq;
   };
   const authorized = (request: NodeHttp.IncomingMessage) =>
     !options.token || request.headers.authorization === `Bearer ${options.token}`;
@@ -226,11 +264,7 @@ export async function startFakeCellServer(
     broadcast(target, { type: "task", task });
     const text = `[Delegated task ${step.taskId} "${step.title}" completed]\n${step.summary}`;
     if (target.run) {
-      broadcast(target, {
-        type: "wake",
-        text,
-        ...(current ? { runId: target.run.runId, origin: "wake" } : {}),
-      });
+      broadcast(target, { type: "wake", text, runId: target.run.runId, origin: "wake" });
       return;
     }
     startRun(target, text, "wake", step.wake);
@@ -242,15 +276,11 @@ export async function startFakeCellServer(
     origin: "user" | "wake",
     scripted?: ReadonlyArray<FakeCellStep>,
   ): { readonly runId: string; readonly seq: number } | undefined => {
-    if (target.run || !prompt.trim()) return undefined;
-    if (!target.configured) {
-      broadcast(target, { type: "error", text: "OPENAI_API_KEY is not configured for this cell" });
-      return undefined;
-    }
+    if (target.run || !target.configured || !prompt.trim()) return undefined;
     if (origin === "user") target.prompts.push(prompt);
     const steps = [...(scripted ?? script(prompt, target.prompts.length, target.answers))];
     const runId = `run-${++target.runs}`;
-    const scope = current ? { runId } : {};
+    const scope = { runId };
     let cancelled = false;
     let wakeCancel: (() => void) | undefined;
     const run: Run = {
@@ -261,13 +291,12 @@ export async function startFakeCellServer(
       },
     };
     target.run = run;
-    broadcast(target, {
-      type: origin === "wake" ? "wake" : "user",
-      text: prompt,
-      ...scope,
-      ...(current ? { origin } : {}),
-    });
-    const accepted = { runId, seq: target.seq };
+    const opening = broadcast(
+      target,
+      { type: origin === "wake" ? "wake" : "user", text: prompt, ...scope, origin },
+      { opensRun: true },
+    );
+    const accepted = { runId, seq: opening };
     const delegated: Array<Extract<FakeCellStep, { readonly type: "delegate" }>> = [];
     void (async () => {
       let failure: Extract<FakeCellStep, { readonly type: "fail" }> | undefined;
@@ -366,19 +395,15 @@ export async function startFakeCellServer(
         if (failure !== undefined) break;
       }
       const error = cancelled
-        ? current
-          ? { code: "cancelled", message: "Cancelled" }
-          : "Cancelled"
+        ? { code: "cancelled", message: "Cancelled" }
         : failure === undefined
           ? undefined
-          : current
-            ? {
-                code: failure.code ?? "provider_error",
-                message: failure.error,
-                ...(failure.status === undefined ? {} : { status: failure.status }),
-                ...(failure.resetAt === undefined ? {} : { resetAt: failure.resetAt }),
-              }
-            : failure.error;
+          : {
+              code: failure.code ?? "provider_error",
+              message: failure.error,
+              ...(failure.status === undefined ? {} : { status: failure.status }),
+              ...(failure.resetAt === undefined ? {} : { resetAt: failure.resetAt }),
+            };
       broadcast(
         target,
         error === undefined ? { type: "done", ...scope } : { type: "done", error, ...scope },
@@ -406,29 +431,15 @@ export async function startFakeCellServer(
     const target = project(decodeURIComponent(match[1]!));
     const path = match[2] ?? "/";
     if (path === "/state" && request.method === "GET") {
-      return json(200, {
-        model: target.model,
-        running: target.run !== null,
-        configured: target.configured,
-        turns: target.prompts.length,
-        sockets: target.sockets.size,
-        parent: null,
-        depth: 0,
-        tasks: target.tasks.size,
-        version,
-        ...(current ? { runId: target.run?.runId ?? null, seq: target.seq } : {}),
-      });
+      return json(200, stateOf(target));
     }
     if (path === "/prompt" && request.method === "POST") {
       const body = await readBody(request);
-      if (target.run) {
-        return current
-          ? json(409, { runId: target.run.runId })
-          : text(409, "An agent run is already in progress");
-      }
+      if (target.run) return json(409, { runId: target.run.runId });
+      if (!target.configured) return text(409, "OPENAI_API_KEY is not configured for this cell");
       const accepted = startRun(target, body, "user");
       if (accepted === undefined) return text(409, "The prompt was not started");
-      return current ? json(202, accepted) : text(202);
+      return json(202, accepted);
     }
     if (path === "/cancel" && request.method === "POST") {
       target.run?.cancel();
@@ -442,15 +453,25 @@ export async function startFakeCellServer(
     if (path === "/tasks" && request.method === "GET") {
       return json(200, [...target.tasks.values()]);
     }
-    if (path === "/events" && request.method === "GET" && current) {
+    if (path === "/events" && request.method === "GET") {
       const after = Number(url.searchParams.get("after") ?? "0");
-      const limit = Number(url.searchParams.get("limit") ?? String(EVENT_RETENTION));
-      return json(
-        200,
-        target.events
-          .filter((event) => typeof event.seq === "number" && event.seq > after)
-          .slice(0, Math.max(0, limit)),
+      const limit = Math.min(
+        PAGE_LIMIT,
+        Math.max(1, Number(url.searchParams.get("limit") ?? String(PAGE_LIMIT))),
       );
+      const earliest = target.events[0]?.seq;
+      if (earliest !== undefined && after < earliest - 1) {
+        return json(200, {
+          events: [],
+          nextAfter: after,
+          complete: false,
+          truncated: true,
+          earliest,
+        });
+      }
+      const events = target.events.filter((event) => event.seq > after).slice(0, limit);
+      const nextAfter = events.at(-1)?.seq ?? after;
+      return json(200, { events, nextAfter, complete: nextAfter >= target.seq });
     }
     return text(404, "Not found");
   });
@@ -463,6 +484,7 @@ export async function startFakeCellServer(
       return;
     }
     const target = project(decodeURIComponent(match[1]!));
+    const after = url.searchParams.get("after");
     sockets.handleUpgrade(request, socket, head, (ws) => {
       target.sockets.add(ws);
       ws.on("close", () => target.sockets.delete(ws));
@@ -478,16 +500,17 @@ export async function startFakeCellServer(
         if (type === "prompt") startRun(target, String(text ?? ""), "user");
         else if (type === "cancel") target.run?.cancel();
       });
-      ws.send(
-        JSON.stringify({
-          type: "state",
-          running: target.run !== null,
-          parent: null,
-          depth: 0,
-          ...(current ? { runId: target.run?.runId ?? null, seq: target.seq } : {}),
-        }),
-      );
-      ws.send(JSON.stringify({ type: "tasks", tasks: [...target.tasks.values()] }));
+      // Every socket begins with the state and the roster at that number; a
+      // client that names where it left off gets the persisted events after it.
+      const state = stateOf(target);
+      ws.send(JSON.stringify({ type: "state", ...state }));
+      ws.send(JSON.stringify({ type: "tasks", tasks: [...target.tasks.values()], seq: state.seq }));
+      if (after !== null) {
+        const from = Number(after);
+        for (const event of target.events) {
+          if (event.seq > from) ws.send(JSON.stringify(event));
+        }
+      }
       for (const waiter of target.connectionWaiters.splice(0)) waiter();
     });
   });
@@ -498,7 +521,6 @@ export async function startFakeCellServer(
   }
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
-    protocol,
     prompts: (name) => projects.get(name)?.prompts ?? [],
     dropSockets: () => {
       for (const target of projects.values()) {

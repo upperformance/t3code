@@ -6,6 +6,7 @@ import {
   cellProjectName,
   cellSocketUrl,
   classifyCellDone,
+  readCellState,
   readPromptAccepted,
   readPromptRejectedRunId,
 } from "./protocol.ts";
@@ -49,18 +50,68 @@ describe("cell urls", () => {
   });
 });
 
+describe("readCellState", () => {
+  const state = (over: Record<string, unknown>) =>
+    JSON.stringify({
+      protocol: 3,
+      model: "gpt-6-astra",
+      running: false,
+      runId: null,
+      seq: 12,
+      configured: true,
+      version: "0.4.0",
+      ...over,
+    });
+
+  it.effect("reads a level-3 state", () =>
+    Effect.gen(function* () {
+      const read = yield* readCellState(state({}));
+      assert.equal(read.protocol, 3);
+      assert.equal(read.seq, 12);
+      assert.isNull(read.runId);
+    }),
+  );
+
+  it.effect("refuses a tenant below level 3 by the level it states", () =>
+    Effect.gen(function* () {
+      const stated = yield* readCellState(state({ protocol: 2 })).pipe(Effect.flip);
+      assert.equal(stated._tag, "CellProtocolError");
+      assert.include(stated.message, "cell protocol 2");
+      assert.include(stated.message, "needs 3");
+      const unstated = yield* readCellState(
+        JSON.stringify({ model: "gpt-6-astra", running: false, configured: true }),
+      ).pipe(Effect.flip);
+      assert.equal(unstated._tag, "CellProtocolError");
+      assert.include(unstated.message, "stating no level");
+      assert.include(unstated.message, "needs 3");
+    }),
+  );
+
+  it.effect("tells a body that is not a cell state from an old one", () =>
+    Effect.gen(function* () {
+      assert.equal((yield* readCellState("<html>").pipe(Effect.flip))._tag, "SchemaError");
+      assert.equal(
+        (yield* readCellState(state({ model: 7 })).pipe(Effect.flip))._tag,
+        "SchemaError",
+      );
+    }),
+  );
+});
+
 describe("prompt responses", () => {
-  it("reads the run id from a 202 and tolerates the empty body of an older tenant", () => {
+  it("reads the run id and opening number from a 202, and the running id from a 409", () => {
     expect(readPromptAccepted('{"runId":"run-7","seq":41}')).toEqual({ runId: "run-7", seq: 41 });
+    expect(readPromptAccepted('{"runId":"run-7"}')).toBeUndefined();
     expect(readPromptAccepted("")).toBeUndefined();
     expect(readPromptRejectedRunId('{"runId":"run-3"}')).toBe("run-3");
-    expect(readPromptRejectedRunId("An agent run is already in progress")).toBeUndefined();
+    expect(readPromptRejectedRunId("The prompt was not started")).toBeUndefined();
   });
 });
 
 describe("classifyCellDone", () => {
-  it("classifies a structured error by its code and keeps the reset time", () => {
+  it("classifies a done by its error code and keeps the reset time", () => {
     assert.deepEqual(classifyCellDone(undefined), { kind: "completed" });
+    assert.deepEqual(classifyCellDone(null), { kind: "completed" });
     assert.deepEqual(classifyCellDone({ code: "cancelled", message: "Cancelled" }), {
       kind: "cancelled",
     });
@@ -73,19 +124,12 @@ describe("classifyCellDone", () => {
     assert.equal(limited.kind, "failed");
     if (limited.kind !== "failed") return;
     assert.equal(limited.failureClass, "usage_limit");
+    assert.equal(limited.code, "usage_limit");
     assert.equal(limited.resetAt, "2026-10-19T00:00:00.000Z");
     assert.include(limited.message, "429");
     const transport = classifyCellDone({ code: "transport_error", message: "fetch failed" });
     assert.isTrue(transport.kind === "failed" && transport.failureClass === "transport_error");
     const tool = classifyCellDone({ code: "tool_error", message: "tsc exited 2" });
     assert.isTrue(tool.kind === "failed" && tool.failureClass === "provider_error");
-  });
-
-  it("falls back to the words of a plain-string error", () => {
-    assert.deepEqual(classifyCellDone("Cancelled"), { kind: "cancelled" });
-    const quota = classifyCellDone("429 insufficient_quota: You exceeded your current quota");
-    assert.isTrue(quota.kind === "failed" && quota.failureClass === "usage_limit");
-    const other = classifyCellDone("model refused");
-    assert.isTrue(other.kind === "failed" && other.failureClass === "provider_error");
   });
 });

@@ -1,7 +1,6 @@
 export { CellEvent, CellState } from "./server/protocol.ts";
 export {
   startFakeCellServer,
-  type FakeCellProtocol,
   type FakeCellServer,
   type FakeCellScript,
   type FakeCellStep,

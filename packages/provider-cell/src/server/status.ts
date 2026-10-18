@@ -7,7 +7,6 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
-import * as Schema from "effect/Schema";
 
 import {
   buildServerProvider,
@@ -19,7 +18,7 @@ import {
   cellApiUrl,
   cellAuthorizationHeaders,
   cellProbeProjectName,
-  CellState,
+  readCellState,
 } from "./protocol.ts";
 import type { CellTransport } from "./transport.ts";
 
@@ -34,7 +33,6 @@ const CELL_PRESENTATION = {
 } as const;
 
 const PROBE_TIMEOUT_MS = 8_000;
-const decodeState = Schema.decodeUnknownEffect(Schema.fromJsonString(CellState));
 
 /** The tenant decides the model; the catalog is that one entry, and the adapter refuses any other. */
 function cellModels(model: string | undefined): ReadonlyArray<ServerProviderModel> {
@@ -121,14 +119,24 @@ export const checkCellProviderStatus = Effect.fn("checkCellProviderStatus")(func
       message: "The cell tenant rejected the access token. Update it in Settings → Providers.",
     });
   }
-  const state = yield* decodeState(body).pipe(Effect.result);
-  if (status !== 200 || Result.isFailure(state)) {
+  const state = yield* readCellState(body).pipe(Effect.result);
+  if (status !== 200 || (Result.isFailure(state) && state.failure._tag === "SchemaError")) {
     return snapshot({
       installed: false,
       version: null,
       status: "error",
       auth: { status: "unknown" },
       message: `${settings.baseUrl} answered ${status} without a cell state; it is not a cell tenant.`,
+    });
+  }
+  // A cell tenant, but one speaking an older protocol than this provider.
+  if (Result.isFailure(state)) {
+    return snapshot({
+      installed: true,
+      version: null,
+      status: "error",
+      auth: { status: "unknown" },
+      message: state.failure.message,
     });
   }
   const version = state.success.version ?? null;
