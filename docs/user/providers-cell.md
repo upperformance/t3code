@@ -93,10 +93,13 @@ message again once it has finished.
 
 What the next session can show is bounded by what the cell still holds. The
 cell keeps a bounded log of its recent events; if more happened than it kept,
-or the conversation was reset from the cell's page meanwhile, the resumed turn
-is reported as failed with a note saying so, and the cell's own page has the
-full transcript. The last piece of output shown before T3 Code stopped may
-appear again after the restart. A delegated task still running at the restart
-is shown as cancelled in the thread, which can no longer follow it; the task
-itself runs on, and when it finishes the cell wakes the thread with its result
-as usual, provided the thread is open at the time.
+the resumed turn is reported as failed with a note saying so, and the cell's
+own page has the full transcript. If the conversation was reset from the
+cell's page meanwhile, the resumed turn is reported as failed with a note
+saying that instead; the reset discarded the conversation, so the cell's page
+shows whatever conversation the cell has had since. The last piece of output
+shown before T3 Code stopped may appear again after the restart. A delegated
+task still running at the restart stays shown as running in the thread: the
+next session picks it up where the cell has it, its result lands on that same
+task when it finishes, and the cell wakes the thread with the result as usual,
+provided the thread is open at the time.

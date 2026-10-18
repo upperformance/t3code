@@ -130,9 +130,18 @@ state` carry it as `requestId`, null when the run has none. A prompt
   `{ runId }` naming it and cancels nothing; with no run in progress it
   answers 204 and does nothing; without the header it cancels whatever runs.
   The adapter always sends the header.
+- **The cell names itself.** `GET state` and the `state` frame carry `name`,
+  `<tenant>/<project>`, and `misnamed`: null, or text saying the runtime's and
+  the stored names disagreed when the cell was activated. The cell also
+  records a disagreement once, as a numbered standalone `error` of kind
+  `identity`. The adapter reports a misnaming as a warning in the server log
+  naming the thread and the cell, once per session by its text: every
+  connection's `state` repeats it, the recorded error may be read back from
+  the log or arrive live, and none of those says anything new.
 - **Every connection opens the same way.** The socket sends `state` (the same
-  fields as `GET state`, so `running`, `runId`, `requestId` and `seq` at that
-  moment), then `tasks`, the full roster numbered at exactly that `seq`, then
+  fields as `GET state`, so `running`, `runId`, `requestId`, `name`,
+  `misnamed` and `seq` at that moment), then `tasks`, the full roster
+  numbered at exactly that `seq`, then
   events. The roster therefore always arrives before any replayed or live
   event, and it describes the cell exactly at the number `state` gave.
 - **A gap can be read back.** `GET events?after=<seq>&limit=<n>` (n ≤ 1000)
@@ -147,8 +156,8 @@ state` carry it as `requestId`, null when the run has none. A prompt
   successful run's `done` carries no error.
 
 `GET state` is read once per session when the thread is attached, which is
-where the level is checked and the tenant's model learned, and again to
-recover a lost prompt reply. Events the cell adds after this build are
+where the level is checked, the tenant's model learned and a misnaming
+reported, and again to recover a lost prompt reply. Events the cell adds after this build are
 ignored rather than failing the socket, so this T3 keeps working against a
 newer tenant. What the cell does send of the protocol is validated: a `seq`
 that is not a non-negative integer, a 202 whose `seq` is not one, a roster
@@ -208,21 +217,21 @@ through the same recovery by request id. A status below 500 without the
 refusal shape fails the turn quoting the body, as a provider error when the
 tenant rejected the token (401, 403) and as a transport error otherwise.
 
-| Cell event               | T3 effect                                                                                                                                                              |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `state`                  | First on every connection: where the cell is, by number, and which run it is running. On a reconnect, drives the reconciliation below.                                 |
-| `tasks`                  | Second on every connection, numbered at `state.seq`: the roster at that moment. Tasks it no longer lists are settled as cancelled and dropped.                         |
-| `user`                   | Ignored: T3 already recorded the prompt. Its number is where the run begins, which the 202 reports.                                                                    |
-| `assistant`              | A completed assistant message item. No streaming.                                                                                                                      |
-| `shell` / `shell_output` | A `command_execution` item, running then completed with stdout and stderr joined and the exit code.                                                                    |
-| `tool` / `tool_output`   | A `dynamic_tool` item for the orchestration tools (`delegate_task` and friends), with input and output.                                                                |
-| `patch`                  | A completed `file_change` item per changed path. The cell sends no diff, so the item has a name and operation.                                                         |
-| `task`                   | Subagent lifecycle: `subagent.updated`, a `subagent` node and a `subagent` item keyed by the task id.                                                                  |
-| `wake`                   | A cell-initiated run, queued and offered as a continuation; inside T3's own run, a notice item.                                                                        |
-| `error`                  | Naming a run: a `system_notice` item of that run's turn (an apply_patch failure, for example); the turn goes on. Standalone: a warning in the log, assigned to no run. |
-| `done`                   | Turn completed; cancelled or interrupted when the error is a cancellation; otherwise failed, classified.                                                               |
-| `reset`                  | The conversation was reset from another client. An active turn fails, queued wakes are dropped.                                                                        |
-| `fs`                     | Ignored: it serves the browser's file sync.                                                                                                                            |
+| Cell event               | T3 effect                                                                                                                                                                                                                                                |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `state`                  | First on every connection: where the cell is, by number, which run it is running, and its name. A `misnamed` text is logged once per session. On a reconnect, drives the reconciliation below.                                                           |
+| `tasks`                  | Second on every connection, numbered at `state.seq`: the roster at that moment. Tasks it no longer lists are settled as cancelled and dropped.                                                                                                           |
+| `user`                   | Ignored: T3 already recorded the prompt. Its number is where the run begins, which the 202 reports.                                                                                                                                                      |
+| `assistant`              | A completed assistant message item. No streaming.                                                                                                                                                                                                        |
+| `shell` / `shell_output` | A `command_execution` item, running then completed with stdout and stderr joined and the exit code.                                                                                                                                                      |
+| `tool` / `tool_output`   | A `dynamic_tool` item for the orchestration tools (`delegate_task` and friends), with input and output.                                                                                                                                                  |
+| `patch`                  | A completed `file_change` item per changed path. The cell sends no diff, so the item has a name and operation.                                                                                                                                           |
+| `task`                   | Subagent lifecycle: `subagent.updated`, a `subagent` node and a `subagent` item keyed by the task id.                                                                                                                                                    |
+| `wake`                   | A cell-initiated run, queued and offered as a continuation; inside T3's own run, a notice item.                                                                                                                                                          |
+| `error`                  | Naming a run: a `system_notice` item of that run's turn (an apply_patch failure, for example); the turn goes on. Standalone: a warning in the log, assigned to no run; one of kind `identity` is the misnaming `state` reports, logged once per session. |
+| `done`                   | Turn completed; cancelled or interrupted when the error is a cancellation; otherwise failed, classified.                                                                                                                                                 |
+| `reset`                  | The conversation was reset from another client. An active turn fails, queued wakes are dropped.                                                                                                                                                          |
+| `fs`                     | Ignored: it serves the browser's file sync.                                                                                                                                                                                                              |
 
 Interrupt is `POST cancel` naming the turn's run in `x-run-id`; the cell
 confirms with a cancelled `done`, and the adapter waits for that before
@@ -494,12 +503,29 @@ work is gone and the agent must restart it. For a cell nothing is cut off:
 the run and its delegated tasks live on the tenant. The adapter says so with
 `sessions.backgroundWorkSurvivesRestart`, and recovery then records none of
 the cell thread's work as cancelled, so no note is written, the continuation
-keeps its `restartContinuationOfRunId`, and the adapter adopts. Recovery
-still terminalizes the rows it can no longer follow: a delegated task's
-subagent row from before the restart shows as cancelled, since the next
-session has no owner to publish its end to, while the task itself runs on and
-its completion wakes the cell, which the next session receives as a wake if
-its socket is open then.
+keeps its `restartContinuationOfRunId`, and the adapter adopts. A session
+record stored by a build from before the capability lacks the field; recovery
+then asks the adapter's own capabilities through the registry, so the first
+restart after an upgrade treats the thread the same way, and a note that
+older build already wrote on the cut run is withdrawn by recovery and, should
+one still reach a turn start, ignored for a provider whose work survives.
+
+A delegated task survives with its rows. Recovery terminalizes the cut run's
+own rows but leaves a provider-native subagent's rows (the subagent, its node
+and its item) and the thread's task roster open, since the task runs on and
+the thread is still waiting on it. The next turn hands the open subagent
+items to the adapter with the thread (`openNativeSubagentItems` on
+`ensureThread` and `resumeThread`), keyed by the task id in `nativeItemRef`.
+The first roster decides what became of each: a task the cell still lists
+keeps the rows it was handed, and the first turn of the session to publish
+it, the restart continuation when one comes, takes them over as its own, so
+the task's end, live or from the roster, lands on the subagent row that
+showed it start, with its item's ordinal and start time kept; a task the cell
+no longer lists ended while no session was open, and that turn settles its
+rows as cancelled. A session closing leaves the rows alone for the same
+reason: the task runs on, so the adapter no longer reports it cancelled at
+close. The task's completion also wakes the cell, which the next session
+receives as a wake if its socket is open then.
 
 What restoration does not survive: a prompt whose 202 had not arrived when T3
 stopped, a window of one round trip in which the head names no run yet, so
@@ -601,8 +627,12 @@ speaks level 3 with the request id. The restart itself is not a transcript:
 one database against the fake cell, stops the first the way the server stops
 (worker halted, continuation prepared, sessions shut down, state reconciled)
 while a turn with a delegated child is in progress, and checks that the
-second takes the run back without a prompt and that no turn is told its
-background work was cancelled.
+second takes the run back without a prompt, that no turn is told its
+background work was cancelled, and that the child's result lands on the
+subagent row the first server showed, which goes from running to completed
+and stays the thread's only one. Its waits are driven by the thread's stored
+events and bounded on the wall clock, and the orchestrator's test clock is
+moved by the test alone, between the two servers.
 
 The adapter's own tests cover the rules above: the rejected prompt racing
 another run's events, a 202 overtaking the previous run's tail, a stranger

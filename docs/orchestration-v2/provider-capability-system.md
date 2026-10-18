@@ -41,10 +41,20 @@ Policy examples:
 - If pending requests do not survive restart, mark old requests `not_resumable`.
 - If background work survives restart (the provider runs on a remote origin
   that does not notice the server stopping, as a cell does), runtime recovery
-  still terminalizes the rows it can no longer follow, but records none of
-  that work as cancelled: no restart note tells the next turn to restart it,
-  and a restart continuation keeps its `restartContinuationOfRunId` so the
-  adapter can take the surviving turn back natively instead of being prompted.
+  records none of that work as cancelled: no restart note tells the next turn
+  to restart it, and a restart continuation keeps its
+  `restartContinuationOfRunId` so the adapter can take the surviving turn
+  back natively instead of being prompted. The cut run's own rows are still
+  terminalized, but a provider-native subagent's rows (the subagent, its node
+  and its item) and the provider thread's task roster are left open, and the
+  next turn hands the open subagent items to the adapter
+  (`openNativeSubagentItems` on `ensureThread` and `resumeThread`) so the
+  task's end is published to the rows that showed it start. A session record
+  stored before this field existed lacks it; recovery then asks the adapter's
+  own capabilities through the registry, so a provider that gains the field
+  in an upgrade is treated by it on the first restart after, and a note an
+  earlier build already wrote on such a run is withdrawn at recovery and
+  ignored when the turn starts.
 
 Provider-thread resumption is not a capability. It is a required adapter primitive. Adapters must be able to start from a stored provider cursor/session/thread handle or return a runtime resume failure.
 
