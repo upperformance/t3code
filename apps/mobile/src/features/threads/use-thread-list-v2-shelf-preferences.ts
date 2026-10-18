@@ -1,6 +1,6 @@
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
-import { useCallback, useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 
@@ -22,28 +22,30 @@ export function useThreadListV2ShelfPreferences() {
   const snoozedShelfExpandedRef = useRef(snoozedShelfExpanded);
   const settledShelfExpandedRef = useRef(settledShelfExpanded);
   const workingShelfExpandedRef = useRef(workingShelfExpanded);
-  snoozedShelfExpandedRef.current = snoozedShelfExpanded;
-  settledShelfExpandedRef.current = settledShelfExpanded;
-  workingShelfExpandedRef.current = workingShelfExpanded;
+  useLayoutEffect(() => {
+    snoozedShelfExpandedRef.current = snoozedShelfExpanded;
+    settledShelfExpandedRef.current = settledShelfExpanded;
+    workingShelfExpandedRef.current = workingShelfExpanded;
+  });
 
-  const toggleSnoozedShelf = useCallback(() => {
+  const toggleSnoozedShelf = () => {
     if (!loaded) return;
     const expanded = !snoozedShelfExpandedRef.current;
     snoozedShelfExpandedRef.current = expanded;
     savePreferences({ threadListSnoozedShelfExpanded: expanded });
-  }, [loaded, savePreferences]);
-  const toggleSettledShelf = useCallback(() => {
+  };
+  const toggleSettledShelf = () => {
     if (!loaded) return;
     const expanded = !settledShelfExpandedRef.current;
     settledShelfExpandedRef.current = expanded;
     savePreferences({ threadListSettledShelfExpanded: expanded });
-  }, [loaded, savePreferences]);
-  const toggleWorkingShelf = useCallback(() => {
+  };
+  const toggleWorkingShelf = () => {
     if (!loaded) return;
     const expanded = !workingShelfExpandedRef.current;
     workingShelfExpandedRef.current = expanded;
     savePreferences({ threadListWorkingShelfExpanded: expanded });
-  }, [loaded, savePreferences]);
+  };
 
   return {
     loaded,
