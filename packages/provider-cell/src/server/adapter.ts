@@ -7,12 +7,12 @@
  * or, when that answer was lost, the request id T3 sent with the prompt found
  * on the run in the cell's state or on its opening event. From then on an
  * event is the turn's exactly when it carries that run id. The run T3 owns
- * and the last number it applied are kept on the provider thread's head ref,
- * which the orchestrator persists and hands back when a later session resumes
- * the thread, so a run that outlives T3 is taken back or read to its end
- * before anything else is sent. The tenant must speak cell protocol 3: every
- * event numbered, every connection opening with `state` and the `tasks`
- * roster, and a paged event log to read a gap back.
+ * and the number up to which its output is applied are kept on the provider
+ * thread's head ref, which the orchestrator persists and hands back when a
+ * later session resumes the thread, so a run that outlives T3 is taken back
+ * or read to its end before anything else is sent. The tenant must speak
+ * cell protocol 3: every event numbered, every connection opening with
+ * `state` and the `tasks` roster, and a paged event log to read a gap back.
  * docs/internals/provider-cell.md records the rules.
  */
 import {
@@ -89,6 +89,10 @@ const CellProviderCapabilitiesV2 = {
     supportsProviderSwitchingViaHandoff: true,
     supportsRuntimeModeSwitchInSession: false,
     pendingRequestsSurviveRestart: false,
+    // The cell runs on without T3: a turn in progress and the tasks it
+    // delegated outlive a server restart, and the next session takes the run
+    // back through the thread's persisted head.
+    backgroundWorkSurvivesRestart: true,
   },
   threads: {
     canCreateEmptyThread: true,
@@ -219,6 +223,9 @@ const RESTORED_LOST_MESSAGE =
   "The cell's run for the turn in progress when T3 Code last stopped ended while T3 Code was down, and how it ended could not be read back; its result stayed in the cell. Send another message to continue the conversation there.";
 const WAKE_RESET_MESSAGE =
   "The cell conversation was reset from another client before this delegated result reached T3, and the reset discarded it. Send another message to continue there.";
+/** The run T3 owned when it stopped was discarded by a reset before the next session could take it back. */
+const RESTORED_RESET_MESSAGE =
+  "The cell conversation was reset from another client after T3 Code last stopped, which discarded the run for the turn then in progress; whatever that run produced before the reset is shown above, and nothing more will come from it. Send another message to continue in the reset conversation.";
 const UNNAMED_RUN_MESSAGE =
   "The cell accepted the prompt without naming its run and the number of its first event, so T3 cannot tell which output is this turn's. Its result stays in the cell; send another message to continue there.";
 /** The prompt's answer was lost and nothing in the cell names the request id T3 sent, while the cell runs something. */
@@ -276,8 +283,14 @@ interface ActiveTurn {
   readonly candidates: Array<CellRunEvent>;
   /** The cell's state at the latest reconnect while the prompt was unanswered, judged once the 202 names the run. */
   snapshot: CellSnapshot | undefined;
-  /** The thread's head has named this turn's run; the turn's end writes the head that follows it. */
-  persisted: boolean;
+  /**
+   * The number the thread's head names this turn's run at: the boundary
+   * before anything of the run still to be applied when the run was named,
+   * then the number of each event of the run applied. Undefined until the
+   * head names the run; from then on the turn's end writes the head that
+   * follows it.
+   */
+  head: number | undefined;
 }
 
 /** A run of the cell's agent loop: its id and the number of its opening event. */
@@ -328,6 +341,12 @@ interface PendingWake {
   ended: boolean;
   /** The run ended while T3 was disconnected and could not be read back, so the buffer is incomplete. */
   lost: boolean;
+  /**
+   * A `reset` discarded the run after it was queued. Only the run the last
+   * session owned is kept past a reset, so that the turn which comes to take
+   * it back learns of the reset instead of posting its text as a prompt.
+   */
+  reset: boolean;
   /** The run has been offered to the orchestrator as a continuation. */
   offered: boolean;
   /** The orchestrator persisted the continuation, so a turn for it will come. */
@@ -536,20 +555,28 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       });
       /**
        * The thread's persisted head while a run is T3's: the run, the request
-       * id its prompt was posted with, and the last number applied. The
-       * orchestrator keeps it with the provider thread and hands it back when
-       * a later session resumes the thread, so that session can take the run
-       * back if the cell still runs it, or read its end from the log.
+       * id its prompt was posted with, and the number up to which the run's
+       * output is applied. The orchestrator keeps it with the provider thread
+       * and hands it back when a later session resumes the thread, so that
+       * session can take the run back if the cell still runs it, or read its
+       * end from the log. The number is never the last one received, which
+       * runs ahead of the output while events wait for the prompt's answer:
+       * a session resuming from the head must find everything below it
+       * already applied, and read everything above it back.
        */
-      const publishHead = Effect.fnUntraced(function* (turn: ActiveTurn, runId: string) {
-        turn.persisted = true;
+      const publishHead = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        runId: string,
+        seq: number,
+      ) {
+        turn.head = seq;
         yield* updateThread({
           nativeConversationHeadRef: {
             driver: CELL_PROVIDER,
             nativeId: runId,
             strength: "strong",
             fingerprint: turn.requestId,
-            ordinal: lastSeq,
+            ordinal: seq,
           },
         });
       });
@@ -998,7 +1025,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         // place: that run is what the next session takes back.
         yield* updateThread({
           status: disposition === "broken" ? "error" : "idle",
-          ...((status === "completed" || turn.persisted) && !closed
+          ...((status === "completed" || turn.head !== undefined) && !closed
             ? { nativeConversationHeadRef: nativeRef(turn.scope.nativeId, "weak") }
             : {}),
         });
@@ -1069,6 +1096,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           events: [],
           ended: false,
           lost: false,
+          reset: false,
           offered: false,
           dispatched: false,
         };
@@ -1091,6 +1119,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             events: [],
             ended: false,
             lost: false,
+            reset: false,
             offered: false,
             dispatched: false,
           });
@@ -1247,7 +1276,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         if (event.runId === turn.run.id) {
           yield* applyToTurn(turn, event);
           // The head follows every event of the run applied, so a session that ends here resumes from here.
-          if (isActive(turn)) yield* publishHead(turn, turn.run.id);
+          if (isActive(turn)) yield* publishHead(turn, turn.run.id, event.seq);
           return;
         }
         if (event.seq < turn.run.firstSeq) return yield* routeUnowned(event);
@@ -1271,8 +1300,18 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
        */
       const accept = Effect.fnUntraced(function* (turn: ActiveTurn, run: CellRun) {
         turn.run = run;
-        yield* publishHead(turn, run.id);
         const candidates = turn.candidates.splice(0).toSorted((a, b) => a.seq - b.seq);
+        // Ownership is persisted at the number before anything of the run
+        // still to be applied: the candidates were received while the prompt
+        // was unanswered, so the last number received is past them, and a
+        // session that ended with the head there would resume with none of
+        // them. The head then follows each one applied.
+        const boundary =
+          Math.min(
+            run.firstSeq,
+            ...candidates.flatMap((event) => (event.runId === run.id ? [event.seq] : [])),
+          ) - 1;
+        yield* publishHead(turn, run.id, boundary);
         for (const event of candidates) yield* handleRunEvent(event);
         const snapshot = turn.snapshot;
         turn.snapshot = undefined;
@@ -1290,18 +1329,28 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
        * here, its buffered events are replayed into it, and what the cell
        * still sends for it arrives live. A run that lost events to a gap, or
        * whose end T3 could not read back, ends as lost even when its `done`
-       * was read: what the buffer holds is not the whole run.
+       * was read: what the buffer holds is not the whole run. A run a reset
+       * discarded ends naming the reset, after what the cell did for it
+       * before, since nothing more will come.
        */
       const adopt = Effect.fnUntraced(function* (turn: ActiveTurn, wake: PendingWake) {
         turn.run = { id: wake.runId, firstSeq: wake.firstSeq };
-        // The turn carries the run either way, so its end writes the head that follows it.
-        turn.persisted = true;
+        // The head names the run from the number the queue started it at, a
+        // wake's opener or where the last session left off, both applied
+        // already, and follows each buffered event applied as it does live;
+        // so the turn's end writes the head that follows it, and a session
+        // ending during the replay resumes from what it had shown.
+        yield* publishHead(turn, wake.runId, wake.firstSeq);
         for (const event of wake.events) {
           if (!isActive(turn)) break;
           if (wake.lost && event.type === "done") continue;
           yield* applyToTurn(turn, event);
+          if (isActive(turn)) yield* publishHead(turn, wake.runId, event.seq);
         }
         if (!isActive(turn)) return;
+        if (wake.reset) {
+          return yield* finish(turn, "failed", RESTORED_RESET_MESSAGE, "transport_error");
+        }
         if (wake.lost) {
           return yield* finish(
             turn,
@@ -1310,7 +1359,6 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             "transport_error",
           );
         }
-        yield* publishHead(turn, wake.runId);
       });
       const dispatch: (event: CellEvent) => Effect.Effect<void> = Effect.fnUntraced(function* (
         event: CellEvent,
@@ -1334,9 +1382,19 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             return yield* observeTask(event.task);
           }
           case "reset":
-            // Only a dispatched continuation will come asking for its wake; the rest are simply gone.
+            // Only a dispatched continuation will come asking for its wake;
+            // the rest are simply gone. The run the last session owned stays,
+            // ended by the reset: the turn that comes to take it back, T3's
+            // own restart continuation or the offered one, must learn of the
+            // reset rather than post its text to the cell as a new prompt.
             for (const wake of wakes.splice(0)) {
-              if (wake.dispatched) resetWakes.add(wake.messageId);
+              if (wake.kind === "restored") {
+                wake.reset = true;
+                wake.ended = true;
+                wakes.push(wake);
+              } else if (wake.dispatched) {
+                resetWakes.add(wake.messageId);
+              }
             }
             if (active) {
               active.candidates.splice(0);
@@ -2010,7 +2068,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           run: undefined,
           candidates: [],
           snapshot: undefined,
-          persisted: false,
+          head: undefined,
         };
         yield* Effect.gen(function* () {
           thread = turnInput.providerThread;

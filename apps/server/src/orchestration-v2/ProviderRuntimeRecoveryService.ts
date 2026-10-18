@@ -3,6 +3,7 @@ import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   CommandId,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2ProviderCapabilities,
   type ProviderThreadId,
   type OrchestrationV2RestartCancelledBackgroundWork,
   type OrchestrationV2Subagent,
@@ -117,6 +118,19 @@ function providerThreadHasPendingBackgroundTasks(
   providerThread: OrchestrationV2ThreadProjection["providerThreads"][number],
 ): boolean {
   return (providerThread.pendingBackgroundTasks?.length ?? 0) > 0;
+}
+
+/**
+ * Whether the session's provider keeps working after the server stops, as a
+ * cell does on its tenant. A session record from before the capability was
+ * stored, or one a test leaves without capabilities, says it does not.
+ */
+function backgroundWorkSurvivesRestart(
+  session: OrchestrationV2ThreadProjection["providerSessions"][number] | undefined,
+): boolean {
+  const capabilities: Partial<OrchestrationV2ProviderCapabilities> | undefined =
+    session?.capabilities;
+  return capabilities?.sessions?.backgroundWorkSurvivesRestart === true;
 }
 
 function resolveStaleBackgroundItemProviderInstanceId(
@@ -267,6 +281,24 @@ export const make = Effect.gen(function* () {
         Array<OrchestrationV2RestartCancelledBackgroundWork>
       >();
       const cancelledBackgroundNativeIds = new Set<string>();
+      // Work on a provider that runs on without the server (a cell's turn and
+      // the tasks it delegated live on the tenant) is not cancelled by the
+      // restart, so none of it is recorded as such: the rows T3 can no longer
+      // follow are still terminalized below, but no note tells the next turn
+      // to restart the work, and the restart continuation keeps the run it
+      // resumes, which the adapter takes back natively instead of being
+      // prompted while the cell still runs it.
+      const survivingProviderThreadIds = new Set(
+        projection.providerThreads.flatMap((providerThread) =>
+          backgroundWorkSurvivesRestart(
+            projection.providerSessions.find(
+              (candidate) => candidate.id === providerThread.providerSessionId,
+            ),
+          )
+            ? [providerThread.id]
+            : [],
+        ),
+      );
       const recordCancelledBackgroundWork = (
         providerThreadId: ProviderThreadId | null | undefined,
         work: OrchestrationV2RestartCancelledBackgroundWork,
@@ -281,6 +313,7 @@ export const make = Effect.gen(function* () {
       ) => {
         if (!isBackgroundCapableTurnItemType(item.type)) return;
         const awaitingId = awaitingProviderThreadId(item, projection.runs);
+        if (awaitingId != null && survivingProviderThreadIds.has(awaitingId)) return;
         const ownProviderThread =
           item.providerThreadId === awaitingId
             ? undefined
@@ -559,7 +592,10 @@ export const make = Effect.gen(function* () {
         if (!needsIdle && !needsRosterClear) {
           continue;
         }
-        if (providerThread.ownerNodeId === null) {
+        if (
+          providerThread.ownerNodeId === null &&
+          !survivingProviderThreadIds.has(providerThread.id)
+        ) {
           for (const task of providerThread.pendingBackgroundTasks ?? []) {
             // A subagent already recorded covers the shells it started.
             if (

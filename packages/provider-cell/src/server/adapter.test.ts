@@ -40,7 +40,7 @@ import {
 import { makeReplayCellTransport } from "../testing/replayTransport.ts";
 import { makeCellAdapterV2, type CellAdapterV2Options } from "./adapter.ts";
 import { CELL_RUNTIME_MODE_MESSAGE } from "./errors.ts";
-import { cellProjectName } from "./protocol.ts";
+import { CELL_PROVIDER, cellProjectName } from "./protocol.ts";
 import { checkCellProviderStatus } from "./status.ts";
 import { CellTransportError, makeHttpCellTransport, type CellTransport } from "./transport.ts";
 
@@ -2775,6 +2775,228 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
         yield* settle;
         assert.equal(cell.connects(), 4);
         yield* awaitMarker(harness);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+  it.live(
+    "ownership is persisted before the output buffered while the prompt was unanswered, and a session restored from that head shows all of it",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* startParked(harness, "Mine");
+        yield* awaitRequests(() => cell.promptRequestIds.length, 1);
+        const requestId = cell.promptRequestIds[0]!;
+        // The cell broadcasts the run's first events before it answers the prompt.
+        const log = [
+          { type: "user", text: "Mine", runId: "A", requestId, seq: 1, origin: "user" },
+          { type: "assistant", text: "ONE", runId: "A", seq: 2 },
+          { type: "assistant", text: "TWO", runId: "A", seq: 3 },
+          marker(4),
+        ];
+        yield* cell.send(log);
+        yield* awaitMarker(harness);
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+        const owned = yield* harness.takeEvent(
+          "provider_thread.updated",
+          (event) => event.providerThread.nativeConversationHeadRef?.strength === "strong",
+        );
+        assert.equal(owned.providerThread.nativeConversationHeadRef?.nativeId, "A");
+        assert.equal(
+          owned.providerThread.nativeConversationHeadRef?.ordinal,
+          0,
+          "the first head names the number before the buffered opener, not the last number received",
+        );
+        yield* harness.takeEvent(
+          "provider_thread.updated",
+          (event) => event.providerThread.nativeConversationHeadRef?.ordinal === 3,
+        );
+        // The opener, applied without output, moves the head to 1; each answer's head then follows the answer in the stream the orchestrator persists in order.
+        const trail = harness.allEvents.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+            ? [`answer:${event.turnItem.text}`]
+            : event.type === "provider_thread.updated" &&
+                event.providerThread.nativeConversationHeadRef?.strength === "strong"
+              ? [`head:${event.providerThread.nativeConversationHeadRef.ordinal}`]
+              : [],
+        );
+        assert.deepEqual(trail, [
+          "head:0",
+          "head:1",
+          "answer:ONE",
+          "head:2",
+          "answer:TWO",
+          "head:3",
+        ]);
+
+        // A session that ended right after the first head was persisted, as
+        // the orchestrator stored it, reads the whole buffer back from there.
+        const later = yield* driven();
+        later.states({ running: true, runId: "A", seq: 4 });
+        later.opensWith(
+          prelude({ running: true, runId: "A", seq: 4 }, [
+            { taskId: "marker", title: "Marker", status: "running" },
+          ]),
+        );
+        later.replays(log);
+        const resumed = yield* makeHarness(later.transport, "https://cell.test", {
+          providerSessionId: ProviderSessionId.make("session-cell-2"),
+          resume: owned.providerThread,
+        });
+        assert.deepEqual(later.replayRequests, ["/events?after=0&limit=1000"]);
+        yield* resumed.runtime.startTurn(
+          yield* turnInput(resumed.providerThread, "Continue where you left off.", 2, {
+            createdBy: "agent",
+            creationSource: "server",
+            restartContinuationOfRunId: RunId.make("run-1"),
+          }),
+        );
+        yield* later.send([{ type: "done", runId: "A", seq: 5 }]);
+        const terminal = yield* resumed.takeEvent(
+          "turn.terminal",
+          (event) => event.runOrdinal === 2,
+        );
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(assistantTexts(resumed.allEvents, 2), ["ONE", "TWO"]);
+        assert.deepEqual(later.promptRequestIds, [], "the continuation posts nothing");
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a wake adopted from its buffer persists the head behind each event applied, never ahead of it",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* cell.send([
+          { type: "wake", text: "[Delegated task a done]", runId: "A", seq: 1, origin: "wake" },
+          { type: "assistant", text: "FIRST", runId: "A", seq: 2 },
+          { type: "assistant", text: "SECOND", runId: "A", seq: 3 },
+          marker(4),
+        ]);
+        yield* awaitMarker(harness);
+        const request = yield* harness.takeContinuation;
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "", 1, {
+            createdBy: "agent",
+            creationSource: "provider",
+            ...(request.messageId === undefined ? {} : { messageId: request.messageId }),
+          }),
+        );
+        yield* harness.takeEvent(
+          "provider_thread.updated",
+          (event) => event.providerThread.nativeConversationHeadRef?.ordinal === 3,
+        );
+        const trail = harness.allEvents.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+            ? [`answer:${event.turnItem.text}`]
+            : event.type === "provider_thread.updated" &&
+                event.providerThread.nativeConversationHeadRef?.strength === "strong"
+              ? [`head:${event.providerThread.nativeConversationHeadRef.ordinal}`]
+              : [],
+        );
+        // The opener is consumed when the wake is queued, so the head starts at it, not at the marker beyond the buffer.
+        assert.deepEqual(trail, ["head:1", "answer:FIRST", "head:2", "answer:SECOND", "head:3"]);
+        yield* cell.send([{ type: "done", runId: "A", seq: 5 }]);
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  /** The thread as a session that owned run A up to number 2 left it, for a session to resume. */
+  const threadOwningRun = (providerThread: OrchestrationV2ProviderThread) =>
+    ({
+      ...providerThread,
+      nativeConversationHeadRef: {
+        driver: CELL_PROVIDER,
+        nativeId: "A",
+        strength: "strong",
+        fingerprint: "request-of-the-last-session",
+        ordinal: 2,
+      },
+    }) satisfies OrchestrationV2ProviderThread;
+
+  it.live(
+    "a reset read back behind the last session's run fails its restart continuation naming the reset, without posting a prompt",
+    () =>
+      Effect.gen(function* () {
+        const earlier = yield* driven();
+        earlier.opensWith(prelude());
+        const before = yield* makeHarness(earlier.transport, "https://cell.test");
+        const cell = yield* driven();
+        cell.states({ seq: 3 });
+        cell.opensWith(prelude({ seq: 3 }));
+        cell.replays([{ type: "reset", seq: 3 }]);
+        const harness = yield* makeHarness(cell.transport, "https://cell.test", {
+          providerSessionId: ProviderSessionId.make("session-cell-2"),
+          resume: threadOwningRun(before.providerThread),
+        });
+        assert.deepEqual(cell.replayRequests, ["/events?after=2&limit=1000"]);
+        assert.isTrue(yield* harness.runtime.hasPendingBackgroundWork!);
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Continue where you left off.", 2, {
+            createdBy: "agent",
+            creationSource: "server",
+            restartContinuationOfRunId: RunId.make("run-1"),
+          }),
+        );
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "failed");
+        assert.equal(failureOf(terminal)?.class, "transport_error");
+        assert.include(failureOf(terminal)?.message ?? "", "reset");
+        assert.include(failureOf(terminal)?.message ?? "", "T3 Code last stopped");
+        assert.deepEqual(cell.promptRequestIds, [], "nothing is posted to the reset cell");
+        assert.deepEqual(assistantTexts(harness.allEvents, 2), []);
+        assert.isFalse(yield* harness.runtime.hasPendingBackgroundWork!);
+        const settled = harness.allEvents.findLast(
+          (event) => event.type === "provider_thread.updated",
+        );
+        assert.equal(
+          settled?.type === "provider_thread.updated"
+            ? settled.providerThread.nativeConversationHeadRef?.strength
+            : undefined,
+          "weak",
+          "the reset run is no longer what a later session would take back",
+        );
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "with no restart continuation, a message after the reset posts as a prompt and the offered continuation reports the reset",
+    () =>
+      Effect.gen(function* () {
+        const earlier = yield* driven();
+        earlier.opensWith(prelude());
+        const before = yield* makeHarness(earlier.transport, "https://cell.test");
+        const cell = yield* driven();
+        cell.states({ seq: 3 });
+        cell.opensWith(prelude({ seq: 3 }));
+        cell.replays([{ type: "reset", seq: 3 }]);
+        const harness = yield* makeHarness(cell.transport, "https://cell.test", {
+          providerSessionId: ProviderSessionId.make("session-cell-2"),
+          resume: threadOwningRun(before.providerThread),
+        });
+        yield* cell.answerPrompt(202, '{"runId":"B","seq":4}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Again", 2));
+        yield* cell.send([
+          { type: "user", text: "Again", runId: "B", seq: 4, origin: "user" },
+          { type: "assistant", text: "NEW", runId: "B", seq: 5 },
+          { type: "done", runId: "B", seq: 6 },
+        ]);
+        const prompted = yield* harness.takeEvent(
+          "turn.terminal",
+          (event) => event.runOrdinal === 2,
+        );
+        assert.equal(prompted.status, "completed", failureOf(prompted)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents, 2), ["NEW"]);
+        const offered = yield* harness.takeContinuation;
+        const reported = yield* runContinuation(harness, offered, 3);
+        assert.equal(reported.status, "failed");
+        assert.include(failureOf(reported)?.message ?? "", "reset");
+        assert.deepEqual(assistantTexts(harness.allEvents, 3), []);
+        assert.lengthOf(cell.promptRequestIds, 1, "only the typed message reaches the cell");
+        assert.isFalse(yield* harness.runtime.hasPendingBackgroundWork!);
       }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
   );
 });

@@ -1592,3 +1592,221 @@ it.effect("leaves delegated tasks to their own child threads after process loss"
     assert.deepEqual(noted, [`subagent ${nativeSubagentId}`]);
   }).pipe(Effect.provide(layer));
 });
+
+it.effect(
+  "records no cancelled background work for a provider whose work survives the restart, while still terminalizing its rows",
+  () => {
+    const threadId = ThreadId.make("thread_recovery_surviving");
+    const cellInstanceId = ProviderInstanceId.make("cell");
+    const claudeInstanceId = ProviderInstanceId.make("claude");
+    const cellSessionId = ProviderSessionId.make("provider_session_recovery_cell");
+    const claudeSessionId = ProviderSessionId.make("provider_session_recovery_claude");
+    const cellThreadId = ProviderThreadId.make("provider_thread_recovery_cell");
+    const claudeThreadId = ProviderThreadId.make("provider_thread_recovery_claude");
+    const cellRunId = RunId.make("run_recovery_cell");
+    const claudeRunId = RunId.make("run_recovery_claude");
+    const cellAttemptId = RunAttemptId.make("attempt_recovery_cell");
+    const cellRootNodeId = NodeId.make("node_recovery_cell_root");
+    const cellSubagentNodeId = NodeId.make("node_recovery_cell_subagent");
+    const cellSubagentItemId = TurnItemId.make("turn_item_recovery_cell_subagent");
+    const claudeSubagentNodeId = NodeId.make("node_recovery_claude_subagent");
+    const claudeSubagentItemId = TurnItemId.make("turn_item_recovery_claude_subagent");
+    let committedInput: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0] | null =
+      null;
+    const subagentItem = (input: {
+      readonly id: TurnItemId;
+      readonly nodeId: NodeId;
+      readonly runId: RunId;
+      readonly providerThreadId: ProviderThreadId;
+      readonly providerInstanceId: ProviderInstanceId;
+      readonly nativeId: string;
+      readonly title: string;
+    }) => ({
+      id: input.id,
+      runId: input.runId,
+      nodeId: input.nodeId,
+      providerThreadId: input.providerThreadId,
+      type: "subagent",
+      origin: "provider_native",
+      status: "running",
+      title: input.title,
+      prompt: input.title,
+      subagentId: input.nodeId,
+      providerInstanceId: input.providerInstanceId,
+      childThreadId: null,
+      nativeItemRef: { driver: "cell", nativeId: input.nativeId, strength: "strong" },
+    });
+    const projection = {
+      thread: { id: threadId, providerInstanceId: cellInstanceId },
+      runtimeRequests: [],
+      providerSessions: [
+        {
+          id: cellSessionId,
+          driver: ProviderDriverKind.make("cell"),
+          providerInstanceId: cellInstanceId,
+          status: "ready",
+          capabilities: { sessions: { backgroundWorkSurvivesRestart: true } },
+        },
+        {
+          id: claudeSessionId,
+          driver: ProviderDriverKind.make("claude"),
+          providerInstanceId: claudeInstanceId,
+          status: "ready",
+          capabilities: { sessions: { backgroundWorkSurvivesRestart: false } },
+        },
+      ],
+      providerThreads: [
+        {
+          id: cellThreadId,
+          driver: ProviderDriverKind.make("cell"),
+          providerInstanceId: cellInstanceId,
+          providerSessionId: cellSessionId,
+          ownerNodeId: null,
+          status: "active",
+          nativeThreadRef: { driver: "cell", nativeId: "t3-cell", strength: "strong" },
+          pendingBackgroundTasks: [{ taskId: "ab12", kind: "subagent", description: "review" }],
+        },
+        {
+          id: claudeThreadId,
+          driver: ProviderDriverKind.make("claude"),
+          providerInstanceId: claudeInstanceId,
+          providerSessionId: claudeSessionId,
+          ownerNodeId: null,
+          status: "idle",
+          pendingBackgroundTasks: [{ taskId: "bg-claude", kind: "subagent", description: "Audit" }],
+        },
+      ],
+      providerTurns: [],
+      runs: [
+        {
+          id: cellRunId,
+          ordinal: 1,
+          status: "running",
+          providerInstanceId: cellInstanceId,
+          providerThreadId: cellThreadId,
+          activeAttemptId: cellAttemptId,
+          startedAt: "2026-10-19T00:00:00.000Z",
+          completedAt: null,
+        },
+        {
+          id: claudeRunId,
+          ordinal: 1,
+          status: "completed",
+          providerInstanceId: claudeInstanceId,
+          providerThreadId: claudeThreadId,
+          activeAttemptId: null,
+          startedAt: "2026-10-19T00:00:00.000Z",
+          completedAt: null,
+        },
+      ],
+      attempts: [
+        { id: cellAttemptId, runId: cellRunId, rootNodeId: cellRootNodeId, status: "running" },
+      ],
+      nodes: [{ id: cellRootNodeId, runId: cellRunId, status: "running" }],
+      subagents: [],
+      messages: [],
+      turnItems: [
+        // The cut run's delegated child: on a local provider the continuation would be told to restart it.
+        subagentItem({
+          id: cellSubagentItemId,
+          nodeId: cellSubagentNodeId,
+          runId: cellRunId,
+          providerThreadId: cellThreadId,
+          providerInstanceId: cellInstanceId,
+          nativeId: "ab12",
+          title: "review",
+        }),
+        // A settled run's native subagent on a provider whose work dies with the server.
+        subagentItem({
+          id: claudeSubagentItemId,
+          nodeId: claudeSubagentNodeId,
+          runId: claudeRunId,
+          providerThreadId: claudeThreadId,
+          providerInstanceId: claudeInstanceId,
+          nativeId: "sub-1",
+          title: "Audit",
+        }),
+      ],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const layer = ProviderRuntimeRecovery.layer.pipe(
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getRecoveryThreadIds: () => Effect.succeed([threadId]),
+            getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+          }),
+          Layer.mock(EventSink.EventSinkV2)({
+            commitCommand: (input) => {
+              committedInput = input;
+              return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);
+            },
+          }),
+          IdAllocator.layer,
+          Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({
+            runRecoveryOnce: Effect.succeed(false),
+          }),
+          Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listByCommandId: () => Effect.succeed([]),
+            reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+          }),
+        ),
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const summary =
+        yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).reconcile("startup");
+      assert.equal(summary.terminalizedRuns, 1);
+      const events = committedInput?.events ?? [];
+
+      // The rows T3 can no longer follow end on both threads.
+      assert.deepEqual(
+        events
+          .flatMap((event) =>
+            event.type === "turn-item.updated" && event.payload.status === "cancelled"
+              ? [event.payload.id]
+              : [],
+          )
+          .sort(),
+        [cellSubagentItemId, claudeSubagentItemId].sort(),
+      );
+      for (const providerThreadId of [cellThreadId, claudeThreadId]) {
+        const updated = events.find(
+          (event) =>
+            event.type === "provider-thread.updated" && event.payload.id === providerThreadId,
+        );
+        assert.equal(
+          updated?.type === "provider-thread.updated" ? updated.payload.status : null,
+          "idle",
+        );
+        assert.deepEqual(
+          updated?.type === "provider-thread.updated"
+            ? updated.payload.pendingBackgroundTasks
+            : null,
+          [],
+        );
+      }
+
+      // Only the provider whose work died with the server is told about it.
+      const notes = events.flatMap((event) =>
+        event.type === "run.background-work-cancelled"
+          ? [
+              {
+                runId: event.runId,
+                work: event.payload.restartCancelledBackgroundWork.map(
+                  (entry) => `${entry.kind}:${entry.label}`,
+                ),
+              },
+            ]
+          : [],
+      );
+      assert.deepEqual(notes, [
+        {
+          runId: claudeRunId,
+          work: ["subagent:Audit (id sub-1)", "subagent:Audit (id bg-claude)"],
+        },
+      ]);
+    }).pipe(Effect.provide(layer));
+  },
+);
