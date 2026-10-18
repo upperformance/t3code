@@ -197,6 +197,10 @@ const WAKE_LOST_MESSAGE =
   "The cell finished this delegated work while T3 was disconnected; its result stayed in the cell. Send another message to continue the conversation there.";
 const ALREADY_RUNNING_MESSAGE =
   "The cell is already running a turn started from another client. Wait for it to finish, then send the message again.";
+const GAP_NOTICE_MESSAGE =
+  "The connection to the cell dropped and came back while this turn ran; output from the gap may be missing here. The cell's own transcript has all of it.";
+const WAKE_RESET_MESSAGE =
+  "The cell conversation was reset from another client before this delegated result reached T3, and the reset discarded it. Send another message to continue there.";
 
 interface TurnScope {
   readonly threadId: ThreadId;
@@ -232,6 +236,24 @@ interface ActiveTurn {
   readonly candidates: Array<CellRunEvent>;
   /** Last sequence number seen before the prompt was posted, for recovering a lost response. */
   seqBeforePrompt: number | undefined;
+  /**
+   * Sequence number of the run's first event, from the 202 or the echo. A
+   * numbered event below it predates T3's run and says nothing about it.
+   */
+  acceptedSeq: number | undefined;
+  /** A reconnect that found the prompt unanswered, judged once the cell says which run is T3's. */
+  gap: ReconnectGap | undefined;
+}
+
+/** What the cell's `state` said on a reconnect while the prompt's answer was still pending. */
+interface ReconnectGap {
+  readonly seq: number | undefined;
+  readonly running: boolean;
+  /** `null` when a tenant that numbers runs is idle; undefined when it does not number them. */
+  readonly runId: string | null | undefined;
+  readonly caughtUp: boolean;
+  /** Candidates held at the time, replayed ones included: an echo among them means the run began before the gap. */
+  readonly candidatesBefore: number;
 }
 
 /** A delegated task, remembered where it was first seen so later reports land on the same rows. */
@@ -369,6 +391,17 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       let awaitingState = false;
       /** Highest sequence number seen; undefined until the tenant sends one. */
       let lastSeq: number | undefined;
+      /**
+       * A reconnect's `state` describes the cell at one sequence number and the
+       * `tasks` right behind it is the roster at that moment. Until the roster
+       * has arrived, replayed events numbered past that moment and task rows
+       * the replay found inside the gap wait here in sequence order.
+       */
+      let held: Array<CellEvent> = [];
+      let awaitingRoster = false;
+      let rosterBoundary: number | undefined;
+      /** Message ids of wakes a `reset` dropped, so their continuations can say why they carry nothing. */
+      const resetWakes = new Set<MessageId>();
       let wakeCounter = 0;
       let ready: Deferred.Deferred<void, ProviderAdapter.ProviderAdapterProtocolError> | undefined;
       const tasks = new Map<string, TaskRecord>();
@@ -1044,8 +1077,17 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           }
           if (event.runId !== undefined && turn.nativeRunId !== undefined) {
             if (event.runId === turn.nativeRunId) return yield* applyToTurn(turn, event);
+            // Numbered below the run's first event, this is an earlier run's
+            // tail that the 202 overtook on the way here: nobody's, and no
+            // evidence about T3's run.
+            if (
+              event.seq !== undefined &&
+              turn.acceptedSeq !== undefined &&
+              event.seq < turn.acceptedSeq
+            )
+              return yield* routeUnowned(event);
             // The cell runs one agent loop at a time, so another run's event
-            // means T3's run ended while its `done` never arrived.
+            // after T3's began means T3's run ended while its `done` never arrived.
             yield* finish(turn, "failed", UNOBSERVED_END_MESSAGE, "transport_error");
             return yield* routeUnowned(event);
           }
@@ -1068,34 +1110,86 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       const releaseCandidates = Effect.fnUntraced(function* (events: ReadonlyArray<CellRunEvent>) {
         for (const event of events) yield* routeUnowned(event);
       });
-      const accept = Effect.fnUntraced(function* (turn: ActiveTurn, runId: string | undefined) {
-        const candidates = turn.candidates.splice(0);
-        turn.phase = "running";
-        turn.nativeRunId = runId;
-        if (runId !== undefined) {
-          yield* releaseCandidates(candidates.filter((event) => event.runId !== runId));
-          for (const event of candidates) {
-            if (event.runId === runId && active === turn) yield* applyToTurn(turn, event);
-          }
-          return;
-        }
-        const echo = candidates.findIndex((event) => isEcho(turn, event));
-        yield* releaseCandidates(echo === -1 ? candidates : candidates.slice(0, echo));
-        if (echo === -1) return;
-        turn.echoed = true;
-        for (const event of candidates.slice(echo + 1)) {
-          if (active === turn) yield* applyToTurn(turn, event);
+      const isActive = (turn: ActiveTurn) => active === turn;
+      /** Applies a run's candidates in order; what follows the turn's end is nobody's and goes back to the unowned path. */
+      const drain = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        events: ReadonlyArray<CellRunEvent>,
+      ) {
+        for (let index = 0; index < events.length; index++) {
+          if (!isActive(turn)) return yield* releaseCandidates(events.slice(index));
+          yield* applyToTurn(turn, events[index]!);
         }
       });
-      const handleEvent: (event: CellEvent) => Effect.Effect<void> = Effect.fnUntraced(function* (
+      /**
+       * The cell has said which run is T3's: by id, or by the echo where it
+       * sends none. The candidates are settled, and a reconnect that happened
+       * while the answer was pending is judged the way one during the run is.
+       */
+      const accept = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        runId: string | undefined,
+        boundary?: number,
+      ) {
+        const candidates = turn.candidates.splice(0);
+        const gap = turn.gap;
+        turn.gap = undefined;
+        const echoIndex = candidates.findIndex(
+          (event) => isEcho(turn, event) && (runId === undefined || event.runId === runId),
+        );
+        const acceptedSeq = boundary ?? candidates[echoIndex]?.seq;
+        turn.phase = "running";
+        turn.nativeRunId = runId;
+        turn.acceptedSeq = acceptedSeq;
+        if (runId !== undefined) {
+          yield* releaseCandidates(candidates.filter((event) => event.runId !== runId));
+          yield* drain(
+            turn,
+            candidates.filter((event) => event.runId === runId),
+          );
+        } else {
+          yield* releaseCandidates(echoIndex === -1 ? candidates : candidates.slice(0, echoIndex));
+          if (echoIndex !== -1) {
+            turn.echoed = true;
+            yield* drain(turn, candidates.slice(echoIndex + 1));
+          }
+        }
+        if (gap === undefined || !isActive(turn)) return;
+        // A gap from before the run began hid nothing of it.
+        const began =
+          acceptedSeq !== undefined && gap.seq !== undefined
+            ? acceptedSeq <= gap.seq
+            : echoIndex !== -1 && echoIndex < gap.candidatesBefore;
+        if (!began) return;
+        const alive = gap.running && runId !== undefined && gap.runId === runId;
+        if (!alive) {
+          return yield* finish(
+            turn,
+            "failed",
+            gap.runId !== undefined ? UNOBSERVED_END_MESSAGE : UNPROVABLE_TURN_MESSAGE,
+            "transport_error",
+          );
+        }
+        if (!gap.caughtUp) yield* publishNotice(turn, "Connection dropped", GAP_NOTICE_MESSAGE);
+      });
+      const isTaskRow = (event: CellEvent) => event.type === "task" || event.type === "tasks";
+      /** Keeps `held` in sequence order; an unnumbered event keeps its arrival place. */
+      const hold = (event: CellEvent) => {
+        const seq = event.seq;
+        if (seq === undefined) {
+          held.push(event);
+          return;
+        }
+        const index = held.findIndex((other) => other.seq !== undefined && other.seq > seq);
+        if (index === -1) held.push(event);
+        else held.splice(index, 0, event);
+      };
+      const dispatch: (event: CellEvent) => Effect.Effect<void> = Effect.fnUntraced(function* (
         event: CellEvent,
       ) {
-        if (event.type === "state") return yield* handleState(event);
-        if (event.seq !== undefined) {
-          if (lastSeq !== undefined && event.seq <= lastSeq) return;
-          lastSeq = event.seq;
-        }
         switch (event.type) {
+          case "state":
+            return;
           case "tasks":
             return yield* reconcileTasks(event.tasks);
           case "task": {
@@ -1112,7 +1206,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             return yield* observeTask(event.task);
           }
           case "reset":
-            wakes.splice(0);
+            for (const wake of wakes.splice(0)) resetWakes.add(wake.messageId);
             if (active) {
               active.candidates.splice(0);
               yield* finish(
@@ -1130,50 +1224,142 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             return;
         }
       });
-      const handleRaw: (
+      /**
+       * Applies what waited behind a reconnect's roster, up to `upTo` where
+       * given. Task rows from inside the gap are numbered below what was
+       * already seen but were never applied; everything else is new, and a
+       * live copy of a replayed event is dropped by its number.
+       */
+      const flushHeld = Effect.fnUntraced(function* (upTo?: number) {
+        while (held.length > 0) {
+          const next = held[0]!;
+          if (upTo !== undefined && next.seq !== undefined && next.seq > upTo) return;
+          held.shift();
+          if (next.seq !== undefined) {
+            const insideGap = rosterBoundary !== undefined && next.seq <= rosterBoundary;
+            if (!insideGap) {
+              if (lastSeq !== undefined && next.seq <= lastSeq) continue;
+              lastSeq = next.seq;
+            }
+          }
+          yield* dispatch(next);
+        }
+      });
+      const endRosterWait = Effect.fnUntraced(function* () {
+        awaitingRoster = false;
+        yield* flushHeld();
+        rosterBoundary = undefined;
+      });
+      /**
+       * The roster that follows a reconnect's `state`. Numbered, it is the
+       * cell's tasks as of its own sequence number, and what was held is
+       * applied around it in order. Unnumbered, it is the roster at the moment
+       * of connection: task rows the replay found at or before that moment
+       * are superseded by it, and only what came after it is applied.
+       */
+      const handleRoster = Effect.fnUntraced(function* (
+        event: Extract<CellEvent, { readonly type: "tasks" }>,
+      ) {
+        if (event.seq !== undefined) {
+          yield* flushHeld(event.seq);
+          if (lastSeq === undefined || event.seq > lastSeq) lastSeq = event.seq;
+        } else {
+          const boundary = rosterBoundary;
+          held = held.filter(
+            (other) =>
+              !(
+                isTaskRow(other) &&
+                other.seq !== undefined &&
+                boundary !== undefined &&
+                other.seq <= boundary
+              ),
+          );
+        }
+        yield* reconcileTasks(event.tasks);
+        yield* endRosterWait();
+      });
+      const handleEvent: (event: CellEvent) => Effect.Effect<void> = Effect.fnUntraced(function* (
+        event: CellEvent,
+      ) {
+        if (event.type === "state") return yield* handleState(event);
+        if (awaitingRoster) {
+          if (event.type === "tasks") return yield* handleRoster(event);
+          // The cell sends the roster right behind `state`; anything else
+          // first means this tenant sent none, and nothing waits any longer.
+          yield* endRosterWait();
+        }
+        if (event.seq !== undefined) {
+          if (lastSeq !== undefined && event.seq <= lastSeq) return;
+          lastSeq = event.seq;
+        }
+        yield* dispatch(event);
+      });
+      const decodeRaw: (
         raw: unknown,
-      ) => Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError> = Effect.fnUntraced(
-        function* (raw: unknown) {
+      ) => Effect.Effect<CellEvent | undefined, ProviderAdapter.ProviderAdapterProtocolError> =
+        Effect.fnUntraced(function* (raw: unknown) {
           const type = eventType(raw);
-          if (!isKnownCellEventType(type)) return;
+          if (!isKnownCellEventType(type)) return undefined;
           if (options.nativeEventLogger)
             yield* options.nativeEventLogger.write(
               { provider: "cell", event: raw },
               input.threadId,
             );
-          const event = yield* decodeEvent(raw).pipe(
+          return yield* decodeEvent(raw).pipe(
             Effect.mapError((cause) =>
               protocolError(`The cell sent an unreadable ${type} event`, cause),
             ),
           );
-          yield* handleEvent(event);
+        });
+      const handleRaw: (
+        raw: unknown,
+      ) => Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError> = Effect.fnUntraced(
+        function* (raw: unknown) {
+          const event = yield* decodeRaw(raw);
+          if (event !== undefined) yield* handleEvent(event);
         },
       );
-      /** Fetches the persisted events T3 missed; false when the tenant could not supply them. */
+      /** The log is best effort: an entry that cannot be read is skipped, not fatal. */
+      const decodeReplayed = (raw: unknown) =>
+        decodeRaw(raw).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Skipped an unreadable replayed cell event", cause).pipe(
+              Effect.as(undefined),
+            ),
+          ),
+        );
+      /**
+       * Reads the persisted events after `after`. Those up to `target` are the
+       * gap; a page can run past it, and those are returned apart so the
+       * caller can place them after the snapshot the target belongs to.
+       * `complete` is false when the tenant could not supply the whole gap.
+       */
       const catchUp = Effect.fnUntraced(function* (after: number, target: number) {
+        const gap: Array<unknown> = [];
+        const beyond: Array<unknown> = [];
         let cursor = after;
         while (cursor < target) {
           const response = yield* request(
             "GET",
             `/events?after=${cursor}&limit=${EVENTS_PAGE_LIMIT}`,
           ).pipe(Effect.result);
-          if (Result.isFailure(response) || response.success.status !== 200) return false;
+          if (Result.isFailure(response) || response.success.status !== 200) break;
           const page = yield* decodeEventList(response.success.body).pipe(Effect.result);
-          if (Result.isFailure(page) || page.success.length === 0) return false;
+          if (Result.isFailure(page) || page.success.length === 0) break;
           const before = cursor;
           for (const raw of page.success) {
-            if (eventType(raw) === "state") continue;
-            yield* handleRaw(raw).pipe(
-              Effect.catch((cause) =>
-                Effect.logWarning("Skipped an unreadable replayed cell event", cause),
-              ),
-            );
             const seq = typeof raw === "object" && raw !== null ? Reflect.get(raw, "seq") : null;
+            const snapshot = eventType(raw) === "state";
+            if (typeof seq === "number" && seq > target) {
+              if (!snapshot) beyond.push(raw);
+              continue;
+            }
             if (typeof seq === "number" && seq > cursor) cursor = seq;
+            if (!snapshot) gap.push(raw);
           }
-          if (cursor === before) return false;
+          if (cursor === before || beyond.length > 0) break;
         }
-        return true;
+        return { complete: cursor >= target, gap, beyond };
       });
       const handleState: (
         event: Extract<CellEvent, { readonly type: "state" }>,
@@ -1187,30 +1373,59 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           if (event.seq !== undefined && lastSeq === undefined) lastSeq = event.seq;
           return;
         }
+        // Whatever still waited behind an earlier snapshot predates this one.
+        yield* endRosterWait();
         // Events sent while the socket was down are gone unless the tenant
         // numbers them, in which case they are read back before judging.
         let caughtUp = false;
         if (event.seq !== undefined && lastSeq !== undefined) {
-          caughtUp = event.seq <= lastSeq || (yield* catchUp(lastSeq, event.seq));
-          if (lastSeq < event.seq) lastSeq = event.seq;
+          if (event.seq <= lastSeq) {
+            caughtUp = true;
+          } else {
+            const replay = yield* catchUp(lastSeq, event.seq);
+            caughtUp = replay.complete;
+            // Run events in the gap are applied now, so a `done` the gap hid
+            // ends the turn before it is judged. Task rows wait for the roster
+            // snapshot, which is the authority on tasks at this moment.
+            for (const raw of replay.gap) {
+              const replayed = yield* decodeReplayed(raw);
+              if (replayed === undefined) continue;
+              if (isTaskRow(replayed)) hold(replayed);
+              else yield* handleEvent(replayed);
+            }
+            for (const raw of replay.beyond) {
+              const replayed = yield* decodeReplayed(raw);
+              if (replayed !== undefined) hold(replayed);
+            }
+            if (lastSeq < event.seq) lastSeq = event.seq;
+          }
         }
+        awaitingRoster = true;
+        rosterBoundary = event.seq;
         const numbered = event.runId !== undefined;
         const turn = active;
-        if (turn !== undefined && turn.phase === "running") {
-          const alive = event.running && numbered && event.runId === turn.nativeRunId;
-          if (!alive) {
-            yield* finish(
-              turn,
-              "failed",
-              numbered ? UNOBSERVED_END_MESSAGE : UNPROVABLE_TURN_MESSAGE,
-              "transport_error",
-            );
-          } else if (!caughtUp) {
-            yield* publishNotice(
-              turn,
-              "Connection dropped",
-              "The connection to the cell dropped and came back while this turn ran; output from the gap may be missing here. The cell's own transcript has all of it.",
-            );
+        if (turn !== undefined) {
+          if (turn.phase === "running") {
+            const alive = event.running && numbered && event.runId === turn.nativeRunId;
+            if (!alive) {
+              yield* finish(
+                turn,
+                "failed",
+                numbered ? UNOBSERVED_END_MESSAGE : UNPROVABLE_TURN_MESSAGE,
+                "transport_error",
+              );
+            } else if (!caughtUp) {
+              yield* publishNotice(turn, "Connection dropped", GAP_NOTICE_MESSAGE);
+            }
+          } else {
+            // Which run is T3's is still unknown; the gap is judged once the cell says.
+            turn.gap = {
+              seq: event.seq,
+              running: event.running,
+              runId: event.runId,
+              caughtUp,
+              candidatesBefore: turn.candidates.length,
+            };
           }
         }
         for (const wake of wakes) {
@@ -1412,7 +1627,6 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         });
         return thread;
       });
-      const isActive = (turn: ActiveTurn) => active === turn;
       const validateThread = (candidate: OrchestrationV2ProviderThread) =>
         thread !== undefined &&
         candidate.driver === CELL_PROVIDER &&
@@ -1459,7 +1673,14 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         if (runId === undefined) return "awaiting_echo" as const;
         if (turn.seqBeforePrompt !== undefined) {
           const target = state.success.seq ?? turn.seqBeforePrompt;
-          if (target > turn.seqBeforePrompt) yield* catchUp(turn.seqBeforePrompt, target);
+          if (target > turn.seqBeforePrompt) {
+            // No snapshot is pending here, so the whole page is applied in order.
+            const replay = yield* catchUp(turn.seqBeforePrompt, target);
+            for (const raw of [...replay.gap, ...replay.beyond]) {
+              const replayed = yield* decodeReplayed(raw);
+              if (replayed !== undefined) yield* handleEvent(replayed);
+            }
+          }
         }
         const replayed = turn.candidates.find(
           (event) => isEcho(turn, event) && event.runId === runId,
@@ -1524,6 +1745,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           echo: yield* Deferred.make<void>(),
           candidates: [],
           seqBeforePrompt: undefined,
+          acceptedSeq: undefined,
+          gap: undefined,
         };
         yield* Effect.gen(function* () {
           thread = turnInput.providerThread;
@@ -1576,9 +1799,16 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             );
           }
           if (continuation) {
-            const index = wakes.findIndex((wake) => wake.messageId === turnInput.message.messageId);
-            const wake = index === -1 ? wakes.shift() : wakes.splice(index, 1)[0];
-            if (wake === undefined) return yield* finish(turn, "completed");
+            const messageId = turnInput.message.messageId;
+            const index = wakes.findIndex((wake) => wake.messageId === messageId);
+            // Only the wake this message was offered for: a continuation whose
+            // wake is gone ends with nothing, never with the next wake's output.
+            if (index === -1) {
+              return resetWakes.delete(messageId)
+                ? yield* finish(turn, "failed", WAKE_RESET_MESSAGE)
+                : yield* finish(turn, "completed");
+            }
+            const wake = wakes.splice(index, 1)[0]!;
             turn.phase = "running";
             turn.nativeRunId = wake.runId;
             turn.echoed = true;
@@ -1605,7 +1835,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           }
           const response = outcome.success;
           if (response.status === 202) {
-            return yield* accept(turn, readPromptAccepted(response.body)?.runId);
+            const accepted = readPromptAccepted(response.body);
+            return yield* accept(turn, accepted?.runId, accepted?.seq);
           }
           // Nothing broadcast before the refusal was T3's run.
           yield* releaseCandidates(turn.candidates.splice(0));
