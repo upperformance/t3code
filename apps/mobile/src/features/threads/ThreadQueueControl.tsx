@@ -4,7 +4,7 @@ import type { ChatAttachment, EnvironmentId, RunId, ThreadId } from "@t3tools/co
 import { Atom } from "effect/reactivity";
 import { Image } from "expo-image";
 import * as Haptics from "expo-haptics";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 import { Animated, Platform, Pressable, ScrollView, View } from "react-native";
 import { Gesture, GestureDetector, GestureHandlerRootView } from "react-native-gesture-handler";
 import ReanimatedSwipeable, {
@@ -113,12 +113,12 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
     busyRef.current = true;
     setBusyRunId(runId);
     void Haptics.selectionAsync();
-    try {
+    await (async () => {
       await reorder({ ...target, input: { threadId: target.threadId, runId, beforeRunId } });
-    } finally {
+    })().finally(() => {
       busyRef.current = false;
       setBusyRunId(null);
-    }
+    });
   };
 
   const act = async (runId: RunId, action: QueueAction) => {
@@ -150,7 +150,7 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
     busyRef.current = true;
     setBusyRunId(runId);
     void Haptics.selectionAsync();
-    try {
+    await (async () => {
       if (action === "remove") {
         await cancel(buildCancelQueuedRunCommand({ ...target, runId }));
       } else if (workflow?.activeRun && workflow.canPromoteToSteer) {
@@ -163,10 +163,10 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
           },
         });
       }
-    } finally {
+    })().finally(() => {
       busyRef.current = false;
       setBusyRunId(null);
-    }
+    });
   };
 
   const canReorder = workflow?.canReorder === true && queuedRuns.length > 1;
@@ -203,12 +203,12 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
               if (busyRef.current) return;
               busyRef.current = true;
               setResuming(true);
-              try {
+              await (async () => {
                 await resume({ ...target, input: { threadId: target.threadId } });
-              } finally {
+              })().finally(() => {
                 busyRef.current = false;
                 setResuming(false);
-              }
+              });
             }}
           />
         </View>
@@ -596,22 +596,19 @@ function QueueDragHandle(props: {
   onMove: (y: number) => void;
   onEnd: (y: number, success: boolean) => void;
 }) {
-  const latest = useRef(props);
-  useLayoutEffect(() => {
-    latest.current = props;
-  });
-  const gesture = useMemo(
-    () =>
-      Gesture.Pan()
-        .enabled(!props.disabled)
-        .minDistance(0)
-        .shouldCancelWhenOutside(false)
-        .runOnJS(true)
-        .onStart(() => latest.current.onStart())
-        .onUpdate((event) => latest.current.onMove(event.translationY))
-        .onFinalize((event, success) => latest.current.onEnd(event.translationY, success)),
-    [props.disabled],
-  );
+  // Gesture callbacks fire outside render, so effect events read the latest
+  // props without rebuilding the gesture.
+  const onStart = useEffectEvent(() => props.onStart());
+  const onMove = useEffectEvent((y: number) => props.onMove(y));
+  const onEnd = useEffectEvent((y: number, success: boolean) => props.onEnd(y, success));
+  const gesture = Gesture.Pan()
+    .enabled(!props.disabled)
+    .minDistance(0)
+    .shouldCancelWhenOutside(false)
+    .runOnJS(true)
+    .onStart(() => onStart())
+    .onUpdate((event) => onMove(event.translationY))
+    .onFinalize((event, success) => onEnd(event.translationY, success));
   return (
     <GestureDetector gesture={gesture}>
       <View
