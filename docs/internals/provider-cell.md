@@ -95,20 +95,46 @@ this provider needs, and attaching a thread to such a tenant fails with
 [`protocol.ts`](../../packages/provider-cell/src/server/protocol.ts) holds the
 shapes. What level 3 guarantees, and what the adapter builds on:
 
-- **Every event is numbered.** `seq` is a per-cell monotonic integer the cell
-  persists. Run-scoped events (`user`, `wake`, `assistant`, `shell`,
-  `shell_output`, `tool`, `tool_output`, `patch`, `error`, `done`) carry the
-  `runId` of the agent run they belong to; `user` and `wake` say whether the
-  run was started by a user or by a child finishing (`origin`); `task` and
-  `tasks` are numbered like everything else.
+- **Every event is numbered.** `seq` is a per-cell counter the cell
+  persists: a non-negative integer that only grows, through resets and
+  destroys too. Run-scoped events (`user`, `wake`, `assistant`, `shell`,
+  `shell_output`, `tool`, `tool_output`, `patch`, `done`, and an `error`
+  raised inside a run) carry the `runId` of the agent run they belong to;
+  `user` and `wake` say whether the run was started by a user or by a child
+  finishing (`origin`); `task` and `tasks` are numbered like everything else.
+  An `error` outside any run (a cleanup that failed, a report to a parent
+  that could not be delivered, a root repaired by a reset) is standalone: it
+  carries `seq` and no `runId`. What the cell answers a client's own socket
+  message (an `exec` result, a refused socket prompt) is a reply, not an
+  event: unnumbered, sent only to that client, never kept. The adapter does
+  not model replies, since T3 sends no socket commands; an `exec` frame is an
+  unknown type and ignored, and an unnumbered `error` would be an unreadable
+  event, handled as below.
+- **A prompt carries a request id.** `POST prompt` takes an optional
+  `x-request-id` header, an opaque string of at most 128 characters. The cell
+  keeps it on the run it starts: the run's opening `user` event and `GET
+state` carry it as `requestId`, null when the run has none. A prompt
+  repeated with the request id of the run in progress, or of the run that
+  ended last, answers 202 with that run's `{ runId, seq }` instead of starting
+  another run, so a client whose answer was lost can ask again safely. The
+  adapter mints a fresh UUID for every turn, sends it with the prompt and
+  keeps it with the turn.
 - **The 202 names the run.** `POST prompt` answers `{ runId, seq }`, where
-  `seq` is the number of the run's opening `user` event. A 409 answers
-  `{ runId }` naming the run already in progress.
+  `seq` is the number of the run's opening `user` event. Every other answer
+  is `{ runId, error }`: a different request id while a run is in progress
+  answers 409 with `runId` naming that run; an empty prompt, a tenant without
+  a model API key and a cell busy with a fork or a reset answer 409 with
+  `runId: null` and the reason in `error`.
+- **A cancel names its run.** `POST cancel` takes an optional `x-run-id`
+  header. When the run in progress is another one, the cell answers 409
+  `{ runId }` naming it and cancels nothing; with no run in progress it
+  answers 204 and does nothing; without the header it cancels whatever runs.
+  The adapter always sends the header.
 - **Every connection opens the same way.** The socket sends `state` (the same
-  fields as `GET state`, so `running`, `runId` and `seq` at that moment), then
-  `tasks`, the full roster numbered at that same `seq`, then events. The
-  roster therefore always arrives before any replayed or live event, and it
-  describes the cell exactly at the number `state` gave.
+  fields as `GET state`, so `running`, `runId`, `requestId` and `seq` at that
+  moment), then `tasks`, the full roster numbered at exactly that `seq`, then
+  events. The roster therefore always arrives before any replayed or live
+  event, and it describes the cell exactly at the number `state` gave.
 - **A gap can be read back.** `GET events?after=<seq>&limit=<n>` (n ≤ 1000)
   answers `{ events, nextAfter, complete }`, ordered by number; `complete`
   says the log has nothing after `nextAfter`. The cell keeps the last 20,000
@@ -124,61 +150,88 @@ shapes. What level 3 guarantees, and what the adapter builds on:
 where the level is checked and the tenant's model learned, and again to
 recover a lost prompt reply. Events the cell adds after this build are
 ignored rather than failing the socket, so this T3 keeps working against a
-newer tenant.
+newer tenant. What the cell does send of the protocol is validated: a `seq`
+that is not a non-negative integer, a 202 whose `seq` is not one, a roster
+numbered elsewhere than its `state`, or a known event that cannot be decoded
+is a violation like a frame out of order. Live, it drops the connection, and
+the next one reads the gap back from the log; in the log, such an entry is
+skipped with a warning, since the log is the only copy and dropping the
+connection would present the same entry again.
 
 ## Which events are T3's
 
 Nothing a run broadcasts is attributed to a T3 turn until the cell has said
-which run is T3's, and the only thing that says so is the 202 to T3's own
-prompt. While `POST prompt` is unanswered, run-scoped events are candidates
-held in the turn. The 202 settles them: the candidates are put through the
-same ownership rule as live events, in sequence order. That rule is one line:
-an event is the turn's exactly when it carries the run id the 202 named. An
-event of another run numbered below the run's opening event (the 202's `seq`)
-is an earlier run's tail that the 202 overtook on the way to T3, nobody's and
-no evidence about T3's run. An event of another run numbered after it proves
-T3's run ended without its `done` reaching T3, since the cell runs one agent
-loop at a time, and the turn fails as a transport error rather than adopting
-the stranger; that holds whether the stranger arrived live or was among the
-candidates, so a wake buffered behind T3's run while the prompt was unanswered
-ends the turn exactly as it would have live, and is queued as a wake. A 409
-releases every candidate to the unowned path and fails the turn with a message
-that another client is running the cell, so a foreign run's `assistant` and
-`done` racing ahead of the refusal can never complete a prompt the cell
-rejected.
+which run is T3's. Two things say so: the 202 to T3's own prompt, and, when
+that answer was lost, the request id T3 sent with the prompt found on the
+run, as described below. While `POST prompt` is unanswered, run-scoped events
+are candidates held in the turn. The 202 settles them: the candidates are put
+through the same ownership rule as live events, in sequence order. That rule
+is one line: an event is the turn's exactly when it carries the run id the
+202 named. An event of another run numbered below the run's opening event
+(the 202's `seq`) is an earlier run's tail that the 202 overtook on the way
+to T3, nobody's and no evidence about T3's run. An event of another run
+numbered after it proves T3's run ended without its `done` reaching T3,
+since the cell runs one agent loop at a time, and the turn fails as a
+transport error rather than adopting the stranger; that holds whether the
+stranger arrived live or was among the candidates, so a wake buffered behind
+T3's run while the prompt was unanswered ends the turn exactly as it would
+have live, and is queued as a wake. A 409 releases every candidate to the
+unowned path and fails the turn: with a message that another client is
+running the cell when the refusal names a run, with the cell's reason when it
+names none. So a foreign run's `assistant` and `done` racing ahead of the
+refusal can never complete a prompt the cell rejected.
 
-A prompt whose answer never arrives is not failed on the spot. The run's
-opening `user` event, numbered after the prompt went out, user-originated and
-carrying the prompt's text, names the run and its number, which is what the
-202 would have said. It is looked for among the candidates, and failing that
-in the event log read from the last number applied up to what `GET state`
-reports; with the cell idle and no such event, the message most likely never
-started and the turn says so; with the cell running some other run, the turn
-fails with a message that says what T3 could not confirm.
+A prompt whose answer never arrives is not failed on the spot, and it is not
+recovered by its text either: another client may have sent the same words
+first, and with T3's 409 lost, matching the opening event by text would hand
+T3 that client's answer. The only evidence is the request id T3 sent with
+the prompt. The run's opening `user` event carries it, and that event names
+the run and its number, which is what the 202 would have said; it is looked
+for among the candidates, and failing that in the event log read from the
+last number applied up to what `GET state` reports. Failing that too, `GET
+state` naming T3's request id on the run in progress makes that run T3's
+from the number the state reported, so that nothing numbered before it is
+taken as evidence about the run. Without any of these the turn fails as a
+transport error: with the cell idle, the message most likely never started
+and the turn says to send it again; with the cell running something else,
+the turn says T3 cannot tell whether the message ran and that its result, if
+any, stays in the cell. An answer T3 cannot trust counts as no answer: a
+server error (5xx) whose body is not the cell's own `{ runId, error }`
+refusal came from something between T3 and the cell, or from a cell that may
+already have started the run, and goes through the same recovery; one that
+carries the cell's refusal fails the turn with that reason.
 
-| Cell event               | T3 effect                                                                                                                                      |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `state`                  | First on every connection: where the cell is, by number, and which run it is running. On a reconnect, drives the reconciliation below.         |
-| `tasks`                  | Second on every connection, numbered at `state.seq`: the roster at that moment. Tasks it no longer lists are settled as cancelled and dropped. |
-| `user`                   | Ignored: T3 already recorded the prompt. Its number is where the run begins, which the 202 reports.                                            |
-| `assistant`              | A completed assistant message item. No streaming.                                                                                              |
-| `shell` / `shell_output` | A `command_execution` item, running then completed with stdout and stderr joined and the exit code.                                            |
-| `tool` / `tool_output`   | A `dynamic_tool` item for the orchestration tools (`delegate_task` and friends), with input and output.                                        |
-| `patch`                  | A completed `file_change` item per changed path. The cell sends no diff, so the item has a name and operation.                                 |
-| `task`                   | Subagent lifecycle: `subagent.updated`, a `subagent` node and a `subagent` item keyed by the task id.                                          |
-| `wake`                   | A cell-initiated run, queued and offered as a continuation; inside T3's own run, a notice item.                                                |
-| `error`                  | A `system_notice` item during a turn (an apply_patch failure, for example); the turn goes on.                                                  |
-| `done`                   | Turn completed; cancelled or interrupted when the error is a cancellation; otherwise failed, classified.                                       |
-| `reset`                  | The conversation was reset from another client. An active turn fails, queued wakes are dropped.                                                |
-| `fs`, `exec`             | Ignored: they serve the browser's file sync.                                                                                                   |
+| Cell event               | T3 effect                                                                                                                                                              |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `state`                  | First on every connection: where the cell is, by number, and which run it is running. On a reconnect, drives the reconciliation below.                                 |
+| `tasks`                  | Second on every connection, numbered at `state.seq`: the roster at that moment. Tasks it no longer lists are settled as cancelled and dropped.                         |
+| `user`                   | Ignored: T3 already recorded the prompt. Its number is where the run begins, which the 202 reports.                                                                    |
+| `assistant`              | A completed assistant message item. No streaming.                                                                                                                      |
+| `shell` / `shell_output` | A `command_execution` item, running then completed with stdout and stderr joined and the exit code.                                                                    |
+| `tool` / `tool_output`   | A `dynamic_tool` item for the orchestration tools (`delegate_task` and friends), with input and output.                                                                |
+| `patch`                  | A completed `file_change` item per changed path. The cell sends no diff, so the item has a name and operation.                                                         |
+| `task`                   | Subagent lifecycle: `subagent.updated`, a `subagent` node and a `subagent` item keyed by the task id.                                                                  |
+| `wake`                   | A cell-initiated run, queued and offered as a continuation; inside T3's own run, a notice item.                                                                        |
+| `error`                  | Naming a run: a `system_notice` item of that run's turn (an apply_patch failure, for example); the turn goes on. Standalone: a warning in the log, assigned to no run. |
+| `done`                   | Turn completed; cancelled or interrupted when the error is a cancellation; otherwise failed, classified.                                                               |
+| `reset`                  | The conversation was reset from another client. An active turn fails, queued wakes are dropped.                                                                        |
+| `fs`                     | Ignored: it serves the browser's file sync.                                                                                                                            |
 
-Interrupt is `POST cancel`; the cell confirms with a cancelled `done`, and the
-adapter waits for that before reporting the turn interrupted. A `done` that
-beats the cancel settles the turn as completed. Stop pressed before the prompt
-registered waits behind the prompt: start and interrupt share one permit, so
-the cancel goes out only once the cell has said which run it would cancel.
-Steering is by interrupt and restart, which the orchestrator implements.
-Queued messages wait in T3; the cell refuses a second prompt with 409.
+Interrupt is `POST cancel` naming the turn's run in `x-run-id`; the cell
+confirms with a cancelled `done`, and the adapter waits for that before
+reporting the turn interrupted. A `done` that beats the cancel settles the
+turn as completed. Stop pressed before the prompt registered waits behind the
+prompt: start and interrupt share one permit, so the cancel goes out only
+once the cell has said which run it would cancel. Which turn is active is
+decided under the event permit, behind whatever reconciliation is in
+progress: a reconnect's replay that carries the turn's `done` ends the turn
+first, and Stop then finds a settled turn with nothing left to stop and posts
+no cancel, so the run the cell started next is left alone. A cancel that does
+reach the cell after the run ended is refused with 409 naming the run in
+progress, which the adapter reads as the turn's run having ended: it cancels
+nothing and the turn's `done`, live or read back, settles the turn. Steering
+is by interrupt and restart, which the orchestrator implements. Queued
+messages wait in T3; the cell refuses a second prompt with 409.
 
 ## Wakes
 
@@ -199,9 +252,12 @@ orchestrator had already dispatched, since only such a turn will come asking
 for it, and it leaves when that turn starts or the orchestrator clears the
 request; a wake dropped before it was dispatched leaves nothing behind. The
 wake's events are replayed into the turn, and the thread stays pinned as
-having pending background work until the queue is empty. A continuation the
-orchestrator clears (the instance was disabled, the thread archived) drops
-its wake; the result still lives in the cell's transcript.
+having pending background work until the queue is empty. A wake that lost
+events to a gap the cell no longer retains ends its continuation as a
+transport error even when its `done` was read, since what the buffer holds
+is not the whole run; its events before and after the gap are still shown.
+A continuation the orchestrator clears (the instance was disabled, the thread
+archived) drops its wake; the result still lives in the cell's transcript.
 
 Rows the adapter publishes while no run is active, such as a task settling
 between turns, are not persisted: the session manager only forwards adapter
@@ -302,9 +358,16 @@ adapter reconciles what it was tracking against the snapshot:
   its number. A turn whose `done` was in the gap ends the way the cell ended
   it, and a task row from the gap is observed with the turn that was running
   when the cell sent it, so the subagent row lands in the run that delegated.
-  A page the cell cannot serve (a transport failure, a bad answer) drops the
-  connection; the next one presents the rest of the gap again from where the
-  replay stopped.
+  A page the cell cannot serve (a transport failure, a bad answer), a page
+  that moves the cursor nowhere, or a log that claims to be complete before
+  the number the snapshot itself reported, fails the recovery: the cursor
+  stays where the replay stopped, nothing of the snapshot is applied, and the
+  connection is dropped; the next one presents the rest of the gap again.
+- A snapshot numbered below the last number applied is not the history T3
+  was following: the cell's counter never regresses. Nothing carries over.
+  The active turn fails as a transport error naming the numbers, queued wakes
+  are marked lost, and the adapter attaches afresh at the new snapshot, as on
+  a first connection, so the next turn follows the new numbering from there.
 - The roster is applied at its own number, after the replay up to it. It is
   the whole roster: a task it no longer lists was removed while disconnected,
   so it is settled as cancelled if it was running and dropped either way, and
@@ -312,7 +375,10 @@ adapter reconciles what it was tracking against the snapshot:
   created is recorded with no owner.
 - A gap the cell no longer retains (`truncated`) cannot be read back, and the
   active turn fails as a transport error naming the numbers that were lost;
-  the result stays in the cell and the thread stays reusable.
+  the result stays in the cell and the thread stays reusable. Every queued
+  wake still open across the gap is marked lost, whether or not the cell is
+  still running it, since what the socket delivers after the snapshot is not
+  the whole run.
 - With the gap read back in full, the active turn is judged against what the
   cell said it was running at the snapshot. A `done` in the gap has already
   ended the turn by now, so a turn still open whose run the cell is not
@@ -325,16 +391,27 @@ adapter reconciles what it was tracking against the snapshot:
 - A queued wake whose run is not the one the cell is running, and whose `done`
   the replay did not supply, is marked lost; its continuation turn ends with a
   transport-error terminal instead of running forever on an incomplete buffer.
+- Recovery is bounded. Connections dropped for not keeping the protocol (a
+  frame before the roster, no roster within ten seconds of `state`, a roster
+  numbered elsewhere than its `state`, an unreadable event, a replay that
+  failed) are counted; the third in a row fails the active turn as a
+  transport error naming the reason, so a turn never waits for ever on a
+  tenant that keeps answering wrongly. The socket goes on reconnecting with
+  its backoff for the idle thread, and a connection whose snapshot is applied
+  resets the count.
 
 ## Failures
 
 A failed `done` becomes a failed terminal with the class the cell's error code
 names: `usage_limit` (with `resetAt` when the cell supplies it),
 `transport_error`, or `provider_error` for everything else including tool
-errors. `provider_error` is also the class for a prompt the cell refused;
-`transport_error` is for what T3 could not observe, a gap it could not read
-back, or a 202 that did not name the run; a turn the adapter stopped itself
-for policy reasons is `permission_error` or `validation_error`.
+errors. `provider_error` is also the class for a prompt the cell refused,
+with the cell's reason; `transport_error` is for what T3 could not observe:
+a lost prompt answer that no request id confirmed, a gap it could not read
+back, a run the cell was no longer running, three dropped connections in a
+row, a regressed numbering, or a 202 that did not name the run. A turn the
+adapter stopped itself for policy reasons is `permission_error` or
+`validation_error`.
 
 ## Alternatives rejected
 
@@ -371,6 +448,12 @@ for policy reasons is `permission_error` or `validation_error`.
   lived in that second set of rules or in the seams between the two. Nothing
   is deployed and both sides are ours, so the adapter requires level 3 and
   the fallbacks are gone.
+- **Recovering a lost prompt answer by the prompt's text.** The fourth round
+  still looked for the run's opening `user` event by the words of the prompt
+  when the 202 was lost. Another client sending the same words first, with
+  T3's 409 lost on the way back, completed T3's turn with that client's
+  answer. A request id the cell keeps on the run is the only evidence that a
+  run is T3's, and the protocol gained one.
 
 ## Testing
 
@@ -383,17 +466,23 @@ transcript protocol is `cell.http-ws`: outbound frames are the HTTP requests
 and WebSocket connects the adapter makes, inbound frames are the responses,
 transport failures and socket events. Replay binds `<project>` to the first
 project it sees, so a request to a second project fails the replay instead of
-matching. Socket events are labelled `ws:<type>#<n>` so a fixture step can
-hold the n-th event of a type behind a replay gate; the recorder honours the
-same gate, so a recording is paced the way its replay will be. The recorder in
-`apps/server/scripts/record-cell-replay-fixture.ts` records against a live
-tenant (`--url`) or against the fake cell in
+matching, and `<request-id>` to the `x-request-id` of the latest prompt, so a
+transcript holds no minted id and a replayed opener or state carries exactly
+the id the adapter is looking for; the recorder writes the placeholder where
+the cell echoed the id. Socket events are labelled `ws:<type>#<n>` so a
+fixture step can hold the n-th event of a type behind a replay gate; the
+recorder honours the same gate, so a recording is paced the way its replay
+will be. The recorder in `apps/server/scripts/record-cell-replay-fixture.ts`
+records against a live tenant (`--url`) or against the fake cell in
 `@t3tools/provider-cell/testing`, a Node HTTP and WebSocket server that speaks
 level 3 (numbered, persisted events; `state` then the numbered roster on
 every socket; a paged event log with the protocol's retention; structured
-`done` errors) and answers the shared fixture prompts the way the cell does.
-The checked-in transcripts were recorded against the fake cell; record them
-against a tenant once celld speaks level 3.
+`done` errors; the request id kept on the run and answered again for a
+repeat; refusals as `{ runId, error }`; a cancel that names its run; replies
+to its own clients' socket prompts; standalone errors) and answers the shared
+fixture prompts the way the cell does. The checked-in transcripts were
+recorded against the fake cell; record them against a tenant once celld
+speaks level 3 with the request id.
 
 The adapter's own tests cover the rules above: the rejected prompt racing
 another run's events, a 202 overtaking the previous run's tail, a stranger
@@ -406,12 +495,24 @@ the prompt was unanswered judged once the run is named, a task row from the
 gap landing in the run that delegated, a roster that never comes and a frame
 sent before it both dropping the connection, the gap read back page by page,
 a gap the cell no longer retains, the FIFO drain, roster reconciliation, Stop
-before and after the prompt registered, a cancel racing `done`, a lost prompt
-response, session resume, shutdown, a disabled instance, refused runtime
-modes, models and protocol levels, usage limits, and the reconnect backoff.
-The reconnect races run over a hand-driven socket, since a transcript walk
-cannot hold a prompt's answer until after the frames that race it; the ones
-that need the roster timeout and the backoff run on the test clock.
+before and after the prompt registered, a cancel racing `done`, session
+resume, shutdown, a disabled instance, refused runtime modes, models and
+protocol levels, usage limits, and the reconnect backoff. The fifth review's
+probes are tests too: a lost 409 behind another client's identical prompt
+adopting nothing, a lost answer recovered by the request id on the opener,
+in the log, or on the run the state names, a 5xx with and without the cell's
+refusal, Stop decided behind a replay that ended the turn posting no cancel,
+a cancel the cell refused settled by the replayed `done`, a truncated gap
+marking a wake the cell still runs lost with the loss outranking its `done`,
+a standalone error live and in the log, a replay page that makes no progress
+or ends before the snapshot, three roster timeouts in a row failing the turn
+while reconnection goes on, a regressed numbering, a roster numbered
+elsewhere than its state and a fractional number each dropping the
+connection, and the fake cell's request ids, refusals and run-targeted
+cancels. The reconnect races run over a hand-driven socket, since a
+transcript walk cannot hold a prompt's answer until after the frames that
+race it; the ones that need the roster timeout and the backoff run on the
+test clock.
 
 ## Follow-ups
 
@@ -422,4 +523,5 @@ that need the roster timeout and the backoff run on the test clock.
   native-session listing, once the tenant can list projects.
 - A display name on the tenant, once the cell has an API for it.
 - Attachments through `PUT fs/file`, with the prompt naming the paths.
-- Fixtures recorded against a tenant, once celld speaks level 3.
+- Fixtures recorded against a tenant, once celld speaks level 3 with the
+  request id.

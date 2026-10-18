@@ -56,9 +56,17 @@ celld on the tenant.
 
 The connection to a cell may be reset while the tenant moves it; T3 Code
 reconnects on its own, reads back what it missed, and the turn carries on. If
-the tenant no longer holds the events that were missed, or the cell's run ended
-while the connection was down without saying how, the turn is reported as
-failed with a note that its result stayed in the cell; the work is not lost,
-and the next message continues the same conversation. If someone else is using
-the same cell from its page on the tenant, a message sent meanwhile fails with
-a note to wait for that run to finish.
+the tenant no longer holds the events that were missed, the cell's run ended
+while the connection was down without saying how, or the connection keeps
+failing, the turn is reported as failed with a note that its result stayed in
+the cell; the work is not lost, and the next message continues the same
+conversation. If someone else is using the same cell from its page on the
+tenant, a message sent meanwhile fails with a note to wait for that run to
+finish.
+
+Each message carries an id the cell keeps with the run it starts. If the
+cell's answer to a message is lost on the way back, T3 Code asks the cell
+whether a run with that id started before giving up, and never takes another
+client's run for its own, even one started with the same words. A message it
+cannot confirm is reported as failed with a note saying whether to send it
+again or to look in the cell for its result.
