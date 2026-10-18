@@ -11,14 +11,16 @@ requires one. Refresh provider status, then pick Cell in a thread's model picker
 
 ## How a cell thread works
 
-Each thread gets its own cell project, named from the thread id with the
-instance's **Project prefix**. The first message creates it. The project's files
-live on the tenant, so you can open its page there to browse and edit them while
-the agent works. Deleting the thread in T3 Code does not remove the cell.
+Each thread gets its own cell project, named with the instance's **Project
+prefix** followed by a code derived from the thread. The first message creates
+it. The project's files live on the tenant, so you can open its page there to
+browse and edit them while the agent works. Deleting the thread in T3 Code does
+not remove the cell.
 
 The cell keeps the conversation. Reopening a thread continues where it left off,
 and a delegated task that finishes while the thread is idle wakes it with the
-result, as with other providers.
+result, as with other providers. Several tasks finishing in a row wake it once
+each, in order.
 
 ## What is different
 
@@ -26,10 +28,14 @@ result, as with other providers.
   show the local project, which the cell never changes. Look at the cell's own
   page on the tenant for its files.
 - **Attachments** are not delivered to the cell yet. Send text only.
-- **Permissions.** Cell offers only **Full access**. The cell is its own
+- **Permissions.** Cell runs only in **Full access**. The cell is its own
   sandbox: the agent cannot reach your machine or the network, so there is
-  nothing to approve. A thread set to another mode runs as Full access.
-- **Model.** The tenant decides the model; the picker shows the one it reports.
+  nothing to approve. A thread set to another permission mode does not run on a
+  cell; the message fails with a note to switch the thread to Full access and
+  send it again.
+- **Model.** The tenant decides the model. The picker shows that one model and
+  **Default**, which means the same thing; custom models cannot be added to a
+  Cell instance.
 - **Forks and rewinds** are not available. Switching providers passes the
   conversation as a context handoff.
 - **T3 Code's tools** are not available inside a cell, so the agent cannot link
@@ -41,7 +47,13 @@ result, as with other providers.
 ## Status
 
 Provider status checks that the tenant answers and whether it has a model API
-key. If the tenant is unreachable, messages fail until it is back. The
-connection to a cell may be reset while the tenant moves it; T3 Code reconnects
-on its own, and a turn that ended while disconnected reports that its result
-stayed in the cell.
+key. If the tenant is unreachable, messages fail until it is back.
+
+The connection to a cell may be reset while the tenant moves it; T3 Code
+reconnects on its own. On a tenant that numbers its events, T3 Code reads back
+what it missed and the turn carries on. On an older tenant a turn that was
+running during the reset is reported as failed with a note that its result
+stayed in the cell; the work is not lost, and the next message continues the
+same conversation. If someone else is using the same cell from its page on the
+tenant, a message sent meanwhile fails with a note to wait for that run to
+finish.
