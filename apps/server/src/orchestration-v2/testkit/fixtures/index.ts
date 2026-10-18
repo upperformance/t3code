@@ -67,6 +67,8 @@ import { assertMuseWorkflowOutput } from "./muse_workflow/output.ts";
 import { assertMuseSubagentV2Output } from "./subagent_v2/muse_output.ts";
 import { assertMuseMultiTurnOutput } from "./multi_turn/muse_output.ts";
 import { assertMuseTurnInterruptOutput } from "./turn_interrupt/muse_output.ts";
+import { assertCellMultiTurnOutput } from "./multi_turn/cell_output.ts";
+import { assertCellTurnInterruptOutput } from "./turn_interrupt/cell_output.ts";
 import { piCompactionInput } from "./pi_compaction/input.ts";
 import { assertPiCompactionOutput } from "./pi_compaction/output.ts";
 import { providerThreadResumeInput } from "./provider_thread_resume/input.ts";
@@ -207,6 +209,7 @@ import {
   CURSOR_MODEL_SELECTION,
   GROK_MODEL_SELECTION,
   MUSE_MODEL_SELECTION,
+  CELL_MODEL_SELECTION,
   OPENCODE_MODEL_SELECTION,
   OPENCODE2_MODEL_SELECTION,
   PI_MODEL_SELECTION,
@@ -663,6 +666,12 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         driver: ProviderDriverKind.make("muse"),
         transcriptFile: new URL("./simple/muse_transcript.ndjson", import.meta.url),
         modelSelection: MUSE_MODEL_SELECTION,
+        assertOutput: assertSimpleOutput,
+      },
+      {
+        driver: ProviderDriverKind.make("cell"),
+        transcriptFile: new URL("./simple/cell_transcript.ndjson", import.meta.url),
+        modelSelection: CELL_MODEL_SELECTION,
         assertOutput: assertSimpleOutput,
       },
     ],
@@ -1240,6 +1249,12 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         modelSelection: MUSE_MODEL_SELECTION,
         assertOutput: assertMuseMultiTurnOutput,
       },
+      {
+        driver: ProviderDriverKind.make("cell"),
+        transcriptFile: new URL("./multi_turn/cell_transcript.ndjson", import.meta.url),
+        modelSelection: CELL_MODEL_SELECTION,
+        assertOutput: assertCellMultiTurnOutput,
+      },
     ],
   },
   {
@@ -1564,6 +1579,12 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         transcriptFile: new URL("./turn_interrupt/muse_transcript.ndjson", import.meta.url),
         modelSelection: MUSE_MODEL_SELECTION,
         assertOutput: assertMuseTurnInterruptOutput,
+      },
+      {
+        driver: ProviderDriverKind.make("cell"),
+        transcriptFile: new URL("./turn_interrupt/cell_transcript.ndjson", import.meta.url),
+        modelSelection: CELL_MODEL_SELECTION,
+        assertOutput: assertCellTurnInterruptOutput,
       },
     ],
   },

@@ -1,0 +1,9 @@
+{"type":"transcript_start","provider":"cell","protocol":"cell.http-ws","version":"fake-cell","scenario":"simple","metadata":{"generatedBy":"fake-cell-recorder","model":"gpt-6-astra"}}
+{"type":"expect_outbound","label":"ws_connect","frame":{"kind":"ws_connect","path":"/cell/<project>/ws"}}
+{"type":"emit_inbound","label":"ws:state","frame":{"kind":"ws_event","event":{"type":"state","running":false,"parent":null,"depth":0}}}
+{"type":"emit_inbound","label":"ws:tasks","frame":{"kind":"ws_event","event":{"type":"tasks","tasks":[]}}}
+{"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Respond with the following text: fixture simple ok"}}
+{"type":"emit_inbound","label":"ws:user","frame":{"kind":"ws_event","event":{"type":"user","text":"Respond with the following text: fixture simple ok"}}}
+{"type":"emit_inbound","label":"ws:assistant","frame":{"kind":"ws_event","event":{"type":"assistant","text":"fixture simple ok"}}}
+{"type":"emit_inbound","label":"ws:done","frame":{"kind":"ws_event","event":{"type":"done"}}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":""}}

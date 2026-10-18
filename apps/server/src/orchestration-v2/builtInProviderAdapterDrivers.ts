@@ -4,6 +4,7 @@ import {
   AcpRegistryAdapterV2Driver,
   type AcpRegistryAdapterV2DriverEnv,
 } from "@t3tools/provider-acp-registry/server";
+import { CellAdapterV2Driver, type CellAdapterV2DriverEnv } from "@t3tools/provider-cell/server";
 import {
   ClaudeAdapterV2Driver,
   type ClaudeAdapterV2DriverEnv,
@@ -23,6 +24,7 @@ import type { AnyProviderAdapterDriver } from "@t3tools/provider-core/server/ada
 
 export type BuiltInProviderAdapterDriversV2Env =
   | AcpRegistryAdapterV2DriverEnv
+  | CellAdapterV2DriverEnv
   | ClaudeAdapterV2DriverEnv
   | CodexAdapterV2DriverEnv
   | CursorAdapterV2DriverEnv
@@ -39,6 +41,7 @@ const BUILT_IN_PROVIDER_ADAPTER_DRIVERS_V2: ReadonlyArray<
   OpenCodeAdapterV2Driver,
   GrokAdapterV2Driver,
   PiAdapterV2Driver,
+  CellAdapterV2Driver,
   AcpRegistryAdapterV2Driver,
 ];
 

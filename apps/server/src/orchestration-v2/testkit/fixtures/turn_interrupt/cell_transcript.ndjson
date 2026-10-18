@@ -1,0 +1,12 @@
+{"type":"transcript_start","provider":"cell","protocol":"cell.http-ws","version":"fake-cell","scenario":"turn_interrupt","metadata":{"generatedBy":"fake-cell-recorder","model":"gpt-6-astra"}}
+{"type":"expect_outbound","label":"ws_connect","frame":{"kind":"ws_connect","path":"/cell/<project>/ws"}}
+{"type":"emit_inbound","label":"ws:state","frame":{"kind":"ws_event","event":{"type":"state","running":false,"parent":null,"depth":0}}}
+{"type":"emit_inbound","label":"ws:tasks","frame":{"kind":"ws_event","event":{"type":"tasks","tasks":[]}}}
+{"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Do not answer immediately. First run the local shell command `sleep 30`, then respond with exactly: interrupt fixture should not finish naturally."}}
+{"type":"emit_inbound","label":"ws:user","frame":{"kind":"ws_event","event":{"type":"user","text":"Do not answer immediately. First run the local shell command `sleep 30`, then respond with exactly: interrupt fixture should not finish naturally."}}}
+{"type":"emit_inbound","label":"ws:shell","frame":{"kind":"ws_event","event":{"type":"shell","command":"sleep 30"}}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":""}}
+{"type":"expect_outbound","label":"POST /cell/<project>/cancel","frame":{"kind":"http","method":"POST","path":"/cell/<project>/cancel"}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":204,"body":""}}
+{"type":"emit_inbound","label":"ws:shell_output","frame":{"kind":"ws_event","event":{"type":"shell_output","command":"sleep 30","stdout":"","stderr":"The operation was aborted\n","exitCode":1,"timedOut":false}}}
+{"type":"emit_inbound","label":"ws:done","frame":{"kind":"ws_event","event":{"type":"done","error":"Cancelled"}}}
