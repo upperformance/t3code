@@ -125,10 +125,16 @@ const record = Effect.gen(function* () {
       },
       {
         driver: CellOrchestratorReplayHarness.driver,
-        decodeTranscript: Effect.succeed,
-        makeProviderAdapterRegistryLayer: () =>
+        decodeTranscript: (transcript: ProviderReplayTranscript) => Effect.succeed(transcript),
+        // The gate paces the recording like its replay: a gated child result
+        // waits for the step that releases it, so the fixture's run order holds.
+        makeProviderAdapterRegistryLayer: (_transcript, options) =>
           cellReplayLayer({
-            transport: makeRecordingCellTransport(liveTransport, entries),
+            transport: makeRecordingCellTransport(
+              liveTransport,
+              entries,
+              options?.replayGate === undefined ? {} : { gate: options.replayGate },
+            ),
             settings,
           }),
       },
@@ -156,6 +162,10 @@ const record = Effect.gen(function* () {
     entries,
   } satisfies ProviderReplayTranscript;
 
+  // Written before the verification replay, so a failed verification leaves
+  // the recording behind for inspection instead of only its error.
+  yield* fs.makeDirectory(path.dirname(outputPath), { recursive: true });
+  yield* fs.writeFileString(outputPath, encodeTranscriptNdjson(transcript));
   yield* Effect.gen(function* () {
     const replayWorkspace = yield* checkpointWorkspace(fixture.name, fixtureInput.workspaceFiles);
     const materialized = yield* materializeInput;
@@ -172,15 +182,10 @@ const record = Effect.gen(function* () {
       continuationOptions,
     );
     variant.assertOutput(replayResult, transcript);
-  }).pipe(
-    Effect.scoped,
-    provideDeterministicTestRuntime,
-    Effect.tapError(() => Console.error(encodeTranscriptNdjson(transcript))),
+  }).pipe(Effect.scoped, provideDeterministicTestRuntime);
+  yield* Console.log(
+    `Wrote and verified ${transcript.entries.length} cell replay entries at ${outputPath}`,
   );
-
-  yield* fs.makeDirectory(path.dirname(outputPath), { recursive: true });
-  yield* fs.writeFileString(outputPath, encodeTranscriptNdjson(transcript));
-  yield* Console.log(`Wrote ${transcript.entries.length} cell replay entries to ${outputPath}`);
 });
 
 // The undici dispatcher lives in its layer's scope, so the layers wrap the whole recording.

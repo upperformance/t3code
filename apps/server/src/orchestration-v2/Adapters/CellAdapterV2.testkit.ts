@@ -74,12 +74,13 @@ export const CellOrchestratorReplayHarness: OrchestratorV2ProviderReplayHarness<
         (cause) => new CellReplayTranscriptDecodeError({ scenario: transcript.scenario, cause }),
       ),
     ),
-  makeProviderAdapterRegistryLayer: (transcript) =>
+  makeProviderAdapterRegistryLayer: (transcript, options) =>
     Layer.unwrap(
       Effect.gen(function* () {
         const controller = makeReplayCellTransport({
           scenario: transcript.scenario,
           entries: transcript.entries,
+          ...(options?.replayGate === undefined ? {} : { gate: options.replayGate }),
         });
         yield* Effect.addFinalizer(() => Effect.sync(() => controller.assertComplete()));
         return layer({ transport: controller.transport });

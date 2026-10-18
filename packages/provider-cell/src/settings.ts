@@ -2,12 +2,7 @@
  * Shared by the server driver and the client settings form, so it holds only browser-safe schema
  * code.
  */
-import {
-  CustomModelSetting,
-  makeProviderSettingsSchema,
-  secretSetting,
-  TrimmedString,
-} from "@t3tools/contracts";
+import { makeProviderSettingsSchema, secretSetting, TrimmedString } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
@@ -42,13 +37,9 @@ export const CellSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Project prefix",
         description:
-          "Start of the cell project name each thread creates; the rest comes from the thread id.",
+          "Start of the cell project name each thread creates; the rest is a hash of the thread id.",
         providerSettingsForm: { placeholder: CELL_DEFAULT_PROJECT_PREFIX, clearWhenEmpty: "omit" },
       }),
-    ),
-    customModels: Schema.Array(CustomModelSetting).pipe(
-      Schema.withDecodingDefault(Effect.succeed([])),
-      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
   { order: ["baseUrl", "token", "projectPrefix"] },

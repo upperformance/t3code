@@ -1,0 +1,21 @@
+{"type":"transcript_start","provider":"cell","protocol":"cell.http-ws","version":"fake-cell","scenario":"provider_thread_resume","metadata":{"generatedBy":"fake-cell-recorder","model":"gpt-6-astra"}}
+{"type":"expect_outbound","label":"GET /cell/<project>/state","frame":{"kind":"http","method":"GET","path":"/cell/<project>/state"}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":200,"body":"{\"model\":\"gpt-6-astra\",\"running\":false,\"configured\":true,\"turns\":0,\"sockets\":0,\"parent\":null,\"depth\":0,\"tasks\":0,\"version\":\"0.3.0\",\"runId\":null,\"seq\":0}"}}
+{"type":"expect_outbound","label":"ws_connect","frame":{"kind":"ws_connect","path":"/cell/<project>/ws"}}
+{"type":"emit_inbound","label":"ws:state#1","frame":{"kind":"ws_event","event":{"type":"state","running":false,"parent":null,"depth":0,"runId":null,"seq":0}}}
+{"type":"emit_inbound","label":"ws:tasks#1","frame":{"kind":"ws_event","event":{"type":"tasks","tasks":[]}}}
+{"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Respond with exactly: provider thread resume fixture first turn complete"}}
+{"type":"emit_inbound","label":"ws:user#1","frame":{"kind":"ws_event","event":{"type":"user","text":"Respond with exactly: provider thread resume fixture first turn complete","runId":"run-1","origin":"user","seq":1}}}
+{"type":"emit_inbound","label":"ws:assistant#1","frame":{"kind":"ws_event","event":{"type":"assistant","text":"provider thread resume fixture first turn complete","runId":"run-1","seq":2}}}
+{"type":"emit_inbound","label":"ws:done#1","frame":{"kind":"ws_event","event":{"type":"done","runId":"run-1","seq":3}}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":"{\"runId\":\"run-1\",\"seq\":1}"}}
+{"type":"expect_outbound","label":"GET /cell/<project>/state","frame":{"kind":"http","method":"GET","path":"/cell/<project>/state"}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":200,"body":"{\"model\":\"gpt-6-astra\",\"running\":false,\"configured\":true,\"turns\":1,\"sockets\":0,\"parent\":null,\"depth\":0,\"tasks\":0,\"version\":\"0.3.0\",\"runId\":null,\"seq\":3}"}}
+{"type":"expect_outbound","label":"ws_connect","frame":{"kind":"ws_connect","path":"/cell/<project>/ws"}}
+{"type":"emit_inbound","label":"ws:state#2","frame":{"kind":"ws_event","event":{"type":"state","running":false,"parent":null,"depth":0,"runId":null,"seq":3}}}
+{"type":"emit_inbound","label":"ws:tasks#2","frame":{"kind":"ws_event","event":{"type":"tasks","tasks":[]}}}
+{"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Using the conversation history available in this resumed thread, first repeat the exact final answer you gave in the previous turn. Then on a new line write exactly: provider thread resume fixture second turn complete"}}
+{"type":"emit_inbound","label":"ws:user#2","frame":{"kind":"ws_event","event":{"type":"user","text":"Using the conversation history available in this resumed thread, first repeat the exact final answer you gave in the previous turn. Then on a new line write exactly: provider thread resume fixture second turn complete","runId":"run-2","origin":"user","seq":4}}}
+{"type":"emit_inbound","label":"ws:assistant#2","frame":{"kind":"ws_event","event":{"type":"assistant","text":"provider thread resume fixture first turn complete\nprovider thread resume fixture second turn complete","runId":"run-2","seq":5}}}
+{"type":"emit_inbound","label":"ws:done#2","frame":{"kind":"ws_event","event":{"type":"done","runId":"run-2","seq":6}}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":"{\"runId\":\"run-2\",\"seq\":4}"}}

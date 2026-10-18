@@ -2,8 +2,10 @@
  * The replay boundary for cell transcripts (`cell.http-ws`): outbound frames
  * are the HTTP requests and socket connects the adapter makes, inbound frames
  * are their responses and the events the socket delivered. The controller
- * holds the cursor; the transport it hands out answers from the transcript
- * and fails on the first request the recording did not see.
+ * walks the transcript in order on one promise chain: an outbound entry waits
+ * for the adapter to make that request, inbound socket frames are delivered
+ * as the walk reaches them, and a labelled frame can be held by a replay gate
+ * until a scenario step releases it.
  */
 import type { ProviderReplayEntry } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
@@ -34,6 +36,8 @@ export const CellReplayFrame = Schema.Union([
     status: Schema.Number,
     body: Schema.String,
   }),
+  /** The request never got an answer: the recorder saw a transport failure. */
+  Schema.Struct({ kind: Schema.Literal("http_failure"), detail: Schema.String }),
   Schema.Struct({ kind: Schema.Literal("ws_connect"), path: Schema.String }),
   Schema.Struct({ kind: Schema.Literal("ws_event"), event: Schema.Unknown }),
   Schema.Struct({ kind: Schema.Literal("ws_closed"), code: Schema.optional(Schema.Number) }),
@@ -66,25 +70,26 @@ export class CellReplayIncompleteError extends Schema.TaggedError<CellReplayInco
   }
 }
 
-/** `/cell/<project>/prompt` in a recording matches any project segment; the ids differ per run. */
-function pathMatches(expected: string, actual: string): boolean {
-  if (!expected.includes(PROJECT_PLACEHOLDER)) return expected === actual;
-  const [prefix, suffix] = expected.split(PROJECT_PLACEHOLDER);
-  if (prefix === undefined || suffix === undefined) return expected === actual;
-  return (
-    actual.startsWith(prefix) &&
-    actual.endsWith(suffix) &&
-    actual.length > prefix.length + suffix.length &&
-    !actual.slice(prefix.length, actual.length - suffix.length).includes("/")
-  );
+/**
+ * The project segment of a cell path. Recordings keep `<project>` there, since
+ * the hash differs per run; replay binds it to the first project it sees so a
+ * request to a second project is caught instead of matched.
+ */
+function projectSegment(path: string): string | undefined {
+  return /^\/cell\/([^/?]+)/.exec(path)?.[1];
 }
 
-/**
- * Replaces the project segment, and drops the socket's `client` query, so a
- * recording depends on neither the thread id nor the session id that minted it.
- */
+function withProject(path: string, project: string): string {
+  return path.replace(/^(\/cell\/)[^/?]+/, `$1${project}`);
+}
+
+/** Drops the socket's `client` query, which carries the session id that minted the recording. */
 function anonymizeCellPath(path: string): string {
-  return path.replace(/\?.*$/, "").replace(/^(\/cell\/)[^/]+/, `$1${PROJECT_PLACEHOLDER}`);
+  const [pathname, search = ""] = path.split("?", 2) as [string, string?];
+  const params = new URLSearchParams(search);
+  params.delete("client");
+  const query = params.toString();
+  return `${withProject(pathname, PROJECT_PLACEHOLDER)}${query ? `?${query}` : ""}`;
 }
 
 function requestPath(url: string): string {
@@ -92,34 +97,49 @@ function requestPath(url: string): string {
   return `${parsed.pathname}${parsed.search}`;
 }
 
+export interface CellReplayGate {
+  readonly beforeEmit: (label: string | undefined, signal?: AbortSignal) => Promise<void>;
+}
+
 interface Listener {
   readonly deliver: (frames: ReadonlyArray<string>) => void;
   readonly close: (code: number | undefined) => void;
 }
 
+type PendingResponse =
+  | { readonly kind: "response"; readonly response: CellHttpResponse }
+  | { readonly kind: "failure"; readonly error: CellTransportError };
+
 export class CellReplayController {
   private cursor = 0;
   private failure: CellReplayMismatchError | undefined;
   private listener: Listener | undefined;
+  private boundProject: string | undefined;
+  private chain: Promise<void> = Promise.resolve();
+  private readonly abort = new AbortController();
   private readonly entries: ReadonlyArray<ProviderReplayEntry>;
   private readonly scenario: string;
+  private readonly gate: CellReplayGate | undefined;
 
   constructor(input: {
     readonly scenario: string;
     readonly entries: ReadonlyArray<ProviderReplayEntry>;
+    readonly gate?: CellReplayGate;
   }) {
     this.scenario = input.scenario;
     this.entries = input.entries;
+    this.gate = input.gate;
   }
 
   get transport(): CellTransport {
     return {
-      request: (request) => Effect.suspend(() => this.request(request)),
-      connect: (input) => Effect.suspend(() => this.connect(input.url)),
+      request: (request) => this.request(request),
+      connect: (input) => this.connect(input.url),
     };
   }
 
   assertComplete(): void {
+    this.abort.abort();
     if (this.failure) throw this.failure;
     if (this.cursor !== this.entries.length) {
       throw new CellReplayIncompleteError({
@@ -130,6 +150,16 @@ export class CellReplayController {
     }
   }
 
+  /** Every cursor movement runs on one chain, so deliveries and matches keep transcript order. */
+  private enqueue<A>(task: () => Promise<A>): Promise<A> {
+    const result = this.chain.then(task);
+    this.chain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   private request(request: CellHttpRequest): Effect.Effect<CellHttpResponse, CellTransportError> {
     const actual = {
       kind: "http" as const,
@@ -137,39 +167,66 @@ export class CellReplayController {
       path: anonymizeCellPath(requestPath(request.url)),
       ...(request.body === undefined ? {} : { body: request.body }),
     };
-    const expected = this.takeOutbound(actual);
-    if (expected === undefined) return this.fail(`${request.method} ${request.url}`);
-    // The cell broadcasts a prompt's first events before it answers 202, so the
-    // socket frames recorded ahead of the response are delivered first, as they were.
-    this.drainSocketFrames();
-    const response = this.takeInbound();
-    if (response?.kind !== "http_response") {
-      this.failure ??= new CellReplayMismatchError({
-        scenario: this.scenario,
-        cursor: this.cursor,
-        expected: "http_response",
-        actual: response ?? null,
-      });
-      return this.fail(`${request.method} ${request.url}`);
-    }
-    const result = Effect.succeed({ status: response.status, body: response.body });
-    this.drainSocketFrames();
-    return result;
+    const operation = `${request.method} ${request.url}`;
+    const project = projectSegment(requestPath(request.url));
+    return Effect.promise(() =>
+      this.enqueue(async (): Promise<PendingResponse> => {
+        await this.deliverInbound();
+        if (!this.takeOutbound(actual, project)) {
+          return { kind: "failure", error: this.fail(operation) };
+        }
+        // The cell broadcasts a prompt's first events before it answers 202, so
+        // the socket frames recorded ahead of the response are delivered first.
+        const response = await this.deliverInbound({ untilResponse: true });
+        if (response === undefined) {
+          this.failure ??= new CellReplayMismatchError({
+            scenario: this.scenario,
+            cursor: this.cursor,
+            expected: "http_response",
+            actual: this.entries[this.cursor] ?? null,
+          });
+          return { kind: "failure", error: this.fail(operation) };
+        }
+        if (response.kind === "http_failure") {
+          return {
+            kind: "failure",
+            error: new CellTransportError({ operation, detail: response.detail }),
+          };
+        }
+        return {
+          kind: "response",
+          response: { status: response.status, body: response.body },
+        };
+      }),
+    ).pipe(
+      Effect.flatMap((outcome) =>
+        outcome.kind === "response" ? Effect.succeed(outcome.response) : Effect.fail(outcome.error),
+      ),
+      Effect.tap(() => Effect.sync(() => this.pump())),
+    );
   }
 
   private connect(
     url: string,
   ): Effect.Effect<CellSocketConnection, CellTransportError, Scope.Scope> {
     const actual = { kind: "ws_connect" as const, path: anonymizeCellPath(requestPath(url)) };
-    if (this.takeOutbound(actual) === undefined) return this.fail(`connect ${url}`);
+    const project = projectSegment(requestPath(url));
     const attach = (listener: Listener) => {
       this.listener = listener;
     };
     const detach = (listener: Listener) => {
       if (this.listener === listener) this.listener = undefined;
     };
-    const drain = () => this.drainSocketFrames();
+    const match = () =>
+      this.enqueue(async () => {
+        await this.deliverInbound();
+        return this.takeOutbound(actual, project);
+      });
+    const fail = () => this.fail(`connect ${url}`);
+    const pump = () => this.pump();
     return Effect.gen(function* () {
+      const matched = yield* Effect.promise(match);
+      if (!matched) return yield* fail();
       const pending: Array<string> = [];
       let closedWith: CellTransportError | undefined;
       let waiter: Deferred.Deferred<void> | undefined;
@@ -206,95 +263,126 @@ export class CellReplayController {
           waiter = undefined;
         }
       });
-      drain();
+      pump();
       return { pull };
     });
   }
 
-  private takeOutbound(actual: CellReplayFrame): CellReplayFrame | undefined {
-    if (this.failure) return undefined;
+  private takeOutbound(actual: CellReplayFrame, project: string | undefined): boolean {
+    if (this.failure) return false;
     const entry = this.entries[this.cursor];
     const expected = entry?.type === "expect_outbound" ? decodeFrame(entry.frame) : undefined;
+    const boundPath = (path: string) =>
+      this.boundProject === undefined ? path : withProject(path, this.boundProject);
+    const actualPath = actual.kind === "http" || actual.kind === "ws_connect" ? actual.path : "";
     const matches =
       expected !== undefined &&
       expected.kind === actual.kind &&
       (actual.kind === "http"
         ? expected.kind === "http" &&
           expected.method === actual.method &&
-          pathMatches(expected.path, actual.path) &&
+          boundPath(expected.path) === boundPath(actualPath) &&
           (expected.body ?? "") === (actual.body ?? "")
         : actual.kind === "ws_connect" &&
           expected.kind === "ws_connect" &&
-          pathMatches(expected.path, actual.path));
+          boundPath(expected.path) === boundPath(actualPath)) &&
+      (this.boundProject === undefined || project === undefined || project === this.boundProject);
     if (!matches) {
       this.failure = new CellReplayMismatchError({
         scenario: this.scenario,
         cursor: this.cursor,
         expected: entry ?? null,
-        actual,
+        actual: {
+          ...actual,
+          ...(project === undefined ? {} : { project }),
+          ...(this.boundProject === undefined ? {} : { boundProject: this.boundProject }),
+        },
       });
-      return undefined;
+      return false;
     }
+    if (this.boundProject === undefined && project !== undefined) this.boundProject = project;
     this.cursor += 1;
-    return expected;
+    return true;
   }
 
-  private takeInbound(): CellReplayFrame | undefined {
-    const entry = this.entries[this.cursor];
-    if (entry?.type !== "emit_inbound") return undefined;
-    this.cursor += 1;
-    return decodeFrame(entry.frame);
-  }
-
-  /** Socket frames are delivered as soon as the transcript reaches them. */
-  private drainSocketFrames(): void {
+  /** Walks inbound entries from the cursor without waiting for the chain; callers hold it. */
+  private async deliverInbound(options: { readonly untilResponse?: boolean } = {}) {
     while (this.failure === undefined) {
       const entry = this.entries[this.cursor];
-      if (entry?.type === "runtime_exit") {
+      if (entry === undefined) return undefined;
+      if (entry.type === "runtime_exit") {
         this.cursor += 1;
         this.listener?.close(undefined);
         continue;
       }
-      if (entry?.type !== "emit_inbound") return;
+      if (entry.type !== "emit_inbound") return undefined;
       const frame = decodeFrame(entry.frame);
-      if (frame.kind === "http_response") return;
+      if (frame.kind === "http_response" || frame.kind === "http_failure") {
+        if (options.untilResponse !== true) return undefined;
+        this.cursor += 1;
+        return frame;
+      }
+      if (this.gate !== undefined) await this.gate.beforeEmit(entry.label, this.abort.signal);
+      if (this.abort.signal.aborted) return undefined;
       this.cursor += 1;
       if (frame.kind === "ws_event") this.listener?.deliver([encodeJson(frame.event)]);
       else if (frame.kind === "ws_closed") this.listener?.close(frame.code);
     }
+    return undefined;
   }
 
-  private fail(operation: string): Effect.Effect<never, CellTransportError> {
-    return Effect.fail(
-      new CellTransportError({
-        operation,
-        detail: this.failure?.message ?? "replay transcript exhausted",
-        cause: this.failure,
-      }),
-    );
+  /** Socket frames are delivered as soon as the transcript reaches them. */
+  private pump(): void {
+    void this.enqueue(() => this.deliverInbound());
+  }
+
+  private fail(operation: string): CellTransportError {
+    return new CellTransportError({
+      operation,
+      detail: this.failure?.message ?? "replay transcript exhausted",
+      cause: this.failure,
+    });
   }
 }
 
 export function makeReplayCellTransport(input: {
   readonly scenario: string;
   readonly entries: ReadonlyArray<ProviderReplayEntry>;
+  readonly gate?: CellReplayGate;
 }): CellReplayController {
   return new CellReplayController(input);
 }
 
-/** Wraps a live transport and appends every exchange to `entries` in transcript order. */
+/** `ws:task#2` names the second `task` event of a recording, for replay gates to hold. */
+export function cellReplayEventLabel(type: string, ordinal: number): string {
+  return `ws:${type}#${ordinal}`;
+}
+
+/**
+ * Wraps a live transport and appends every exchange to `entries` in transcript
+ * order. With a gate, a labelled socket frame is held until the scenario
+ * releases it, so a recording is paced the way its replay will be.
+ */
 export function makeRecordingCellTransport(
   transport: CellTransport,
   entries: Array<ProviderReplayEntry>,
+  options: { readonly gate?: CellReplayGate } = {},
 ): CellTransport {
-  const record = (type: "expect_outbound" | "emit_inbound", frame: CellReplayFrame) => {
-    const label =
-      frame.kind === "http"
-        ? `${frame.method} ${frame.path}`
-        : frame.kind === "ws_event"
-          ? `ws:${String((frame.event as { type?: unknown } | null)?.type ?? "event")}`
-          : frame.kind;
+  const eventCounts = new Map<string, number>();
+  const record = (type: "expect_outbound" | "emit_inbound", frame: CellReplayFrame): string => {
+    let label: string;
+    if (frame.kind === "http") {
+      label = `${frame.method} ${frame.path}`;
+    } else if (frame.kind === "ws_event") {
+      const eventType = String((frame.event as { type?: unknown } | null)?.type ?? "event");
+      const ordinal = (eventCounts.get(eventType) ?? 0) + 1;
+      eventCounts.set(eventType, ordinal);
+      label = cellReplayEventLabel(eventType, ordinal);
+    } else {
+      label = frame.kind;
+    }
     entries.push({ type, label, frame });
+    return label;
   };
   return {
     request: (request) =>
@@ -305,7 +393,15 @@ export function makeRecordingCellTransport(
           path: anonymizeCellPath(requestPath(request.url)),
           ...(request.body === undefined ? {} : { body: request.body }),
         });
-        const response = yield* transport.request(request);
+        const response = yield* transport
+          .request(request)
+          .pipe(
+            Effect.tapError((error) =>
+              Effect.sync(() =>
+                record("emit_inbound", { kind: "http_failure", detail: error.detail }),
+              ),
+            ),
+          );
         record("emit_inbound", {
           kind: "http_response",
           status: response.status,
@@ -320,23 +416,32 @@ export function makeRecordingCellTransport(
           path: anonymizeCellPath(requestPath(input.url)),
         });
         const connection = yield* transport.connect(input);
-        return {
-          pull: connection.pull.pipe(
-            Effect.tap((frames) =>
-              Effect.forEach(frames, (frame) =>
-                decodeEventFrame(frame).pipe(
-                  Effect.orElseSucceed((): unknown => frame),
-                  Effect.map((event) => record("emit_inbound", { kind: "ws_event", event })),
-                ),
+        // One frame per pull, so a gated frame holds the ones behind it too.
+        const buffered: Array<string> = [];
+        const pull: CellSocketConnection["pull"] = Effect.gen(function* () {
+          if (buffered.length === 0) {
+            const frames = yield* connection.pull.pipe(
+              Effect.tapError((error) =>
+                Effect.sync(() => {
+                  if (error.closed) record("emit_inbound", { kind: "ws_closed" });
+                }),
               ),
-            ),
-            Effect.tapError((error) =>
-              Effect.sync(() => {
-                if (error.closed) record("emit_inbound", { kind: "ws_closed" });
-              }),
-            ),
-          ),
-        };
+            );
+            buffered.push(...frames);
+            if (buffered.length === 0) return [];
+          }
+          const frame = buffered.shift()!;
+          const event = yield* decodeEventFrame(frame).pipe(
+            Effect.orElseSucceed((): unknown => frame),
+          );
+          const label = record("emit_inbound", { kind: "ws_event", event });
+          if (options.gate !== undefined) {
+            const gate = options.gate;
+            yield* Effect.promise((signal) => gate.beforeEmit(label, signal));
+          }
+          return [frame];
+        });
+        return { pull };
       }),
   };
 }

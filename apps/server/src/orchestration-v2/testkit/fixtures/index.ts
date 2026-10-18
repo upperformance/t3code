@@ -69,6 +69,9 @@ import { assertMuseMultiTurnOutput } from "./multi_turn/muse_output.ts";
 import { assertMuseTurnInterruptOutput } from "./turn_interrupt/muse_output.ts";
 import { assertCellMultiTurnOutput } from "./multi_turn/cell_output.ts";
 import { assertCellTurnInterruptOutput } from "./turn_interrupt/cell_output.ts";
+import { assertCellProviderThreadResumeOutput } from "./provider_thread_resume/cell_output.ts";
+import { cellWakeInput } from "./cell_wake/input.ts";
+import { assertCellWakeOutput } from "./cell_wake/output.ts";
 import { piCompactionInput } from "./pi_compaction/input.ts";
 import { assertPiCompactionOutput } from "./pi_compaction/output.ts";
 import { providerThreadResumeInput } from "./provider_thread_resume/input.ts";
@@ -1332,6 +1335,25 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         modelSelection: PI_MODEL_SELECTION,
         assertOutput: assertPiProviderThreadResumeOutput,
       },
+      {
+        driver: ProviderDriverKind.make("cell"),
+        transcriptFile: new URL("./provider_thread_resume/cell_transcript.ndjson", import.meta.url),
+        modelSelection: CELL_MODEL_SELECTION,
+        assertOutput: assertCellProviderThreadResumeOutput,
+      },
+    ],
+  },
+  {
+    name: "cell_wake",
+    buildInput: cellWakeInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("cell"),
+        transcriptFile: new URL("./cell_wake/cell_transcript.ndjson", import.meta.url),
+        modelSelection: CELL_MODEL_SELECTION,
+        runContinuationWorker: true,
+        assertOutput: assertCellWakeOutput,
+      },
     ],
   },
   {
@@ -1392,6 +1414,12 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         driver: ProviderDriverKind.make("acpRegistry"),
         transcriptFile: new URL("./queued_turn/registry_transcript.ndjson", import.meta.url),
         modelSelection: ACP_REGISTRY_MODEL_SELECTION,
+        assertOutput: assertQueuedTurnOutput,
+      },
+      {
+        driver: ProviderDriverKind.make("cell"),
+        transcriptFile: new URL("./queued_turn/cell_transcript.ndjson", import.meta.url),
+        modelSelection: CELL_MODEL_SELECTION,
         assertOutput: assertQueuedTurnOutput,
       },
     ],

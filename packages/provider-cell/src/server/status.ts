@@ -11,7 +11,6 @@ import * as Schema from "effect/Schema";
 
 import {
   buildServerProvider,
-  providerModelsFromSettings,
   type ProviderProbeResult,
 } from "@t3tools/provider-core/server/snapshotProbe";
 
@@ -37,14 +36,11 @@ const CELL_PRESENTATION = {
 const PROBE_TIMEOUT_MS = 8_000;
 const decodeState = Schema.decodeUnknownEffect(Schema.fromJsonString(CellState));
 
-function cellModels(
-  model: string | undefined,
-  settings: CellSettings,
-): ReadonlyArray<ServerProviderModel> {
-  const builtIn: ReadonlyArray<ServerProviderModel> = model
+/** The tenant decides the model; the catalog is that one entry, and the adapter refuses any other. */
+function cellModels(model: string | undefined): ReadonlyArray<ServerProviderModel> {
+  return model
     ? [{ slug: model, name: model, isCustom: false, isDefault: true, capabilities: null }]
     : [];
-  return providerModelsFromSettings(builtIn, settings.customModels, null);
 }
 
 export const makePendingCellProvider = Effect.fn("makePendingCellProvider")(function* (
@@ -54,7 +50,7 @@ export const makePendingCellProvider = Effect.fn("makePendingCellProvider")(func
     presentation: CELL_PRESENTATION,
     enabled: settings.enabled,
     checkedAt: DateTime.formatIso(yield* DateTime.now),
-    models: cellModels(undefined, settings),
+    models: cellModels(undefined),
     probe: {
       installed: false,
       version: null,
@@ -78,7 +74,7 @@ export const checkCellProviderStatus = Effect.fn("checkCellProviderStatus")(func
       presentation: CELL_PRESENTATION,
       enabled: true,
       checkedAt,
-      models: cellModels(model, settings),
+      models: cellModels(model),
       probe,
     });
   if (!settings.baseUrl) {
