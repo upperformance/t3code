@@ -195,11 +195,18 @@ taken as evidence about the run. Without any of these the turn fails as a
 transport error: with the cell idle, the message most likely never started
 and the turn says to send it again; with the cell running something else,
 the turn says T3 cannot tell whether the message ran and that its result, if
-any, stays in the cell. An answer T3 cannot trust counts as no answer: a
-server error (5xx) whose body is not the cell's own `{ runId, error }`
-refusal came from something between T3 and the cell, or from a cell that may
-already have started the run, and goes through the same recovery; one that
-carries the cell's refusal fails the turn with that reason.
+any, stays in the cell. An answer T3 cannot trust counts as no answer. The
+cell's refusal has one shape: JSON with `runId` present, a string naming the
+run in progress for the 409 conflict, or `null` together with a string
+`error` for every other refusal (an empty prompt, no API key, a cell busy
+with a fork or reset). A server error (5xx) whose body is exactly that is the
+cell's own and fails the turn with its reason; one with any other body, a
+proxy's HTML page, a gateway's `{ "error": ... }` without `runId`, `{ "runId":
+null }` alone, an empty or unreadable body, came from something between T3
+and the cell, or from a cell that may already have started the run, and goes
+through the same recovery by request id. A status below 500 without the
+refusal shape fails the turn quoting the body, as a provider error when the
+tenant rejected the token (401, 403) and as a transport error otherwise.
 
 | Cell event               | T3 effect                                                                                                                                                              |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -400,6 +407,66 @@ adapter reconciles what it was tracking against the snapshot:
   its backoff for the idle thread, and a connection whose snapshot is applied
   resets the count.
 
+## Restarts
+
+The active turn lives in the adapter's memory, and a session ends with the
+cell still running its run whenever T3 stops mid-turn: the cell does not
+notice. So that the next session can take the run back, the thread's
+persisted head names it while it is T3's. The head is
+`nativeConversationHeadRef` on the provider thread, the record the
+orchestrator stores from every `provider_thread.updated` and hands back to
+`resumeThread` and `ensureThread`, and the one Codex carries across a resume
+and Pi uses for its session leaf; `OrchestrationV2ProviderSession` has no
+field of its own for adapter state, and `nativeMetadata` is a closed struct.
+While a run is T3's the head is a strong ref: `nativeId` is the cell's run
+id, `fingerprint` the `x-request-id` the prompt was posted with, `ordinal`
+the last sequence number applied. It is written when the 202, the request id
+or a wake's adoption names the run, and again after every event of the run
+applied, so that it always says where T3 left off; when the turn ends in any
+way but the session closing it is replaced by the weak ref to the finished
+turn that was already written on completion. A closing session leaves the
+strong head in place: that run is what the next session takes back.
+
+A session that resumes a thread whose head is strong queues the run it names
+like a wake, with the persisted number as where the last session left off,
+and handles its first connection as a reconnect rather than a fresh
+attachment: the log is read back from that number to the snapshot, so the
+run's events since, and its `done` if it ended, land in the queued entry; the
+roster is applied at its own number; and the entry is judged as a wake is at
+a reconnect, as still running at the snapshot, as ended by a `done` read
+back, or as lost when the cell is not running it and no `done` was read, when
+the gap is one the cell no longer retains, or when the numbering regressed. A
+replay that fails on this first connection does not drop it, since the thread
+must still attach: the run is marked lost and the adapter attaches at the
+snapshot. Nothing is sent to the cell before this.
+
+T3's own restart continuation, the message the server dispatches with
+`restartContinuationOfRunId` after a restart, adopts the queued run instead
+of posting its text: the turn owns the run from the persisted number, replays
+what was buffered, and either waits for the live `done` or settles from the
+`done` the log supplied; a lost run fails the turn as a transport error
+saying how it ended could not be read back, and the head follows the turn's
+end either way. A restart continuation that finds nothing restored posts its
+text as a prompt, like any other message. When no restart continuation comes
+(the project has `continueThreadsAfterServerUpdate` off, or the thread is
+archived, snoozed or settled), the next turn that starts offers the queued
+run to the orchestrator as a continuation, exactly as a wake is offered, so
+its output follows that turn; the offer waits for that turn because an offer
+made at resume time would queue a second turn next to a restart continuation
+that is about to adopt the same run. A message typed while the cell still
+runs the restored run is refused by the cell with 409 naming it, and the
+adapter, recognising its own run, says the turn in progress when T3 last
+stopped is still running rather than that another client runs the cell.
+
+What restoration does not survive: a prompt whose 202 had not arrived when T3
+stopped, a window of one round trip in which the head names no run yet, so
+the next prompt is refused naming a run T3 cannot prove is its own; the
+events applied after the last head update the orchestrator persisted, which
+a restoring turn shows again (at most the items between two consecutive
+updates, since the head moves with every one); a `reset` or a cell recreated
+in the gap, whose run is reported lost; and the cell's own retention, since a
+gap it no longer holds cannot be read back.
+
 ## Failures
 
 A failed `done` becomes a failed terminal with the class the cell's error code
@@ -466,10 +533,12 @@ transcript protocol is `cell.http-ws`: outbound frames are the HTTP requests
 and WebSocket connects the adapter makes, inbound frames are the responses,
 transport failures and socket events. Replay binds `<project>` to the first
 project it sees, so a request to a second project fails the replay instead of
-matching, and `<request-id>` to the `x-request-id` of the latest prompt, so a
-transcript holds no minted id and a replayed opener or state carries exactly
-the id the adapter is looking for; the recorder writes the placeholder where
-the cell echoed the id. Socket events are labelled `ws:<type>#<n>` so a
+matching, and `<request-id:n>` to the n-th distinct `x-request-id` the
+adapter sends, so a transcript holds no minted id and a replayed opener,
+state or log page carries exactly the ids the adapter is looking for, even
+when one log page carries the openers of several turns; the recorder numbers
+each distinct id in order of first use and writes its placeholder where the
+cell echoed it. Socket events are labelled `ws:<type>#<n>` so a
 fixture step can hold the n-th event of a type behind a replay gate; the
 recorder honours the same gate, so a recording is paced the way its replay
 will be. The recorder in `apps/server/scripts/record-cell-replay-fixture.ts`
@@ -509,7 +578,13 @@ or ends before the snapshot, three roster timeouts in a row failing the turn
 while reconnection goes on, a regressed numbering, a roster numbered
 elsewhere than its state and a fractional number each dropping the
 connection, and the fake cell's request ids, refusals and run-targeted
-cancels. The reconnect races run over a hand-driven socket, since a
+cancels. The sixth review's are too: a gateway's JSON error without the
+cell's `runId` recovered from the opener already buffered, a restart
+continuation taking back the run the last session owned while the cell still
+runs it and settling from the log when it ended in the gap, a message sent
+meanwhile refused naming T3's own run and the run offered as a continuation,
+and the recorder numbering two turns' request ids on one log page, replayed
+with fresh ids. The reconnect races run over a hand-driven socket, since a
 transcript walk cannot hold a prompt's answer until after the frames that
 race it; the ones that need the roster timeout and the backoff run on the
 test clock.

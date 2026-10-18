@@ -70,3 +70,13 @@ whether a run with that id started before giving up, and never takes another
 client's run for its own, even one started with the same words. A message it
 cannot confirm is reported as failed with a note saying whether to send it
 again or to look in the cell for its result.
+
+If T3 Code stops while the cell is working on a message, the cell keeps
+working. When T3 Code starts again it takes that run back: the turn it
+resumes shows what the cell has done since and ends when the cell does, and
+nothing new is sent to the cell until then. If the cell finished while T3
+Code was down, the resumed turn shows the rest of the result at once. A
+message sent while that earlier run is still going is refused with a note
+saying so; wait for it to finish, then send the message again. Only a message
+whose acceptance had not yet reached T3 Code when it stopped is not taken
+back; the next message to that cell is refused until the run finishes.
