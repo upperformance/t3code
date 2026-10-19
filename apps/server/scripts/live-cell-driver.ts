@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off globalDateInEffect:off globalConsole:off preferSchemaOverJson:off - a live driver: it runs the real orchestrator and adapter against a cell on celld and logs on the wall clock.
+// @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off globalDateInEffect:off globalConsole:off preferSchemaOverJson:off globalFetchInEffect:off - a live driver: it runs the real orchestrator and adapter against a cell on celld, logs on the wall clock, and bounds its own reads of the cell with an AbortSignal.
 /**
  * Drives the real orchestrator and the real cell adapter against a live cell
  * (celld) for the scenarios the fixture recorder cannot express, and logs
@@ -20,8 +20,8 @@
  * and the prompt completes.
  * delete-delegate: the run delegates and completes while the child still runs
  * (hold the child with the scripted API's CHILD_DELAY_MS), the thread is
- * deleted, and the cell must have received the task's cancel and list the
- * task as cancelled.
+ * deleted, and the cell must have received the task's cancel and, within 35 s,
+ * list the task as cancelled or no longer list it.
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -72,6 +72,9 @@ const CLOCK_TICK = Duration.millis(20);
 const POLL_LIMIT = 9_000; // × 10 ms wall time
 const RECONNECT_KILL_AFTER_MS = 3_000;
 const RECONNECT_HOLD_MS = Number(process.env.RECONNECT_HOLD_MS ?? 25_000);
+// delete-delegate: how long the cell's task list is read after the cancel left,
+// on the live clock, every request included.
+const TASKS_READ_MS = 35_000;
 
 function readArgValue(name: string): string | undefined {
   const index = process.argv.indexOf(name);
@@ -457,23 +460,43 @@ const main = Effect.gen(function* () {
         log(`delete-delegate: the cancel of task ${taskId} was sent`);
         // The cell's state is read on its own: the adapter gives up on the
         // answer after 3 s, while the cell has 30 s to carry the cancel out,
-        // and a cancelled task may leave the roster.
+        // and a cancelled task may leave the roster. The reads bypass the
+        // transport, which has no bound of its own: each gets what is left of
+        // one live-clock deadline, so a held one ends there.
         const tasksUrl = sent.url.replace(/\/tasks\/[^/]+\/cancel$/, "/tasks");
+        const deadline = Date.now() + TASKS_READ_MS;
         let listed: string | undefined;
-        for (let attempt = 0; attempt < 35; attempt++) {
-          const tasks = yield* transport.request({
-            method: "GET",
-            url: tasksUrl,
-            headers: sent.headers,
-          });
-          listed =
-            tasks.status === 200
-              ? ((JSON.parse(tasks.body) as ReadonlyArray<{ taskId: string; status: string }>).find(
-                  (task) => task.taskId === taskId,
-                )?.status ?? "removed")
-              : `unreadable (${tasks.status})`;
+        while (Date.now() < deadline) {
+          log(`>> GET ${tasksUrl} (${deadline - Date.now()} ms left)`);
+          listed = yield* Effect.tryPromise({
+            try: async (signal) => {
+              const response = await fetch(tasksUrl, {
+                headers: sent.headers,
+                signal: AbortSignal.any([
+                  signal,
+                  AbortSignal.timeout(Math.max(0, deadline - Date.now())),
+                ]),
+              });
+              const body = await response.text();
+              log(`<< ${response.status} GET ${tasksUrl} ${body.slice(0, 600)}`);
+              return response.status === 200
+                ? ((JSON.parse(body) as ReadonlyArray<{ taskId: string; status: string }>).find(
+                    (task) => task.taskId === taskId,
+                  )?.status ?? "removed")
+                : `unreadable (${response.status})`;
+            },
+            catch: (cause) => (cause instanceof Error ? cause.message : String(cause)),
+          }).pipe(
+            Effect.catch((detail) =>
+              Effect.sync(() => {
+                log(`<< GET ${tasksUrl} FAILED ${detail}`);
+                return `unreadable (${detail})`;
+              }),
+            ),
+          );
           if (listed !== "running" && !listed.startsWith("unreadable")) break;
-          yield* TestClock.withLive(Effect.sleep("1 second"));
+          const left = deadline - Date.now();
+          if (left > 0) yield* TestClock.withLive(Effect.sleep(Math.min(1_000, left)));
         }
         const answered =
           cancelAnswer === undefined
