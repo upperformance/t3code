@@ -53,6 +53,7 @@ import * as RuntimePolicy from "./RuntimePolicy.ts";
 import {
   isRestartNoteContinuation,
   pendingRestartCancelledBackgroundWork,
+  persistedBackgroundWorkSurvivesRestart,
   restartCancelledBackgroundWorkNote,
 } from "./RestartBackgroundNote.ts";
 
@@ -706,8 +707,12 @@ export const layer: Layer.Layer<
             providerSessionId,
             // The native ref is dropped so the adapter binds a fresh native
             // session instead of retrying the resume that just failed, while
-            // still adopting this row's identity.
+            // still adopting this row's identity. The open native subagent
+            // rows go with it as on the resume: a provider whose tasks run on
+            // (a cell's) finds them again from its own state and publishes
+            // their end to these rows rather than leaving them open.
             existingProviderThread: { ...providerThread, nativeThreadRef: null },
+            openNativeSubagentItems,
           }),
         );
         if (replacement === undefined) return undefined;
@@ -954,9 +959,10 @@ export const layer: Layer.Layer<
       // its tasks live on the tenant) lost none of it to a restart: a note an
       // earlier build wrote before the capability was stored is not prompted,
       // and the continuation keeps its restartContinuationOfRunId so the
-      // adapter takes the run back natively.
+      // adapter takes the run back natively. A session that reports no
+      // capabilities is read as one whose work does not survive.
       const workSurvivesRestart =
-        session.providerSession.capabilities.sessions.backgroundWorkSurvivesRestart === true;
+        persistedBackgroundWorkSurvivesRestart(session.providerSession.capabilities) === true;
       const noteContinuation =
         !workSurvivesRestart &&
         isRestartNoteContinuation(

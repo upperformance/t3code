@@ -621,6 +621,18 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly unloadThread?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  /**
+   * Asks the provider to stop the background work it still runs for the
+   * thread, best effort, before the session is detached from a thread that is
+   * being deleted. Only a provider whose work outlives the session
+   * (`sessions.backgroundWorkSurvivesRestart`) has anything to stop; the
+   * deletion settled the work's rows itself, so a request the provider
+   * refuses or does not answer changes nothing in T3.
+   */
+  readonly cancelBackgroundWork?: (input: {
+    readonly threadId: ThreadId;
+    readonly reason: string;
+  }) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly respondToRuntimeRequest: (
     input: ProviderAdapterV2RuntimeRequestResponseInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;

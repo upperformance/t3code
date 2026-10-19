@@ -23,6 +23,7 @@ import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Random from "effect/Random";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -1197,6 +1198,150 @@ describe("CellAdapterV2 over the fake cell", () => {
       assert.equal(unreachable.status, "error");
       assert.equal(unreachable.installed, false);
     }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+  it.live(
+    "an attach whose sockets were all refused does not keep the session from attaching later",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* fakeCell();
+        const transport = yield* liveTransport;
+        const made = yield* makeAdapter(transport, fake.baseUrl);
+        const project = yield* cellProjectName("t3-", THREAD_ID);
+        const runtime = yield* made.adapter.openSession({
+          threadId: THREAD_ID,
+          providerSessionId: SESSION_ID,
+          modelSelection: defaultModel,
+          runtimePolicy: fullAccess,
+        });
+        const emitted = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        yield* runtime.events.pipe(
+          Stream.runForEach((event) => Queue.offer(emitted, event)),
+          Effect.ignore,
+          Effect.forkScoped,
+        );
+        const attach = runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: defaultModel,
+          runtimePolicy: fullAccess,
+        });
+        fake.rejectSockets(true);
+        const refused = yield* attach.pipe(Effect.result);
+        assert.isTrue(refused._tag === "Failure", "the attach fails while every socket is refused");
+        if (refused._tag !== "Failure") return;
+        assert.include(String(Reflect.get(refused.failure, "cause")), "connections in a row");
+        // The same session attaches once the tenant accepts sockets again: the
+        // first snapshot to complete, on whatever connection, attaches the thread.
+        fake.rejectSockets(false);
+        const providerThread = yield* attach;
+        assert.equal(providerThread.nativeThreadRef?.nativeId, project);
+        yield* runtime.startTurn(yield* turnInput(providerThread, "Respond with exactly: LATER"));
+        let terminal: ProviderAdapter.ProviderAdapterV2Event | undefined;
+        while (terminal?.type !== "turn.terminal") terminal = yield* Queue.take(emitted);
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(fake.prompts(project), ["Respond with exactly: LATER"]);
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live(
+    "a prompt whose request id the cell already ran, as a recorder rerun against a kept cell sends, fails at once instead of waiting for an end that came before T3 attached",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* fakeCell();
+        const transport = yield* liveTransport;
+        const made = yield* makeAdapter(transport, fake.baseUrl);
+        const project = yield* cellProjectName("t3-", THREAD_ID);
+        // The deterministic test runtime mints the same request id every run.
+        const seeded = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          effect.pipe(Random.withSeed(0x1234_5678));
+        const first = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const harness = yield* openHarness(made);
+            yield* harness.runtime
+              .startTurn(yield* turnInput(harness.providerThread, "Respond with exactly: ONE"))
+              .pipe(seeded);
+            const terminal = yield* harness.takeEvent("turn.terminal");
+            assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+            return harness.providerThread;
+          }),
+        );
+        const resumed = yield* openHarness(made, {
+          providerSessionId: ProviderSessionId.make("session-cell-2"),
+          resume: first,
+        });
+        const startedAt = Date.now();
+        yield* resumed.runtime
+          .startTurn(yield* turnInput(resumed.providerThread, "Respond with exactly: ONE", 2))
+          .pipe(seeded);
+        const terminal = yield* resumed.takeEvent("turn.terminal").pipe(
+          Effect.timeoutOrElse({
+            duration: "5 seconds",
+            orElse: () => Effect.die("the turn waited on a run that ended before T3 attached"),
+          }),
+        );
+        assert.equal(terminal.status, "failed");
+        assert.equal(failureOf(terminal)?.class, "transport_error");
+        assert.include(failureOf(terminal)?.message ?? "", "not new to the cell");
+        assert.include(failureOf(terminal)?.message ?? "", "run-1");
+        assert.isBelow(Date.now() - startedAt, 5_000);
+        assert.deepEqual(
+          fake.prompts(project),
+          ["Respond with exactly: ONE"],
+          "the cell started no second run for the repeated id",
+        );
+        assert.deepEqual(assistantTexts(resumed.allEvents, 2), []);
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live(
+    "the deletion hook asks the cell to cancel each task still running, and only for its own thread",
+    () =>
+      Effect.gen(function* () {
+        // The child would finish on its own a minute later: within the test it only ends when cancelled.
+        const fake = yield* fakeCell({ delegateDelayMs: 60_000 });
+        const transport = yield* liveTransport;
+        const made = yield* makeAdapter(transport, fake.baseUrl);
+        const harness = yield* openHarness(made);
+        const project = yield* cellProjectName("t3-", THREAD_ID);
+        yield* harness.runtime.startTurn(
+          yield* turnInput(
+            harness.providerThread,
+            "Delegate a review to a child cell. Reply with exactly: STARTED. When the child reports, reply with exactly: WAKE_DONE",
+          ),
+        );
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.isTrue(yield* harness.runtime.hasPendingBackgroundWork!);
+        yield* harness.runtime.cancelBackgroundWork!({
+          threadId: ThreadId.make("another-thread"),
+          reason: "Thread deleted.",
+        });
+        assert.deepEqual(
+          fake.taskCancels(project),
+          [],
+          "another thread's deletion cancels nothing here",
+        );
+        yield* harness.runtime.cancelBackgroundWork!({
+          threadId: THREAD_ID,
+          reason: "Thread deleted.",
+        });
+        assert.deepEqual(fake.taskCancels(project), ["ab12"]);
+        // The cell announces the cancellation like any task change; the row settles with it.
+        const cancelled = yield* harness.takeEvent(
+          "subagent.updated",
+          (event) => event.subagent.status === "cancelled",
+        );
+        assert.equal(cancelled.subagent.nativeTaskRef?.nativeId, "ab12");
+        assert.isFalse(yield* harness.runtime.hasPendingBackgroundWork!);
+        yield* harness.runtime.cancelBackgroundWork!({
+          threadId: THREAD_ID,
+          reason: "Thread deleted.",
+        });
+        assert.deepEqual(
+          fake.taskCancels(project),
+          ["ab12"],
+          "a task already ended is not cancelled again",
+        );
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
   );
 });
 
@@ -3164,5 +3309,189 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
         assert.lengthOf(cell.promptRequestIds, 1, "only the typed message reaches the cell");
         assert.isFalse(yield* harness.runtime.hasPendingBackgroundWork!);
       }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+  it.live(
+    "a connection that ends after its state and before its roster leaves the next connection to attach the thread",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        // The first connection sends its state and nothing more before it ends.
+        cell.opensWith([prelude()[0]!]);
+        const attaching = yield* makeHarness(cell.transport, "https://cell.test").pipe(
+          Effect.forkScoped,
+        );
+        yield* awaitRequests(() => cell.connects(), 1);
+        cell.opensWith(prelude({ seq: 3 }));
+        yield* cell.close;
+        const harness = yield* Fiber.join(attaching);
+        assert.equal(cell.connects(), 2, "the second connection's snapshot attached the thread");
+        // The cursor starts at that snapshot: a run numbered after it is followed as on any first connection.
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":4}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+        yield* cell.send([
+          { type: "user", text: "Mine", runId: "A", seq: 4, origin: "user" },
+          { type: "assistant", text: "MINE", runId: "A", seq: 5 },
+          { type: "done", runId: "A", seq: 6 },
+        ]);
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents), ["MINE"]);
+        assert.deepEqual(
+          cell.replayRequests,
+          [],
+          "nothing before the first usable snapshot is read back",
+        );
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a thread resumed with a run to take back reads the log from its head on whichever connection first completes a snapshot",
+    () =>
+      Effect.gen(function* () {
+        const earlier = yield* driven();
+        earlier.opensWith(prelude());
+        const before = yield* makeHarness(earlier.transport, "https://cell.test");
+        const cell = yield* driven();
+        cell.states({ running: true, runId: "A", seq: 4 });
+        cell.replays([
+          { type: "assistant", text: "MISSED", runId: "A", seq: 3 },
+          { type: "assistant", text: "LATER", runId: "A", seq: 4 },
+        ]);
+        cell.opensWith([{ type: "state", running: true, runId: "A", seq: 4 }]);
+        const attaching = yield* makeHarness(cell.transport, "https://cell.test", {
+          providerSessionId: ProviderSessionId.make("session-cell-2"),
+          resume: threadOwningRun(before.providerThread),
+        }).pipe(Effect.forkScoped);
+        yield* awaitRequests(() => cell.connects(), 1);
+        cell.opensWith(prelude({ running: true, runId: "A", seq: 4 }));
+        yield* cell.close;
+        const harness = yield* Fiber.join(attaching);
+        assert.equal(cell.connects(), 2);
+        assert.deepEqual(
+          cell.replayRequests,
+          ["/events?after=2&limit=1000"],
+          "the persisted cursor applies to the connection that completed the snapshot",
+        );
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Continue where you left off.", 2, {
+            createdBy: "agent",
+            creationSource: "server",
+            restartContinuationOfRunId: RunId.make("run-1"),
+          }),
+        );
+        yield* cell.send([{ type: "done", runId: "A", seq: 5 }]);
+        const terminal = yield* harness.takeEvent(
+          "turn.terminal",
+          (event) => event.runOrdinal === 2,
+        );
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents, 2), ["MISSED", "LATER"]);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live("a task the cell reports as starting shows as running until it runs, then settles", () =>
+    Effect.gen(function* () {
+      const cell = yield* driven();
+      cell.opensWith(prelude());
+      const harness = yield* makeHarness(cell.transport, "https://cell.test");
+      yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Delegate"));
+      const task = (status: string, seq: number) => ({
+        type: "task",
+        task: { taskId: "child", title: "Child", status },
+        seq,
+      });
+      // As the cell numbers them: the task starts before the tool answers, runs once the child accepted its prompt.
+      yield* cell.send([
+        { type: "user", text: "Delegate", runId: "A", seq: 1, origin: "user" },
+        task("starting", 2),
+        task("running", 3),
+        { type: "assistant", text: "STARTED", runId: "A", seq: 4 },
+        { type: "done", runId: "A", seq: 5 },
+      ]);
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+      assert.isTrue(yield* harness.runtime.hasPendingBackgroundWork!);
+      yield* cell.send([task("completed", 6)]);
+      yield* harness.takeEvent(
+        "subagent.updated",
+        (event) => event.subagent.status === "completed",
+      );
+      assert.deepEqual(subagentStatuses(harness.allEvents), [
+        "child:running",
+        "child:running",
+        "child:completed",
+      ]);
+      const rosters = harness.allEvents.flatMap((event) =>
+        event.type === "provider_thread.updated" && event.providerThread.pendingBackgroundTasks
+          ? [event.providerThread.pendingBackgroundTasks.map((entry) => entry.taskId).join(",")]
+          : [],
+      );
+      assert.include(rosters, "child", "a starting task is pending background work");
+      assert.equal(rosters.at(-1), "", "a completed task leaves the roster");
+      assert.isFalse(yield* harness.runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a 202 naming a run that had ended before T3 attached fails the turn at once on a steady connection",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude({ seq: 6 }));
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        // The cell answers a request id it has seen before with the run it started for it then: one that began at 4 and had ended by 6.
+        yield* cell.answerPrompt(202, '{"runId":"OLD","seq":4}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Again"));
+        const terminal = yield* harness.takeEvent("turn.terminal").pipe(
+          Effect.timeoutOrElse({
+            duration: "5 seconds",
+            orElse: () => Effect.die("the turn waited for an end that came before T3 attached"),
+          }),
+        );
+        assert.equal(terminal.status, "failed");
+        assert.equal(failureOf(terminal)?.class, "transport_error");
+        assert.include(failureOf(terminal)?.message ?? "", "run OLD, which began at number 4");
+        assert.include(
+          failureOf(terminal)?.message ?? "",
+          "had already ended when T3 attached at number 6",
+        );
+        assert.include(failureOf(terminal)?.message ?? "", "not new to the cell");
+        assert.deepEqual(
+          cell.replayRequests,
+          [],
+          "nothing is read back for a run that was never T3's to show",
+        );
+        assert.deepEqual(cell.cancels, []);
+        // The thread is reusable: a run numbered after the snapshot is followed as usual.
+        yield* cell.answerPrompt(202, '{"runId":"NEW","seq":7}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Again", 2));
+        yield* cell.send([
+          { type: "user", text: "Again", runId: "NEW", seq: 7, origin: "user" },
+          { type: "assistant", text: "NEW", runId: "NEW", seq: 8 },
+          { type: "done", runId: "NEW", seq: 9 },
+        ]);
+        const second = yield* harness.takeEvent("turn.terminal", (event) => event.runOrdinal === 2);
+        assert.equal(second.status, "completed", failureOf(second)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents, 2), ["NEW"]);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live("a 202 naming the run the cell was running at the snapshot keeps the turn", () =>
+    Effect.gen(function* () {
+      const cell = yield* driven();
+      cell.opensWith(prelude({ running: true, runId: "A", seq: 2 }));
+      const harness = yield* makeHarness(cell.transport, "https://cell.test");
+      // A repeated request id of the run in progress: the rest of the run is this turn's.
+      yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+      yield* cell.send([
+        { type: "assistant", text: "REST", runId: "A", seq: 3 },
+        { type: "done", runId: "A", seq: 4 },
+      ]);
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+      assert.deepEqual(assistantTexts(harness.allEvents), ["REST"]);
+    }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
   );
 });

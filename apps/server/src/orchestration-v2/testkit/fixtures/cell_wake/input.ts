@@ -6,8 +6,12 @@ export const CELL_WAKE_PROMPT =
   "Delegate a review to a child cell. Reply with exactly: STARTED. When the child reports, reply with exactly: WAKE_DONE";
 export const CELL_WAKE_FOLLOW_UP_PROMPT = "Respond with exactly: USER_REPLY";
 
-/** The child's completion is the second `task` event: the first announced it as running. */
-const CELL_WAKE_RESULT_LABEL = cellReplayEventLabel("task", 2);
+/**
+ * The child's completion is the third `task` event: the cell announces the
+ * task as `starting` before the child is told and as `running` once the child
+ * accepted its prompt, both inside the delegating run.
+ */
+const CELL_WAKE_RESULT_LABEL = cellReplayEventLabel("task", 3);
 
 /**
  * The child finishes after the delegating turn settled, so the cell wakes on

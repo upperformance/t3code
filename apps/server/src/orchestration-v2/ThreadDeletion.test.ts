@@ -15,6 +15,7 @@ import {
   RunId,
   RuntimeRequestId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -289,6 +290,7 @@ it.effect("queues provider and resource cleanup and preserves an earlier deletio
           providerSessionId: ProviderSessionId.make("session:delete-plan:running"),
           detail: "Thread deleted.",
           revokeMcpCredential: true,
+          cancelBackgroundWork: true,
         },
         { type: "terminal.cleanup" },
         { type: "preview.cleanup" },
@@ -296,4 +298,160 @@ it.effect("queues provider and resource cleanup and preserves an earlier deletio
       ],
     );
   }).pipe(Effect.provide(IdAllocator.layer)),
+);
+
+it.effect(
+  "settles the open rows of a provider-native subagent that outlived its run and asks its provider to stop the task",
+  () =>
+    Effect.gen(function* () {
+      const base = makeProjection();
+      // The run that delegated the task completed long ago; the task runs on in the provider.
+      const completedRun = base.runs.find((run) => run.status === "completed")!;
+      const taskId = NodeId.make("task:delete-plan:native");
+      const itemId = TurnItemId.make("item:delete-plan:native");
+      const sessionId = ProviderSessionId.make("session:delete-plan:native");
+      const taskRef = { driver, nativeId: "ab12", strength: "strong" as const };
+      const projection: OrchestrationV2ThreadProjection = {
+        ...base,
+        providerSessions: [
+          {
+            id: sessionId,
+            driver,
+            providerInstanceId,
+            status: "ready",
+            cwd: "/workspace/feature",
+            model: null,
+            capabilities: CodexProviderCapabilitiesV2,
+            createdAt,
+            updatedAt: createdAt,
+            lastError: null,
+          },
+        ],
+        providerThreads: [
+          {
+            id: providerThreadId,
+            driver,
+            providerInstanceId,
+            providerSessionId: sessionId,
+            appThreadId: threadId,
+            ownerNodeId: null,
+            nativeThreadRef: { driver, nativeId: "t3-cell", strength: "strong" },
+            nativeConversationHeadRef: null,
+            status: "idle",
+            firstRunOrdinal: 1,
+            lastRunOrdinal: 6,
+            handoffIds: [],
+            forkedFrom: null,
+            createdAt,
+            updatedAt: createdAt,
+            pendingBackgroundTasks: [{ taskId: "ab12", kind: "subagent", description: "review" }],
+          },
+        ],
+        nodes: [
+          ...base.nodes,
+          {
+            id: taskId,
+            threadId,
+            runId: completedRun.id,
+            parentNodeId: completedRun.rootNodeId!,
+            rootNodeId: completedRun.rootNodeId!,
+            kind: "subagent",
+            status: "running",
+            countsForRun: false,
+            providerThreadId,
+            providerTurnId: null,
+            nativeItemRef: taskRef,
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt: createdAt,
+            completedAt: null,
+          },
+        ],
+        subagents: [
+          {
+            id: taskId,
+            threadId,
+            runId: completedRun.id,
+            parentNodeId: completedRun.rootNodeId!,
+            origin: "provider_native",
+            createdBy: "agent",
+            driver,
+            providerInstanceId,
+            providerThreadId,
+            childThreadId: null,
+            nativeTaskRef: taskRef,
+            prompt: "review",
+            title: "review",
+            model: null,
+            status: "running",
+            result: null,
+            startedAt: createdAt,
+            completedAt: null,
+            updatedAt: createdAt,
+          },
+        ],
+        turnItems: [
+          {
+            id: itemId,
+            threadId,
+            runId: completedRun.id,
+            nodeId: taskId,
+            providerThreadId,
+            providerTurnId: null,
+            nativeItemRef: taskRef,
+            parentItemId: null,
+            ordinal: 601,
+            status: "running",
+            title: "review",
+            startedAt: createdAt,
+            completedAt: null,
+            updatedAt: createdAt,
+            type: "subagent",
+            subagentId: taskId,
+            origin: "provider_native",
+            driver,
+            providerInstanceId,
+            childThreadId: null,
+            prompt: "review",
+            result: null,
+          },
+        ],
+      };
+      const plan = yield* planThreadDeletion({
+        command,
+        projection,
+        attachmentIds: [],
+        now: deletedAt,
+        idAllocator: yield* IdAllocator.IdAllocatorV2,
+      });
+      const deleted = plan.events.reduce(applyToProjection, projection);
+      assert.deepEqual(
+        deleted.subagents.map((task) => [task.status, task.completedAt]),
+        [["cancelled", deletedAt]],
+      );
+      assert.equal(deleted.nodes.find((node) => node.id === taskId)?.status, "cancelled");
+      assert.equal(deleted.turnItems.find((item) => item.id === itemId)?.status, "cancelled");
+      assert.deepEqual(deleted.providerThreads[0]?.pendingBackgroundTasks, []);
+      assert.equal(
+        deleted.runs.find((run) => run.id === completedRun.id)?.status,
+        "completed",
+        "the run that delegated is left as it was",
+      );
+      // Each row is settled once, and the provider is asked to stop the task before it is detached.
+      assert.lengthOf(
+        plan.events.filter((event) => event.type === "subagent.updated"),
+        1,
+      );
+      assert.lengthOf(
+        plan.events.filter((event) => event.type === "node.updated" && event.payload.id === taskId),
+        1,
+      );
+      assert.deepEqual(plan.effects[0]?.request, {
+        type: "provider-session.detach",
+        providerSessionId: sessionId,
+        detail: "Thread deleted.",
+        revokeMcpCredential: true,
+        cancelBackgroundWork: true,
+      });
+    }).pipe(Effect.provide(IdAllocator.layer)),
 );

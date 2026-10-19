@@ -10697,6 +10697,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             "runtimeRequests",
             "subagents",
             "providerSessions",
+            "providerThreads",
+            "turnItems",
           ])
           .pipe(
             Effect.mapError(

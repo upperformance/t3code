@@ -196,14 +196,23 @@ export const make = Effect.gen(function* () {
     if (persisted !== undefined) return persisted;
     if (Option.isNone(registry)) return false;
     const providerInstanceId = providerThread.providerInstanceId;
-    return yield* registry.value.get(providerInstanceId).pipe(
-      Effect.flatMap((adapter) => adapter.getCapabilities()),
+    // The adapter boundary: a lookup that fails, or one that throws (a
+    // defect, not a typed failure), is answered the same way, so one
+    // provider's broken capabilities cannot abort the thread's recovery
+    // with nothing committed. Only an interruption passes through.
+    return yield* Effect.suspend(() =>
+      registry.value
+        .get(providerInstanceId)
+        .pipe(Effect.flatMap((adapter) => adapter.getCapabilities())),
+    ).pipe(
       Effect.map((capabilities) => capabilities.sessions.backgroundWorkSurvivesRestart === true),
-      Effect.catch((cause) =>
-        Effect.logWarning(
-          "Could not read a provider's capabilities during recovery; treating its background work as ended by the restart",
-          { providerInstanceId, cause },
-        ).pipe(Effect.as(false)),
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning(
+              "Could not read a provider's capabilities during recovery; treating its background work as ended by the restart",
+              { providerInstanceId, cause: Cause.pretty(cause) },
+            ).pipe(Effect.as(false)),
       ),
     );
   });
@@ -712,7 +721,10 @@ export const make = Effect.gen(function* () {
       // A note an earlier build wrote on a run of a provider whose work
       // survives (its session record lacked the capability) would be prompted
       // as text and strip the continuation's restartContinuationOfRunId. The
-      // work was never cancelled, so the note is withdrawn.
+      // work was never cancelled, so the note is withdrawn. Only a thread
+      // recovery visits gets here, one with a run or session left to
+      // recover; a note on a thread that build already settled stands in
+      // the stored run, and the turn start ignores it.
       for (const run of projection.runs) {
         if (
           !survivesOn(run.providerThreadId) ||

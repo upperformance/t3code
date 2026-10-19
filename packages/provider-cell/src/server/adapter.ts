@@ -243,6 +243,17 @@ const seqRegressedMessage = (from: number, to: number) =>
 /** The cell's log no longer reaches back to the gap, so what the turn produced in it cannot be read. */
 const gapLostMessage = (after: number, upTo: number) =>
   `The connection to the cell dropped while the turn ran, and the cell no longer retains the events numbered ${after + 1} to ${upTo} that T3 missed, so part of this turn's output cannot be read back. The cell's own transcript has all of it; send another message to continue there.`;
+/**
+ * The 202 named a run that began at or before the snapshot T3 follows the
+ * log from and that the cell was not running at it: the run had ended before
+ * T3 could see it. The cell answers a repeated request id with the run it
+ * started for it, so the id T3 sent was one the cell had seen before.
+ */
+const staleAcceptanceMessage = (runId: string, firstSeq: number, attachedAt: number) =>
+  `The cell answered the prompt with run ${runId}, which began at number ${firstSeq} and had already ended when T3 attached at number ${attachedAt}: the request id T3 sent was not new to the cell, so this message did not start a run. Send it again.`;
+/** The thread could not attach: the connections meant to deliver its first snapshot kept failing. */
+const attachGivenUpMessage = (detail: string) =>
+  `Could not connect to the cell: ${MAX_CONSECUTIVE_BROKEN_CONNECTIONS} connections in a row ended before the cell's snapshot could be used, the last because ${detail}`;
 
 interface TurnScope {
   readonly threadId: ThreadId;
@@ -521,10 +532,25 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       let connection: Connection | undefined;
       /** Connections dropped in a row before their snapshot could be used; a usable one resets it. */
       let consecutiveBreaks = 0;
-      /** The highest sequence number applied; the first connection's `state` sets it, unless a restored run says where the last session left off. */
+      /** The highest sequence number applied; the first snapshot sets it, unless a restored run says where the last session left off. */
       let lastSeq = 0;
-      /** Where the last session left off, when it owned a run: the first connection reads the log back from here. */
+      /** Where the last session left off, when it owned a run: the first snapshot reads the log back from here. */
       let resumeCursor: number | undefined;
+      /**
+       * Whether a connection's snapshot has been used since the thread was
+       * attached. The first snapshot to complete, on whichever connection,
+       * is where the cursor starts or where the restored run is read back
+       * from; a connection that ends before its snapshot could be used
+       * leaves the next one to do so.
+       */
+      let attached = false;
+      /**
+       * The snapshot of the last connection whose snapshot was used: where
+       * T3's view of the log begins or, after a reconnect, resumes. A run the
+       * cell names for T3's prompt that began at or before it, and that the
+       * cell was not running at it, had ended before T3 could see it.
+       */
+      let latestSnapshot: CellSnapshot | undefined;
       /**
        * Message ids of dispatched continuations whose wake a `reset` dropped,
        * so the turn that comes for each can say why it carries nothing. An
@@ -1378,13 +1404,27 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         for (const event of candidates) yield* handleRunEvent(event);
         const snapshot = turn.snapshot;
         turn.snapshot = undefined;
+        if (!isActive(turn)) return;
+        if (snapshot !== undefined && run.firstSeq <= snapshot.seq && !runsRun(snapshot, run.id)) {
+          return yield* finish(turn, "failed", UNOBSERVED_END_MESSAGE, "transport_error");
+        }
+        // On a steady connection the same rule holds against the snapshot T3
+        // follows the log from: a run that began at or before it, which the
+        // cell was not running at it, ended before T3 attached, so nothing of
+        // it will come on the socket and its `done` is not in anything T3
+        // applied. The cell answers a repeated request id with that run; the
+        // turn fails at once rather than waiting for an end that never comes.
         if (
-          snapshot !== undefined &&
-          isActive(turn) &&
-          run.firstSeq <= snapshot.seq &&
-          !runsRun(snapshot, run.id)
+          latestSnapshot !== undefined &&
+          run.firstSeq <= latestSnapshot.seq &&
+          !runsRun(latestSnapshot, run.id)
         ) {
-          yield* finish(turn, "failed", UNOBSERVED_END_MESSAGE, "transport_error");
+          yield* finish(
+            turn,
+            "failed",
+            staleAcceptanceMessage(run.id, run.firstSeq, latestSnapshot.seq),
+            "transport_error",
+          );
         }
       });
       /**
@@ -1614,12 +1654,17 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         snapshot: CellSnapshot,
         roster: Extract<CellEvent, { readonly type: "tasks" }>,
       ) {
-        const first = link.ordinal === 1;
+        // The first snapshot to complete since the thread was attached, on
+        // whichever connection: an earlier connection that ended before its
+        // roster came left the thread still attaching.
+        const first = !attached;
         if (first) {
+          attached = true;
           consecutiveBreaks = 0;
           if (resumeCursor === undefined) {
             // Nothing before T3 attached is T3's: the first snapshot is where the cursor starts.
             lastSeq = snapshot.seq;
+            latestSnapshot = snapshot;
             yield* reconcileTasks(roster.tasks);
             if (ready) yield* Deferred.succeed(ready, undefined);
             return;
@@ -1652,6 +1697,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           }
           for (const wake of wakes) wake.lost = true;
           lastSeq = snapshot.seq;
+          latestSnapshot = snapshot;
           consecutiveBreaks = 0;
           yield* reconcileTasks(roster.tasks);
           if (first && ready) yield* Deferred.succeed(ready, undefined);
@@ -1676,12 +1722,14 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           );
           for (const wake of wakes) wake.lost = true;
           lastSeq = snapshot.seq;
+          latestSnapshot = snapshot;
           yield* reconcileTasks(roster.tasks);
           if (ready) yield* Deferred.succeed(ready, undefined);
           return;
         }
         consecutiveBreaks = 0;
         if (lastSeq < snapshot.seq) lastSeq = snapshot.seq;
+        latestSnapshot = snapshot;
         yield* reconcileTasks(roster.tasks);
         const turn = active;
         if (turn !== undefined) {
@@ -1799,20 +1847,30 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
                 }
                 return;
               }
-              case "disconnected":
-                if (connection?.phase.kind === "roster") {
-                  yield* Fiber.interrupt(connection.phase.timer);
+              case "disconnected": {
+                const dropped = connection;
+                if (dropped?.phase.kind === "roster") {
+                  yield* Fiber.interrupt(dropped.phase.timer);
                 }
                 connection = undefined;
-                // Failing `ready` here, after the connection's frames, means a
-                // snapshot that did complete before the close still opens the thread.
-                if (ready) {
-                  yield* Deferred.fail(
-                    ready,
-                    protocolError(`Could not connect to the cell: ${entry.detail}`),
-                  );
+                // Decided here, after the connection's frames, so a snapshot
+                // that did complete before the close has attached the thread.
+                // One that ended before its snapshot could be used leaves the
+                // thread attaching: the next connection's snapshot attaches
+                // it. A connection the consumer dropped was counted when it
+                // was dropped; one that ended on its own, or that could not
+                // be opened, counts here, and after three in a row the attach
+                // fails naming the last reason, as a turn does.
+                if (ready && !attached) {
+                  if (dropped === undefined || dropped.phase.kind !== "broken") {
+                    consecutiveBreaks += 1;
+                  }
+                  if (consecutiveBreaks >= MAX_CONSECUTIVE_BROKEN_CONNECTIONS) {
+                    yield* Deferred.fail(ready, protocolError(attachGivenUpMessage(entry.detail)));
+                  }
                 }
                 return yield* Effect.logDebug(`Cell socket closed: ${entry.detail}`);
+              }
               case "frame": {
                 // A frame that is not an event of the protocol (not JSON, a
                 // known type with a bad number or a missing field) is a
@@ -2005,10 +2063,18 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           }),
           Effect.onError(() =>
             Effect.gen(function* () {
+              // Nothing of a failed attach carries over: the next attach, on
+              // this session or another, starts from its own first snapshot.
               ready = undefined;
               thread = undefined;
               project = undefined;
               resumeCursor = undefined;
+              attached = false;
+              latestSnapshot = undefined;
+              lastSeq = 0;
+              consecutiveBreaks = 0;
+              connection = undefined;
+              restorable.clear();
               wakes.splice(0);
               const fiber = socketFiber;
               socketFiber = undefined;
@@ -2297,6 +2363,34 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             wakes.length > 0 ||
             [...tasks.values()].some((record) => taskStatus(record.task.status) === "running"),
         ),
+        // The thread is being deleted: the delegated tasks the cell still
+        // runs for it are asked to stop, best effort, so they do not run on
+        // for a thread that no longer exists. The deletion settled their rows
+        // itself; a cancel the cell refuses or does not answer changes
+        // nothing here, and a task the cell no longer lists needs none.
+        cancelBackgroundWork: (args) =>
+          Effect.gen(function* () {
+            if (closed || project === undefined || thread?.appThreadId !== args.threadId) return;
+            const running = [...tasks.values()].filter(
+              (record) => taskStatus(record.task.status) === "running",
+            );
+            for (const record of running) {
+              const taskId = record.task.taskId;
+              const response = yield* request(
+                "POST",
+                `/tasks/${encodeURIComponent(taskId)}/cancel`,
+              ).pipe(Effect.result);
+              if (Result.isFailure(response)) {
+                yield* Effect.logWarning(
+                  `Could not ask the cell to cancel task ${taskId} (${args.reason}): ${response.failure.message}`,
+                );
+              } else if (response.success.status >= 300) {
+                yield* Effect.logWarning(
+                  `The cell answered ${response.success.status} to cancelling task ${taskId} (${args.reason})`,
+                );
+              }
+            }
+          }).pipe(commands.withPermits(1)),
         ensureThread: (args) =>
           register(args).pipe(
             commands.withPermits(1),

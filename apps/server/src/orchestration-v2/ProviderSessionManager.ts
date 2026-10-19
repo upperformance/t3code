@@ -179,6 +179,13 @@ export interface ProviderSessionManagerV2Shape {
     readonly threadId: ThreadId;
     readonly detail?: string;
     readonly revokeMcpCredential?: boolean;
+    /**
+     * The thread is being deleted: the runtime is asked to stop the
+     * background work it still runs for the thread, best effort, before
+     * the detach. Only a runtime with work that outlives the session
+     * offers the hook.
+     */
+    readonly cancelBackgroundWork?: boolean;
   }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
 }
 
@@ -2310,6 +2317,33 @@ export const layerWithOptions = (
           Effect.gen(function* () {
             const key = sessionKey(input.providerSessionId);
             const currentEntry = (yield* Ref.get(sessions)).get(key);
+            const cancelBackgroundWork = currentEntry?.exposedRuntime.cancelBackgroundWork;
+            if (
+              currentEntry !== undefined &&
+              input.cancelBackgroundWork === true &&
+              cancelBackgroundWork !== undefined &&
+              currentEntry.attachedThreadIds.has(input.threadId)
+            ) {
+              // Best effort, before the session is released: the deletion
+              // settled the work's rows already, so a refusal or a timeout
+              // here changes nothing in the thread.
+              yield* cancelBackgroundWork({
+                threadId: input.threadId,
+                reason: input.detail ?? "Thread detached.",
+              }).pipe(
+                Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
+                Effect.catchCause((cause) =>
+                  Effect.logWarning(
+                    "orchestration-v2.driver-session.detach-cancel-background-work-failed",
+                    {
+                      providerSessionId: input.providerSessionId,
+                      threadId: input.threadId,
+                      cause,
+                    },
+                  ),
+                ),
+              );
+            }
             let detachedProviderThreads: ReadonlyArray<OrchestrationV2ProviderThread> = [];
             if (currentEntry?.supportsMultipleProviderThreads === true) {
               const projection = yield* Effect.option(

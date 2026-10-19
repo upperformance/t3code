@@ -237,7 +237,9 @@ describe("cell restart with background work", () => {
                       (item) => item.type === "assistant_message" && item.text === "STARTED",
                     ) &&
                     current.subagents.some((subagent) => subagent.status === "running") &&
-                    strongHeadOrdinal(current) >= 5,
+                    // The head follows the run's own events: user 1, tool 2 (the task is
+                    // announced starting at 3 and running at 4), tool output 5, the answer 6.
+                    strongHeadOrdinal(current) >= 6,
                   "the first answer, the delegated child and the persisted head naming the run",
                 );
               }),

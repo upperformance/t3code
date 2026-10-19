@@ -13,6 +13,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  TurnItemId,
   ProjectId,
   type OrchestrationV2ThreadProjection,
   OrchestrationV2DomainEvent,
@@ -284,6 +285,11 @@ function makeLocalCommandHarness(input: {
   readonly openFailure?: unknown;
   readonly ensureThreadFailure?: unknown;
   readonly historyReadFailureAfterFallback?: unknown;
+  /** The native resume fails and the fallback attaches afresh, with this provider-native subagent row still open on the thread. */
+  readonly resumeFallbackWithOpenItem?: Extract<
+    OrchestrationV2ThreadProjection["turnItems"][number],
+    { readonly type: "subagent" }
+  >;
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -460,7 +466,7 @@ function makeLocalCommandHarness(input: {
     checkpoints: [],
     updatedAt: now,
   };
-  if ("historyReadFailureAfterFallback" in input) {
+  if ("historyReadFailureAfterFallback" in input || "resumeFallbackWithOpenItem" in input) {
     const nativeThreadRef = {
       driver: providerThread.driver,
       nativeId: "native-resume-thread",
@@ -471,8 +477,14 @@ function makeLocalCommandHarness(input: {
       providerThreads: projection.providerThreads.map((candidate) =>
         candidate.id === providerThreadId ? { ...candidate, nativeThreadRef } : candidate,
       ),
+      ...(input.resumeFallbackWithOpenItem === undefined
+        ? {}
+        : { turnItems: [input.resumeFallbackWithOpenItem] }),
     };
   }
+  const ensureThreadAfterResume = vi.fn(
+    (_input: ProviderAdapter.ProviderAdapterV2EnsureThreadInput) => Effect.succeed(providerThread),
+  );
   const events: Array<OrchestrationV2DomainEvent> = [];
   const interruptRun = () => {
     projection = {
@@ -514,47 +526,64 @@ function makeLocalCommandHarness(input: {
   const open = vi.fn(() =>
     input.interruptOpen === true
       ? Effect.interrupt
-      : "historyReadFailureAfterFallback" in input
-        ? Effect.succeed(resumeFallbackSession as never)
-        : "ensureThreadFailure" in input
-          ? Effect.succeed({ driver: providerThread.driver, ensureThread } as never)
-          : "openFailure" in input
-            ? Effect.sync(() => {
-                if (input.interruptRunBeforeOpenFailure === true) interruptRun();
-              }).pipe(
-                Effect.andThen(
-                  Effect.fail(
-                    new ProviderSessionManager.ProviderSessionOpenError({
-                      instanceId: newInstanceId,
-                      providerSessionId,
-                      cause: input.openFailure,
-                    }),
+      : "resumeFallbackWithOpenItem" in input
+        ? Effect.succeed({
+            ...resumeFallbackSession,
+            providerSession: {
+              id: providerSessionId,
+              driver: providerThread.driver,
+              providerInstanceId: newInstanceId,
+              status: "ready",
+              cwd: "/tmp/native-account-command",
+              model: null,
+              capabilities: CodexProviderCapabilitiesV2,
+              createdAt: now,
+              updatedAt: now,
+              lastError: null,
+            },
+            ensureThread: ensureThreadAfterResume,
+          } as never)
+        : "historyReadFailureAfterFallback" in input
+          ? Effect.succeed(resumeFallbackSession as never)
+          : "ensureThreadFailure" in input
+            ? Effect.succeed({ driver: providerThread.driver, ensureThread } as never)
+            : "openFailure" in input
+              ? Effect.sync(() => {
+                  if (input.interruptRunBeforeOpenFailure === true) interruptRun();
+                }).pipe(
+                  Effect.andThen(
+                    Effect.fail(
+                      new ProviderSessionManager.ProviderSessionOpenError({
+                        instanceId: newInstanceId,
+                        providerSessionId,
+                        cause: input.openFailure,
+                      }),
+                    ),
                   ),
-                ),
-              )
-            : input.failReadsAfterRunning === true
-              ? Effect.succeed({
-                  driver: providerThread.driver,
-                  providerSession: {
-                    id: providerSessionId,
+                )
+              : input.failReadsAfterRunning === true
+                ? Effect.succeed({
                     driver: providerThread.driver,
-                    providerInstanceId: newInstanceId,
-                    status: "ready",
-                    cwd: "/tmp/native-account-command",
-                    model: null,
-                    capabilities: CodexProviderCapabilitiesV2,
-                    createdAt: now,
-                    updatedAt: now,
-                    lastError: null,
-                  },
-                  ensureThread: () => Effect.succeed(providerThread),
-                } as never)
-              : Effect.die("A local command must not open a native session."),
+                    providerSession: {
+                      id: providerSessionId,
+                      driver: providerThread.driver,
+                      providerInstanceId: newInstanceId,
+                      status: "ready",
+                      cwd: "/tmp/native-account-command",
+                      model: null,
+                      capabilities: CodexProviderCapabilitiesV2,
+                      createdAt: now,
+                      updatedAt: now,
+                      lastError: null,
+                    },
+                    ensureThread: () => Effect.succeed(providerThread),
+                  } as never)
+                : Effect.die("A local command must not open a native session."),
   );
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
   >(() =>
-    input.failReadsAfterRunning === true
+    input.failReadsAfterRunning === true || "resumeFallbackWithOpenItem" in input
       ? Effect.void
       : Effect.die("A local command must not start a native turn."),
   );
@@ -623,9 +652,24 @@ function makeLocalCommandHarness(input: {
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
-          prepareProviderHandoff: () => Effect.die("history read must fail first"),
+          prepareProviderHandoff: (handoff) =>
+            "resumeFallbackWithOpenItem" in input
+              ? Effect.succeed({
+                  id: "handoff-resume-fallback",
+                  threadId: handoff.threadId,
+                  targetRunId: handoff.targetRunId,
+                  transferId: handoff.transferId,
+                  fromProviderThreadIds: handoff.fromProviderThreadIds,
+                  toProviderThreadId: handoff.toProviderThreadId,
+                  coveredRunOrdinals: handoff.coveredRunOrdinals,
+                  status: "ready",
+                  strategy: handoff.strategy,
+                  summaryText: "Synthetic summary",
+                  handoffIds: [],
+                } as never)
+              : Effect.die("history read must fail first"),
         }),
-        Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
+        Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent, write: () => Effect.succeed([]) }),
         IdAllocator.layer,
         layerWorktreeLocation(input.worktreesDir),
         input.fileSystem === undefined
@@ -652,12 +696,14 @@ function makeLocalCommandHarness(input: {
               ),
             }),
           getTurnStartHistory: () =>
-            Effect.fail(
-              new ProjectionStore.ProjectionStoreReadError({
-                threadId,
-                cause: input.historyReadFailureAfterFallback,
-              }),
-            ),
+            "resumeFallbackWithOpenItem" in input
+              ? Effect.succeed([])
+              : Effect.fail(
+                  new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: input.historyReadFailureAfterFallback,
+                  }),
+                ),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ open }),
         Layer.mock(ProviderAuthService.ProviderAuthService)({ tryHandlePromptCommand }),
@@ -669,6 +715,7 @@ function makeLocalCommandHarness(input: {
     ),
   );
   return {
+    ensureThreadAfterResume,
     getThreadRecords,
     getTurnStartContext,
     setProjection: (next: OrchestrationV2ThreadProjection) => {
@@ -1035,6 +1082,62 @@ effectIt.effect(
       expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
       expect(harness.projection().runs.at(-1)?.status).toBe("starting");
       expect(harness.events).toEqual([]);
+    }),
+);
+
+effectIt.effect(
+  "hands the thread's open native subagent rows to the fresh attach the resume fallback makes",
+  () =>
+    Effect.gen(function* () {
+      const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
+      const openItem = {
+        id: TurnItemId.make("item-open-native-subagent"),
+        threadId: ThreadId.make("thread-native-account-command"),
+        runId: RunId.make("previous-native-run"),
+        nodeId: NodeId.make("node-open-native-subagent"),
+        providerThreadId: ProviderThreadId.make("new-provider-thread"),
+        providerTurnId: null,
+        nativeItemRef: {
+          driver: ProviderDriverKind.make("codex"),
+          nativeId: "ab12",
+          strength: "strong" as const,
+        },
+        parentItemId: null,
+        ordinal: 101,
+        status: "running" as const,
+        title: "review",
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+        type: "subagent" as const,
+        subagentId: NodeId.make("node-open-native-subagent"),
+        origin: "provider_native" as const,
+        driver: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex-personal"),
+        childThreadId: null,
+        prompt: "review",
+        result: null,
+      };
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        resumeFallbackWithOpenItem: openItem,
+      });
+
+      yield* harness.start;
+
+      // The resume failed, so the fallback attached afresh: the rows a surviving task keeps must reach that attach too.
+      expect(harness.ensureThreadAfterResume).toHaveBeenCalledOnce();
+      expect(harness.ensureThreadAfterResume).toHaveBeenCalledWith(
+        expect.objectContaining({
+          existingProviderThread: expect.objectContaining({
+            id: ProviderThreadId.make("new-provider-thread"),
+            nativeThreadRef: null,
+          }),
+          openNativeSubagentItems: [openItem],
+        }),
+      );
+      expect(harness.startRootRun).toHaveBeenCalledOnce();
+      expect(harness.projection().runs.at(-1)?.status).toBe("running");
     }),
 );
 

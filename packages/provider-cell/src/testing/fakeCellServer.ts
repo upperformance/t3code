@@ -63,6 +63,8 @@ export interface FakeCellServer {
   readonly prompts: (project: string) => ReadonlyArray<string>;
   /** The `x-run-id` of every cancel the project received, null where the header was absent. */
   readonly cancels: (project: string) => ReadonlyArray<string | null>;
+  /** The task ids every `POST tasks/<id>/cancel` named, in order. */
+  readonly taskCancels: (project: string) => ReadonlyArray<string>;
   /** Closes every socket as celld does when a cell moves; clients are expected to reconnect. */
   readonly dropSockets: () => void;
   /** While set, socket upgrades are refused, as when the origin is briefly unreachable. */
@@ -106,6 +108,8 @@ interface Project {
   readonly name: string;
   readonly prompts: Array<string>;
   readonly cancels: Array<string | null>;
+  /** The ids of the tasks `POST tasks/<id>/cancel` named, in order. */
+  readonly taskCancels: Array<string>;
   readonly sockets: Set<WebSocket>;
   readonly connectionWaiters: Array<() => void>;
   readonly idleWaiters: Array<() => void>;
@@ -125,6 +129,8 @@ interface Project {
 }
 
 const PROTOCOL_LEVEL = 3;
+/** A task still with its child: `starting` until the child accepted its prompt, `running` after. */
+const ACTIVE_TASK_STATUSES = new Set(["starting", "running"]);
 const EVENT_RETENTION = 20_000;
 const RUN_RETENTION = 200;
 const PAGE_LIMIT = 1_000;
@@ -198,6 +204,7 @@ export async function startFakeCellServer(
         name: `fake/${name}`,
         prompts: [],
         cancels: [],
+        taskCancels: [],
         sockets: new Set(),
         connectionWaiters: [],
         idleWaiters: [],
@@ -283,6 +290,9 @@ export async function startFakeCellServer(
     target: Project,
     step: Extract<FakeCellStep, { readonly type: "delegate" }>,
   ) => {
+    // A task cancelled meanwhile does not finish.
+    const current = target.tasks.get(step.taskId);
+    if (current !== undefined && !ACTIVE_TASK_STATUSES.has(String(current.status))) return;
     const task = {
       ...target.tasks.get(step.taskId),
       taskId: step.taskId,
@@ -417,27 +427,33 @@ export async function startFakeCellServer(
             failure = step;
             break;
           case "delegate": {
-            const task = {
+            // As the cell does: the task is recorded as `starting` before the
+            // child is told, `running` once the child accepted its prompt, and
+            // only then is the tool answered.
+            const starting = {
               taskId: step.taskId,
               title: step.title,
-              status: "running",
+              status: "starting",
               created: Date.now(),
               finished: null,
             };
-            target.tasks.set(step.taskId, task);
+            target.tasks.set(step.taskId, starting);
             broadcast(target, {
               type: "tool",
               name: "delegate_task",
               arguments: { title: step.title },
               ...scope,
             });
+            broadcast(target, { type: "task", task: starting });
+            const task = { ...starting, status: "running" };
+            target.tasks.set(step.taskId, task);
+            broadcast(target, { type: "task", task });
             broadcast(target, {
               type: "tool_output",
               name: "delegate_task",
               output: JSON.stringify({ taskId: step.taskId, status: "running" }),
               ...scope,
             });
-            broadcast(target, { type: "task", task });
             delegated.push(step);
             break;
           }
@@ -531,6 +547,21 @@ export async function startFakeCellServer(
     if (path === "/tasks" && request.method === "GET") {
       return json(200, [...target.tasks.values()]);
     }
+    // A cancel names the task: one still with its child is marked cancelled
+    // and announced like any task change; one that already ended is answered
+    // as it is, and one the cell does not have is 404.
+    const taskCancel = /^\/tasks\/([^/]+)\/cancel$/.exec(path);
+    if (taskCancel && request.method === "POST") {
+      const taskId = decodeURIComponent(taskCancel[1]!);
+      target.taskCancels.push(taskId);
+      const task = target.tasks.get(taskId);
+      if (task === undefined) return json(404, { error: `No task ${taskId}` });
+      if (!ACTIVE_TASK_STATUSES.has(String(task.status))) return json(200, task);
+      const cancelled = { ...task, status: "cancelled", finished: Date.now() };
+      target.tasks.set(taskId, cancelled);
+      broadcast(target, { type: "task", task: cancelled });
+      return json(200, cancelled);
+    }
     if (path === "/events" && request.method === "GET") {
       const after = Number(url.searchParams.get("after") ?? "0");
       const limit = Math.min(
@@ -605,6 +636,7 @@ export async function startFakeCellServer(
     baseUrl: `http://127.0.0.1:${address.port}`,
     prompts: (name) => projects.get(name)?.prompts ?? [],
     cancels: (name) => projects.get(name)?.cancels ?? [],
+    taskCancels: (name) => projects.get(name)?.taskCancels ?? [],
     dropSockets: () => {
       for (const target of projects.values()) {
         for (const ws of target.sockets) ws.close(1001, "The cell moved");
