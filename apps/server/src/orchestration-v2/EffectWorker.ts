@@ -130,6 +130,9 @@ export const layerExecutor: Layer.Layer<
                 ...(effect.request.revokeMcpCredential === undefined
                   ? {}
                   : { revokeMcpCredential: effect.request.revokeMcpCredential }),
+                ...(effect.request.cancelBackgroundWork === undefined
+                  ? {}
+                  : { cancelBackgroundWork: effect.request.cancelBackgroundWork }),
               })
               .pipe(
                 Effect.mapError(

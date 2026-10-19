@@ -1,0 +1,11 @@
+{"type":"transcript_start","provider":"cell","protocol":"cell.http-ws","version":"0.3.0","scenario":"simple","metadata":{"generatedBy":"live-cell-recorder","model":"gpt-6-astra"}}
+{"type":"expect_outbound","label":"GET /cell/<project>/state","frame":{"kind":"http","method":"GET","path":"/cell/<project>/state"}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":200,"body":"{\"protocol\":3,\"version\":\"0.3.0\",\"model\":\"gpt-6-astra\",\"running\":false,\"runId\":null,\"requestId\":null,\"seq\":0,\"configured\":true,\"turns\":0,\"sockets\":0,\"parent\":null,\"depth\":0,\"tasks\":0,\"name\":\"default/t3-36342bf41939c6d8c823\",\"misnamed\":null,\"generation\":0,\"disowned\":0}"}}
+{"type":"expect_outbound","label":"ws_connect","frame":{"kind":"ws_connect","path":"/cell/<project>/ws"}}
+{"type":"emit_inbound","label":"ws:state#1","frame":{"kind":"ws_event","event":{"type":"state","protocol":3,"version":"0.3.0","model":"gpt-6-astra","running":false,"runId":null,"requestId":null,"seq":0,"configured":true,"turns":0,"sockets":1,"parent":null,"depth":0,"tasks":0,"name":"default/t3-36342bf41939c6d8c823","misnamed":null,"generation":0,"disowned":0}}}
+{"type":"emit_inbound","label":"ws:tasks#1","frame":{"kind":"ws_event","event":{"type":"tasks","tasks":[],"seq":0}}}
+{"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Respond with the following text: fixture simple ok"}}
+{"type":"emit_inbound","label":"ws:user#1","frame":{"kind":"ws_event","event":{"type":"user","origin":"user","text":"Respond with the following text: fixture simple ok","runId":"3112e3a2-3ce5-4b2e-80c0-13766df77827","requestId":"<request-id:1>","seq":1}}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":"{\"runId\":\"3112e3a2-3ce5-4b2e-80c0-13766df77827\",\"seq\":1}"}}
+{"type":"emit_inbound","label":"ws:assistant#1","frame":{"kind":"ws_event","event":{"type":"assistant","text":"fixture simple ok","runId":"3112e3a2-3ce5-4b2e-80c0-13766df77827","seq":2}}}
+{"type":"emit_inbound","label":"ws:done#1","frame":{"kind":"ws_event","event":{"type":"done","runId":"3112e3a2-3ce5-4b2e-80c0-13766df77827","seq":3}}}

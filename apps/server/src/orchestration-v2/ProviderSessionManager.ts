@@ -120,6 +120,31 @@ export class ProviderSessionReleaseError extends Schema.TaggedError<ProviderSess
   }
 }
 
+/**
+ * The cause a released session's event subscribers fail with. A release T3
+ * chose (a detach, a close, an idle timeout) is told apart from one forced by
+ * a runtime error, and from any failure of the stream itself.
+ */
+export class ProviderSessionReleasedError extends Schema.TaggedError<ProviderSessionReleasedError>()(
+  "ProviderSessionReleasedError",
+  {
+    providerSessionId: ProviderSessionId,
+    reason: ProviderSessionReleaseReason,
+    detail: Schema.String,
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
+const isProviderSessionReleasedError = Schema.is(ProviderSessionReleasedError);
+
+/** Whether a stream failure's cause is a release T3 chose, not one a runtime error forced. */
+export const isDeliberateProviderSessionRelease = (cause: unknown): boolean =>
+  isProviderSessionReleasedError(cause) &&
+  (cause.reason === "manual_shutdown" || cause.reason === "idle_timeout");
+
 export class ProviderSessionActivityError extends Schema.TaggedError<ProviderSessionActivityError>()(
   "ProviderSessionActivityError",
   {
@@ -179,6 +204,13 @@ export interface ProviderSessionManagerV2Shape {
     readonly threadId: ThreadId;
     readonly detail?: string;
     readonly revokeMcpCredential?: boolean;
+    /**
+     * The thread is being deleted: the runtime is asked to stop the
+     * background work it still runs for the thread, best effort, before
+     * the detach. Only a runtime with work that outlives the session
+     * offers the hook.
+     */
+    readonly cancelBackgroundWork?: boolean;
   }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
 }
 
@@ -525,12 +557,20 @@ export const layerWithOptions = (
           ),
         );
 
-      const failSubscribers = (entry: LiveSessionEntry, detail: string) =>
+      const failSubscribers = (
+        entry: LiveSessionEntry,
+        reason: ProviderSessionReleaseReason,
+        detail: string,
+      ) =>
         Effect.gen(function* () {
           const error = new ProviderAdapter.ProviderAdapterEventStreamError({
             driver: entry.runtime.driver,
             providerSessionId: entry.runtime.providerSessionId,
-            cause: detail,
+            cause: new ProviderSessionReleasedError({
+              providerSessionId: entry.runtime.providerSessionId,
+              reason,
+              detail,
+            }),
           });
           const subscribers = yield* Ref.getAndSet(entry.eventSubscribers, new Map());
           yield* Effect.forEach(
@@ -1014,6 +1054,7 @@ export const layerWithOptions = (
                   } else {
                     yield* failSubscribers(
                       entry,
+                      input.reason,
                       input.detail ?? `Provider session released: ${input.reason}.`,
                     );
                   }
@@ -2310,6 +2351,37 @@ export const layerWithOptions = (
           Effect.gen(function* () {
             const key = sessionKey(input.providerSessionId);
             const currentEntry = (yield* Ref.get(sessions)).get(key);
+            const cancelBackgroundWork = currentEntry?.exposedRuntime.cancelBackgroundWork;
+            if (
+              currentEntry !== undefined &&
+              input.cancelBackgroundWork === true &&
+              cancelBackgroundWork !== undefined &&
+              currentEntry.attachedThreadIds.has(input.threadId)
+            ) {
+              // Best effort, before the session is released: the deletion
+              // settled the work's rows already, so a refusal or a timeout
+              // here changes nothing in the thread. Suspended, so a hook that
+              // throws before returning its effect is a defect handled like
+              // any other failure of it, not one that aborts the detach.
+              yield* Effect.suspend(() =>
+                cancelBackgroundWork({
+                  threadId: input.threadId,
+                  reason: input.detail ?? "Thread detached.",
+                }),
+              ).pipe(
+                Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
+                Effect.catchCause((cause) =>
+                  Effect.logWarning(
+                    "orchestration-v2.driver-session.detach-cancel-background-work-failed",
+                    {
+                      providerSessionId: input.providerSessionId,
+                      threadId: input.threadId,
+                      cause,
+                    },
+                  ),
+                ),
+              );
+            }
             let detachedProviderThreads: ReadonlyArray<OrchestrationV2ProviderThread> = [];
             if (currentEntry?.supportsMultipleProviderThreads === true) {
               const projection = yield* Effect.option(

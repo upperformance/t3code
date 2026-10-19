@@ -43,6 +43,7 @@ import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
+import { isDeliberateProviderSessionRelease } from "./ProviderSessionManager.ts";
 import type { ProjectionStoreV2Error } from "./ProjectionStore.ts";
 import {
   makeProviderFailure,
@@ -510,6 +511,29 @@ export class RunExecutionIngestError extends Schema.TaggedError<RunExecutionInge
     return `Failed while ingesting orchestration V2 run execution ${this.runId}.`;
   }
 }
+
+/**
+ * The provider session's event stream ended because T3 released the session
+ * (a detach, a close, an idle timeout), as opposed to a connection failure, a
+ * release a runtime error forced, or a failure storing what it delivered.
+ */
+const isRunExecutionIngestError = Schema.is(RunExecutionIngestError);
+const isProviderAdapterEventStreamError = Schema.is(
+  ProviderAdapter.ProviderAdapterEventStreamError,
+);
+const isDeliberateSessionRelease = (cause: Cause.Cause<unknown>) => {
+  const failures = cause.reasons.filter(Cause.isFailReason);
+  return (
+    failures.length > 0 &&
+    failures.length === cause.reasons.length &&
+    failures.every(
+      (reason) =>
+        isRunExecutionIngestError(reason.error) &&
+        isProviderAdapterEventStreamError(reason.error.cause) &&
+        isDeliberateProviderSessionRelease(reason.error.cause.cause),
+    )
+  );
+};
 
 export const RunExecutionServiceV2Error = Schema.Union([
   RunExecutionStartError,
@@ -1295,16 +1319,25 @@ export const layer: Layer.Layer<
               }),
             ),
             // Server shutdown interrupts the subscription and leaves the run to
-            // restart recovery; every other failure fails the run.
+            // restart recovery; every other failure fails the run. Once the
+            // run has settled, T3 releasing the session (a detach, as a thread
+            // deletion does) only ends the watch on the run's background work:
+            // it is noted, not warned about. Any other failure still warns.
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) =>
                 Ref.get(rootRunFinalized).pipe(
                   Effect.flatMap((finalized) =>
-                    Effect.logWarning("orchestration V2 provider event ingestion failed", {
-                      runId: input.run.id,
-                      cause,
-                    }).pipe(
+                    (finalized && isDeliberateSessionRelease(cause)
+                      ? Effect.logInfo(
+                          "orchestration V2 provider event stream ended after its run settled",
+                          { runId: input.run.id, cause },
+                        )
+                      : Effect.logWarning("orchestration V2 provider event ingestion failed", {
+                          runId: input.run.id,
+                          cause,
+                        })
+                    ).pipe(
                       Effect.andThen(
                         finalized
                           ? Effect.void

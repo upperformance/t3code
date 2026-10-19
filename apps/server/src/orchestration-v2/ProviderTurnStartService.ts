@@ -2,6 +2,7 @@ import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
   CommandId,
+  isOrchestrationV2WorkActive,
   latestProviderTurnForAttempt,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ExecutionNode,
@@ -22,14 +23,13 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
-import * as HostProcess from "@t3tools/shared/HostProcess";
 
-import * as ServerConfig from "../config.ts";
+import type * as ServerConfig from "../config.ts";
+import type * as ServerSettings from "../serverSettings.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
-import * as ServerSettings from "../serverSettings.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
@@ -53,6 +53,7 @@ import * as RuntimePolicy from "./RuntimePolicy.ts";
 import {
   isRestartNoteContinuation,
   pendingRestartCancelledBackgroundWork,
+  persistedBackgroundWorkSurvivesRestart,
   restartCancelledBackgroundWorkNote,
 } from "./RestartBackgroundNote.ts";
 
@@ -109,8 +110,6 @@ export const layer: Layer.Layer<
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const serverConfig = yield* ServerConfig.ServerConfig;
-    const serverSettings = yield* ServerSettings.ServerSettingsService;
     const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
     const projects = yield* ProjectService.ProjectService;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
@@ -499,9 +498,22 @@ export const layer: Layer.Layer<
           runs: current.runs,
           turnItems: current.turnItems,
         });
-      const inheritedBackgroundTurnItems = yield* projectionStore
-        .getRuntimeRecoveryProjection(projection.thread.id)
-        .pipe(Effect.map(selectInheritedBackgroundItems));
+      const recoveryProjection = yield* projectionStore.getRuntimeRecoveryProjection(
+        projection.thread.id,
+      );
+      const inheritedBackgroundTurnItems = selectInheritedBackgroundItems(recoveryProjection);
+      // Provider-native subagent rows still open on this provider thread go to
+      // the adapter with the thread: a provider whose tasks outlive the session
+      // that started them (a cell's run on its tenant) publishes their end to
+      // these rows rather than to new ones.
+      const openNativeSubagentItems = recoveryProjection.turnItems.flatMap((item) =>
+        item.type === "subagent" &&
+        item.origin === "provider_native" &&
+        item.providerThreadId === providerThread.id &&
+        isOrchestrationV2WorkActive(item.status)
+          ? [item]
+          : [],
+      );
       const providerSessionId = providerThread.providerSessionId;
       const runControls = makeRunControls({
         threadId: projection.thread.id,
@@ -646,6 +658,7 @@ export const layer: Layer.Layer<
               runtimePolicy: resolvedRuntimePolicy,
               providerSessionId,
               existingProviderThread: providerThread,
+              openNativeSubagentItems,
             }),
           );
         }
@@ -671,6 +684,7 @@ export const layer: Layer.Layer<
                 threadId: projection.thread.id,
                 modelSelection: run.modelSelection,
                 runtimePolicy: resolvedRuntimePolicy,
+                openNativeSubagentItems,
               }),
         );
         if (resumed._tag === "Success") {
@@ -693,8 +707,12 @@ export const layer: Layer.Layer<
             providerSessionId,
             // The native ref is dropped so the adapter binds a fresh native
             // session instead of retrying the resume that just failed, while
-            // still adopting this row's identity.
+            // still adopting this row's identity. The open native subagent
+            // rows go with it as on the resume: a provider whose tasks run on
+            // (a cell's) finds them again from its own state and publishes
+            // their end to these rows rather than leaving them open.
             existingProviderThread: { ...providerThread, nativeThreadRef: null },
+            openNativeSubagentItems,
           }),
         );
         if (replacement === undefined) return undefined;
@@ -937,27 +955,39 @@ export const layer: Layer.Layer<
       });
       // Delivered once: this run's provider turn marks the work as told. A
       // restart continuation is prompted by its own text or resumes natively.
-      const noteContinuation = isRestartNoteContinuation(
-        run,
-        projection.runs,
-        projection.providerTurns,
-        projection.attempts,
-      );
-      const restartCancelledWork = pendingRestartCancelledBackgroundWork({
-        runs: projection.runs,
-        providerTurns: projection.providerTurns,
-        compactionMessageIds: new Set(
-          projection.messages
-            .filter(
-              (candidate) =>
-                candidate.attachments.length === 0 &&
-                candidate.text.trim().toLowerCase() === "/compact",
-            )
-            .map((candidate) => candidate.id),
-        ),
-        run,
-        attempts: projection.attempts,
-      });
+      // A provider whose work runs on without the server (a cell's turn and
+      // its tasks live on the tenant) lost none of it to a restart: a note an
+      // earlier build wrote before the capability was stored is not prompted,
+      // and the continuation keeps its restartContinuationOfRunId so the
+      // adapter takes the run back natively. A session that reports no
+      // capabilities is read as one whose work does not survive.
+      const workSurvivesRestart =
+        persistedBackgroundWorkSurvivesRestart(session.providerSession.capabilities) === true;
+      const noteContinuation =
+        !workSurvivesRestart &&
+        isRestartNoteContinuation(
+          run,
+          projection.runs,
+          projection.providerTurns,
+          projection.attempts,
+        );
+      const restartCancelledWork = workSurvivesRestart
+        ? []
+        : pendingRestartCancelledBackgroundWork({
+            runs: projection.runs,
+            providerTurns: projection.providerTurns,
+            compactionMessageIds: new Set(
+              projection.messages
+                .filter(
+                  (candidate) =>
+                    candidate.attachments.length === 0 &&
+                    candidate.text.trim().toLowerCase() === "/compact",
+                )
+                .map((candidate) => candidate.id),
+            ),
+            run,
+            attempts: projection.attempts,
+          });
       const restartNote =
         restartCancelledWork.length === 0
           ? ""

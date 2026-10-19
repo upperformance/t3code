@@ -28,6 +28,10 @@ to you for approval.
 Muse Code offers only **Supervised** and **Full access**. A Muse thread already set to another mode
 runs in **Supervised**.
 
+Cell runs only in **Full access**: the cell is its own sandbox and asks no approvals. A Cell thread
+set to another mode does not run; its message fails with a note to switch the thread to **Full
+access** and send it again.
+
 Grok offers no **Auto-accept edits**. A Grok thread already set to it runs in **Supervised**. Grok
 file-change approvals offer **Allow all edits this session**. Its command approvals have no
 session-wide choice, because Grok would remember that command for the whole project.

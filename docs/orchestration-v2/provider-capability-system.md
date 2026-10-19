@@ -31,6 +31,7 @@ type SessionCapabilities = {
   supportsProviderSwitchingViaHandoff: boolean;
   supportsRuntimeModeSwitchInSession: boolean;
   pendingRequestsSurviveRestart: boolean;
+  backgroundWorkSurvivesRestart?: boolean;
 };
 ```
 
@@ -38,6 +39,31 @@ Policy examples:
 
 - If model switching is unsupported, start a new provider session.
 - If pending requests do not survive restart, mark old requests `not_resumable`.
+- If background work survives restart (the provider runs on a remote origin
+  that does not notice the server stopping, as a cell does), runtime recovery
+  records none of that work as cancelled: no restart note tells the next turn
+  to restart it, and a restart continuation keeps its
+  `restartContinuationOfRunId` so the adapter can take the surviving turn
+  back natively instead of being prompted. The cut run's own rows are still
+  terminalized, but a provider-native subagent's rows (the subagent, its node
+  and its item) and the provider thread's task roster are left open, and the
+  next turn hands the open subagent items to the adapter
+  (`openNativeSubagentItems` on `ensureThread` and `resumeThread`) so the
+  task's end is published to the rows that showed it start. A session record
+  stored before this field existed lacks it; recovery then asks the adapter's
+  own capabilities through the registry, so a provider that gains the field
+  in an upgrade is treated by it on the first restart after; a lookup that
+  fails or throws is read as work that does not survive, and the thread's
+  recovery still commits. A note an earlier build already wrote on such a
+  run is ignored when the turn starts, and withdrawn at recovery when
+  recovery still visits the thread (it has a run not yet terminal or a
+  session still recorded live); a thread that build already settled keeps
+  the note in its stored run, harmlessly, and the rows it cancelled are not
+  reopened. Deleting the thread settles the rows a surviving task keeps open
+  as cancelled, clears the thread's task roster, and asks the adapter to
+  stop the work (`cancelBackgroundWork` on the session runtime, best
+  effort, from the session detach the deletion queues); archiving leaves
+  them until the thread is re-engaged.
 
 Provider-thread resumption is not a capability. It is a required adapter primitive. Adapters must be able to start from a stored provider cursor/session/thread handle or return a runtime resume failure.
 

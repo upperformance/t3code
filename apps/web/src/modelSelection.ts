@@ -6,6 +6,7 @@ import {
   type ModelSelection,
   ProviderDriverKind,
   ProviderInstanceId,
+  providerSupportsCustomModels,
   type ServerProvider,
 } from "@t3tools/contracts";
 import {
@@ -46,7 +47,7 @@ function readInstanceCustomModels(
   instanceId: ProviderInstanceId,
   driverKind: ProviderDriverKind,
 ): ReadonlyArray<CustomModelDefinition> {
-  if (driverKind === "antigravity") return [];
+  if (!providerSupportsCustomModels(driverKind)) return [];
   const instance = settings.providerInstances?.[instanceId];
   const config = instance?.config;
   if (config !== null && typeof config === "object") {

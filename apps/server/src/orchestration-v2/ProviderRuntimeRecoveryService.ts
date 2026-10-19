@@ -15,12 +15,14 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { restartContinuationRun } from "./RestartContinuation.ts";
 import { isBufferedProviderNotification } from "./NotificationMailbox.ts";
@@ -34,6 +36,7 @@ import {
   cancelledTurnItemWork,
   mergeRestartCancelledBackgroundWork,
   neverStarted,
+  persistedBackgroundWorkSurvivesRestart,
 } from "./RestartBackgroundNote.ts";
 
 export class ProviderRuntimeRecoveryError extends Schema.TaggedError<ProviderRuntimeRecoveryError>()(
@@ -174,7 +177,45 @@ export const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
+  const registry = yield* Effect.serviceOption(ProviderAdapterRegistry.ProviderAdapterRegistryV2);
   type RecoverySession = ProjectionStore.ProjectionRuntimeRecoveryState["providerSessions"][number];
+  /**
+   * Whether the provider thread's work keeps running after the server stops,
+   * as a cell's does on its tenant. The session's persisted capabilities say
+   * so when they carry the field. A session an earlier build stored lacks it,
+   * so the provider's adapter is asked for its own capabilities: a cell thread
+   * from before the field is then taken back like any other instead of being
+   * told its work was cancelled, and a local provider, whose adapter lacks the
+   * field too, is cancelled as before.
+   */
+  const backgroundWorkSurvivesRestart = Effect.fnUntraced(function* (
+    providerThread: ProjectionStore.ProjectionRuntimeRecoveryState["providerThreads"][number],
+    session: RecoverySession | undefined,
+  ) {
+    const persisted = persistedBackgroundWorkSurvivesRestart(session?.capabilities);
+    if (persisted !== undefined) return persisted;
+    if (Option.isNone(registry)) return false;
+    const providerInstanceId = providerThread.providerInstanceId;
+    // The adapter boundary: a lookup that fails, or one that throws (a
+    // defect, not a typed failure), is answered the same way, so one
+    // provider's broken capabilities cannot abort the thread's recovery
+    // with nothing committed. Only an interruption passes through.
+    return yield* Effect.suspend(() =>
+      registry.value
+        .get(providerInstanceId)
+        .pipe(Effect.flatMap((adapter) => adapter.getCapabilities())),
+    ).pipe(
+      Effect.map((capabilities) => capabilities.sessions.backgroundWorkSurvivesRestart === true),
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning(
+              "Could not read a provider's capabilities during recovery; treating its background work as ended by the restart",
+              { providerInstanceId, cause: Cause.pretty(cause) },
+            ).pipe(Effect.as(false)),
+      ),
+    );
+  });
   /**
    * A session shared by several threads (one Codex app server) is stopped by the
    * first thread recovery reaches. It was live when the server went down, so a
@@ -267,6 +308,48 @@ export const make = Effect.gen(function* () {
         Array<OrchestrationV2RestartCancelledBackgroundWork>
       >();
       const cancelledBackgroundNativeIds = new Set<string>();
+      // Work on a provider that runs on without the server (a cell's turn and
+      // the tasks it delegated live on the tenant) is not cancelled by the
+      // restart, so none of it is recorded as such: no note tells the next
+      // turn to restart the work, and the restart continuation keeps the run
+      // it resumes, which the adapter takes back natively instead of being
+      // prompted while the cell still runs it. The run's own rows are still
+      // terminalized below, but a delegated task's rows (the subagent, its
+      // node and its item, keyed by the provider's task id) and the thread's
+      // task roster are left open: the next session is handed them with the
+      // thread and publishes the task's end to them.
+      const survivingProviderThreadIds = new Set<ProviderThreadId>();
+      for (const providerThread of projection.providerThreads) {
+        const session = projection.providerSessions.find(
+          (candidate) => candidate.id === providerThread.providerSessionId,
+        );
+        if (yield* backgroundWorkSurvivesRestart(providerThread, session)) {
+          survivingProviderThreadIds.add(providerThread.id);
+        }
+      }
+      const survivesOn = (providerThreadId: ProviderThreadId | null | undefined) =>
+        providerThreadId != null && survivingProviderThreadIds.has(providerThreadId);
+      const survivingNativeSubagentIds = new Set<string>([
+        ...(projection.subagents ?? []).flatMap((subagent) =>
+          subagent.origin === "provider_native" &&
+          survivesOn(
+            subagent.providerThreadId ??
+              projection.runs.find((run) => run.id === subagent.runId)?.providerThreadId,
+          )
+            ? [subagent.id]
+            : [],
+        ),
+        ...(projection.turnItems ?? []).flatMap((item) =>
+          item.type === "subagent" &&
+          item.origin === "provider_native" &&
+          survivesOn(awaitingProviderThreadId(item, projection.runs))
+            ? [item.subagentId]
+            : [],
+        ),
+      ]);
+      const isSurvivingNativeSubagentItem = (
+        item: OrchestrationV2ThreadProjection["turnItems"][number],
+      ): boolean => item.type === "subagent" && survivingNativeSubagentIds.has(item.subagentId);
       const recordCancelledBackgroundWork = (
         providerThreadId: ProviderThreadId | null | undefined,
         work: OrchestrationV2RestartCancelledBackgroundWork,
@@ -281,6 +364,7 @@ export const make = Effect.gen(function* () {
       ) => {
         if (!isBackgroundCapableTurnItemType(item.type)) return;
         const awaitingId = awaitingProviderThreadId(item, projection.runs);
+        if (awaitingId != null && survivingProviderThreadIds.has(awaitingId)) return;
         const ownProviderThread =
           item.providerThreadId === awaitingId
             ? undefined
@@ -383,6 +467,7 @@ export const make = Effect.gen(function* () {
             candidate.runId === run.id &&
             !messageRequestNodeIds.has(candidate.id) &&
             !delegatedTaskNodeIds.has(candidate.id) &&
+            !survivingNativeSubagentIds.has(candidate.id) &&
             (candidate.status === "pending" ||
               candidate.status === "running" ||
               candidate.status === "waiting"),
@@ -436,6 +521,7 @@ export const make = Effect.gen(function* () {
             candidate.runId === run.id &&
             (candidate.nodeId === null || !messageRequestNodeIds.has(candidate.nodeId)) &&
             !isAppOwnedDelegationItem(candidate) &&
+            !isSurvivingNativeSubagentItem(candidate) &&
             (candidate.status === "pending" ||
               candidate.status === "running" ||
               candidate.status === "waiting"),
@@ -491,7 +577,11 @@ export const make = Effect.gen(function* () {
         if (!isBackgroundCapableTurnItemType(item.type)) {
           continue;
         }
-        if (!isNonterminalTurnItemStatus(item.status) || isAppOwnedDelegationItem(item)) {
+        if (
+          !isNonterminalTurnItemStatus(item.status) ||
+          isAppOwnedDelegationItem(item) ||
+          isSurvivingNativeSubagentItem(item)
+        ) {
           continue;
         }
         const providerInstanceId = resolveStaleBackgroundItemProviderInstanceId(item, projection);
@@ -527,8 +617,11 @@ export const make = Effect.gen(function* () {
         }
       }
       // No provider process outlives the server, so a native subagent still open
-      // here never reports its end, whatever state its run and item are in.
+      // here never reports its end, whatever state its run and item are in,
+      // unless it runs on a provider whose work survives: the next session
+      // reports that one's end to the same rows.
       for (const subagent of projection.subagents ?? []) {
+        if (survivingNativeSubagentIds.has(subagent.id)) continue;
         events.push(
           ...(yield* endOrphanedNativeSubagent({
             projection,
@@ -554,12 +647,16 @@ export const make = Effect.gen(function* () {
         })),
       );
       for (const providerThread of projection.providerThreads ?? []) {
+        const surviving = survivingProviderThreadIds.has(providerThread.id);
         const needsIdle = providerThread.status === "active";
-        const needsRosterClear = providerThreadHasPendingBackgroundTasks(providerThread);
+        // A roster on a provider whose work runs on is still true; the next
+        // session reconciles it against the provider's own.
+        const needsRosterClear =
+          !surviving && providerThreadHasPendingBackgroundTasks(providerThread);
         if (!needsIdle && !needsRosterClear) {
           continue;
         }
-        if (providerThread.ownerNodeId === null) {
+        if (providerThread.ownerNodeId === null && !surviving) {
           for (const task of providerThread.pendingBackgroundTasks ?? []) {
             // A subagent already recorded covers the shells it started.
             if (
@@ -582,7 +679,7 @@ export const make = Effect.gen(function* () {
           payload: {
             ...providerThread,
             status: needsIdle ? "idle" : providerThread.status,
-            pendingBackgroundTasks: [],
+            ...(surviving ? {} : { pendingBackgroundTasks: [] }),
             updatedAt: now,
           },
         });
@@ -619,6 +716,29 @@ export const make = Effect.gen(function* () {
               work,
             ),
           },
+        });
+      }
+      // A note an earlier build wrote on a run of a provider whose work
+      // survives (its session record lacked the capability) would be prompted
+      // as text and strip the continuation's restartContinuationOfRunId. The
+      // work was never cancelled, so the note is withdrawn. Only a thread
+      // recovery visits gets here, one with a run or session left to
+      // recover; a note on a thread that build already settled stands in
+      // the stored run, and the turn start ignores it.
+      for (const run of projection.runs) {
+        if (
+          !survivesOn(run.providerThreadId) ||
+          (run.restartCancelledBackgroundWork?.length ?? 0) === 0
+        )
+          continue;
+        events.push({
+          id: yield* allocateEventId(),
+          type: "run.background-work-cancelled",
+          threadId: projection.thread.id,
+          runId: run.id,
+          providerInstanceId: run.providerInstanceId,
+          occurredAt: now,
+          payload: { runId: run.id, restartCancelledBackgroundWork: [] },
         });
       }
       const continuationRun =

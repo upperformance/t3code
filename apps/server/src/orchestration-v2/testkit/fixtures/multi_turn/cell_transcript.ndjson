@@ -1,0 +1,16 @@
+{"type":"transcript_start","provider":"cell","protocol":"cell.http-ws","version":"0.3.0","scenario":"multi_turn","metadata":{"generatedBy":"live-cell-recorder","model":"gpt-6-astra"}}
+{"type":"expect_outbound","label":"GET /cell/<project>/state","frame":{"kind":"http","method":"GET","path":"/cell/<project>/state"}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":200,"body":"{\"protocol\":3,\"version\":\"0.3.0\",\"model\":\"gpt-6-astra\",\"running\":false,\"runId\":null,\"requestId\":null,\"seq\":0,\"configured\":true,\"turns\":0,\"sockets\":0,\"parent\":null,\"depth\":0,\"tasks\":0,\"name\":\"default/t3-f25a8d606982cda6c9c3\",\"misnamed\":null,\"generation\":0,\"disowned\":0}"}}
+{"type":"expect_outbound","label":"ws_connect","frame":{"kind":"ws_connect","path":"/cell/<project>/ws"}}
+{"type":"emit_inbound","label":"ws:state#1","frame":{"kind":"ws_event","event":{"type":"state","protocol":3,"version":"0.3.0","model":"gpt-6-astra","running":false,"runId":null,"requestId":null,"seq":0,"configured":true,"turns":0,"sockets":1,"parent":null,"depth":0,"tasks":0,"name":"default/t3-f25a8d606982cda6c9c3","misnamed":null,"generation":0,"disowned":0}}}
+{"type":"emit_inbound","label":"ws:tasks#1","frame":{"kind":"ws_event","event":{"type":"tasks","tasks":[],"seq":0}}}
+{"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Respond with exactly: first fixture turn complete"}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":"{\"runId\":\"7530c3bd-a133-4178-8172-267abed81655\",\"seq\":1}"}}
+{"type":"emit_inbound","label":"ws:user#1","frame":{"kind":"ws_event","event":{"type":"user","origin":"user","text":"Respond with exactly: first fixture turn complete","runId":"7530c3bd-a133-4178-8172-267abed81655","requestId":"<request-id:1>","seq":1}}}
+{"type":"emit_inbound","label":"ws:assistant#1","frame":{"kind":"ws_event","event":{"type":"assistant","text":"first fixture turn complete","runId":"7530c3bd-a133-4178-8172-267abed81655","seq":2}}}
+{"type":"emit_inbound","label":"ws:done#1","frame":{"kind":"ws_event","event":{"type":"done","runId":"7530c3bd-a133-4178-8172-267abed81655","seq":3}}}
+{"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Respond with exactly: second fixture turn complete"}}
+{"type":"emit_inbound","label":"ws:user#2","frame":{"kind":"ws_event","event":{"type":"user","origin":"user","text":"Respond with exactly: second fixture turn complete","runId":"1f113b8e-9d2b-474d-8e17-d8745180467e","requestId":"<request-id:2>","seq":4}}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":"{\"runId\":\"1f113b8e-9d2b-474d-8e17-d8745180467e\",\"seq\":4}"}}
+{"type":"emit_inbound","label":"ws:assistant#2","frame":{"kind":"ws_event","event":{"type":"assistant","text":"second fixture turn complete","runId":"1f113b8e-9d2b-474d-8e17-d8745180467e","seq":5}}}
+{"type":"emit_inbound","label":"ws:done#2","frame":{"kind":"ws_event","event":{"type":"done","runId":"1f113b8e-9d2b-474d-8e17-d8745180467e","seq":6}}}

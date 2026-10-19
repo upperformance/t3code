@@ -1,7 +1,8 @@
-import type {
-  OrchestrationV2Command,
-  OrchestrationV2DomainEvent,
-  OrchestrationV2ThreadProjection,
+import {
+  isOrchestrationV2WorkActive,
+  type OrchestrationV2Command,
+  type OrchestrationV2DomainEvent,
+  type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
 import type * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -18,7 +19,15 @@ export const planThreadDeletion = Effect.fn("ThreadDeletion.planThreadDeletion")
   readonly command: Extract<OrchestrationV2Command, { readonly type: "thread.delete" }>;
   readonly projection: Pick<
     OrchestrationV2ThreadProjection,
-    "thread" | "runs" | "attempts" | "nodes" | "runtimeRequests" | "subagents" | "providerSessions"
+    | "thread"
+    | "runs"
+    | "attempts"
+    | "nodes"
+    | "runtimeRequests"
+    | "subagents"
+    | "providerSessions"
+    | "providerThreads"
+    | "turnItems"
   >;
   readonly attachmentIds: ReadonlyArray<string>;
   readonly now: DateTime.Utc;
@@ -108,6 +117,75 @@ export const planThreadDeletion = Effect.fn("ThreadDeletion.planThreadDeletion")
       providerInstanceId: run.providerInstanceId,
       occurredAt: now,
       payload: { ...node, status: "cancelled", completedAt: now },
+    });
+  }
+  // A provider-native subagent that outlives its run (a cell's delegated
+  // task) keeps its subagent, node and item open until a later turn publishes
+  // the task's end. A deleted thread has no later turn, so the rows are
+  // settled here as cancelled, the roster that pinned the thread as waiting
+  // on the task goes with them, and the provider is asked to stop the task
+  // when its session is detached (below).
+  const cancelledNodeIds = new Set(
+    events.flatMap((event) => (event.type === "node.updated" ? [event.payload.id] : [])),
+  );
+  for (const task of projection.subagents) {
+    if (task.origin !== "provider_native" || !isOrchestrationV2WorkActive(task.status)) continue;
+    yield* emitEvent({
+      type: "subagent.updated",
+      threadId: command.threadId,
+      ...(task.runId === null ? {} : { runId: task.runId }),
+      nodeId: task.id,
+      driver: task.driver,
+      providerInstanceId: task.providerInstanceId,
+      occurredAt: now,
+      payload: { ...task, status: "cancelled", completedAt: now, updatedAt: now },
+    });
+    const node = projection.nodes.find((candidate) => candidate.id === task.id);
+    if (
+      node === undefined ||
+      cancelledNodeIds.has(node.id) ||
+      !isOrchestrationV2WorkActive(node.status)
+    ) {
+      continue;
+    }
+    cancelledNodeIds.add(node.id);
+    yield* emitEvent({
+      type: "node.updated",
+      threadId: command.threadId,
+      ...(node.runId === null ? {} : { runId: node.runId }),
+      nodeId: node.id,
+      providerInstanceId: task.providerInstanceId,
+      occurredAt: now,
+      payload: { ...node, status: "cancelled", completedAt: now },
+    });
+  }
+  for (const item of projection.turnItems) {
+    if (
+      item.type !== "subagent" ||
+      item.origin !== "provider_native" ||
+      !isOrchestrationV2WorkActive(item.status)
+    ) {
+      continue;
+    }
+    yield* emitEvent({
+      type: "turn-item.updated",
+      threadId: command.threadId,
+      ...(item.runId === null ? {} : { runId: item.runId }),
+      ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
+      providerInstanceId: item.providerInstanceId,
+      occurredAt: now,
+      payload: { ...item, status: "cancelled", completedAt: now, updatedAt: now },
+    });
+  }
+  for (const providerThread of projection.providerThreads) {
+    if ((providerThread.pendingBackgroundTasks?.length ?? 0) === 0) continue;
+    yield* emitEvent({
+      type: "provider-thread.updated",
+      threadId: command.threadId,
+      driver: providerThread.driver,
+      providerInstanceId: providerThread.providerInstanceId,
+      occurredAt: now,
+      payload: { ...providerThread, pendingBackgroundTasks: [], updatedAt: now },
     });
   }
   for (const request of projection.runtimeRequests.filter(
@@ -205,6 +283,8 @@ export const planThreadDeletion = Effect.fn("ThreadDeletion.planThreadDeletion")
         providerSessionId: session.id,
         detail: "Thread deleted.",
         revokeMcpCredential: true,
+        // The provider's work for the thread (a cell's delegated tasks) is asked to stop before the detach.
+        cancelBackgroundWork: true,
       },
     });
   }

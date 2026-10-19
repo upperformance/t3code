@@ -79,6 +79,20 @@ const layerFailingReleaseEventSink = Layer.effect(
   }),
 ).pipe(Layer.provide(layerTestEventSink));
 
+const layerFailingRequestEventSink = Layer.effect(
+  EventSink.EventSinkV2,
+  Effect.gen(function* () {
+    const delegate = yield* EventSink.EventSinkV2;
+    return EventSink.EventSinkV2.of({
+      ...delegate,
+      write: (input) =>
+        input.events.some((event) => event.type === "runtime-request.updated")
+          ? Effect.fail(new EventSink.EventSinkWriteError({ eventCount: input.events.length }))
+          : delegate.write(input),
+    });
+  }),
+).pipe(Layer.provide(layerTestEventSink));
+
 interface FlakyReleaseWrites {
   readonly failing: Ref.Ref<"none" | "session" | "session-and-requests">;
   readonly failures: Queue.Queue<void>;
@@ -331,6 +345,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     }) => Effect.Effect<void>;
     readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
     readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
+    readonly cancelBackgroundWork?: ProviderAdapter.ProviderAdapterV2SessionRuntime["cancelBackgroundWork"];
     readonly backgroundTasksEndWithProcess?: boolean;
     readonly hangSessionScopeClose?: boolean;
     readonly startTurn?: Effect.Effect<void>;
@@ -423,6 +438,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
             : {
                 hasPendingBackgroundWorkForThread: () => options.hasPendingBackgroundWorkForThread!,
               }),
+          ...(options.cancelBackgroundWork === undefined
+            ? {}
+            : { cancelBackgroundWork: options.cancelBackgroundWork }),
           ensureThread: () => unimplemented("ensureThread unused in test"),
           resumeThread: (threadInput) =>
             Ref.update(state, (current) => ({
@@ -471,6 +489,7 @@ function layerTest(input: {
     readonly initialProviderItemIdentityVersion?: 2;
   }) => Effect.Effect<void>;
   readonly failReleaseEventWrites?: boolean;
+  readonly failRequestEventWrites?: boolean;
   readonly flakyReleaseWrites?: FlakyReleaseWrites;
   readonly pauseAttachWrite?: Parameters<typeof layerPausingAttachEventSink>[0];
   readonly beforeUnchangedWrite?: Ref.Ref<Effect.Effect<void>>;
@@ -480,6 +499,7 @@ function layerTest(input: {
   };
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
+  readonly cancelBackgroundWork?: ProviderAdapter.ProviderAdapterV2SessionRuntime["cancelBackgroundWork"];
   readonly backgroundTasksEndWithProcess?: boolean;
   readonly hangSessionScopeClose?: boolean;
   readonly startTurn?: Effect.Effect<void>;
@@ -498,7 +518,9 @@ function layerTest(input: {
           ? layerBeforeUnchangedWriteEventSink(input.beforeUnchangedWrite)
           : input.failReleaseEventWrites
             ? layerFailingReleaseEventSink
-            : layerTestEventSink;
+            : input.failRequestEventWrites
+              ? layerFailingRequestEventSink
+              : layerTestEventSink;
   const layerRegistry = Layer.unwrap(
     makeProviderAdapter(input.state, {
       failEventStream: input.failEventStream ?? false,
@@ -511,6 +533,9 @@ function layerTest(input: {
       ...(input.hasPendingBackgroundWorkForThread === undefined
         ? {}
         : { hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread }),
+      ...(input.cancelBackgroundWork === undefined
+        ? {}
+        : { cancelBackgroundWork: input.cancelBackgroundWork }),
       ...(input.backgroundTasksEndWithProcess === undefined
         ? {}
         : { backgroundTasksEndWithProcess: input.backgroundTasksEndWithProcess }),
@@ -2643,6 +2668,73 @@ it.effect("ProviderSessionManagerV2 terminal detach revokes the thread's MCP cre
   }),
 );
 
+it.effect(
+  "ProviderSessionManagerV2 completes a detach whose background-work cancellation throws before returning its effect",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const mcpConfigs = yield* Ref.make<
+        ReadonlyArray<McpProviderSession.McpProviderSessionConfig | undefined>
+      >([]);
+      let cancelCalls = 0;
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const registry = yield* McpSessionRegistry.McpSessionRegistry;
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread-provider-session-manager-throwing-cancel");
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        const token = (yield* Ref.get(mcpConfigs))
+          .at(-1)
+          ?.authorizationHeader.replace(/^Bearer\s+/, "");
+        assert.isDefined(yield* registry.resolve(token!));
+
+        yield* manager.detach({
+          providerSessionId,
+          threadId,
+          detail: "Thread deleted.",
+          revokeMcpCredential: true,
+          cancelBackgroundWork: true,
+        });
+
+        assert.equal(cancelCalls, 1, "the hook was asked once");
+        assert.isUndefined(yield* registry.resolve(token!), "the credential is revoked");
+        assert.isUndefined(yield* mcpSessions.read(threadId));
+        assert.isTrue(
+          Option.isNone(yield* manager.get(providerSessionId)),
+          "the session is released",
+        );
+        assert.equal((yield* Ref.get(state)).closeCount, 1);
+      });
+
+      yield* effect.pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60_000,
+            capabilities: ExclusiveCapabilities,
+            mcpConfigs,
+            // Throws while building its effect, before there is one to fail.
+            cancelBackgroundWork: () => {
+              cancelCalls += 1;
+              throw new Error("hook threw synchronously");
+            },
+          }),
+        ),
+      );
+    }),
+);
+
 it.effect("ProviderSessionManagerV2 releases idle sessions without sweeping all sessions", () =>
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
@@ -4052,6 +4144,136 @@ it.effect("ProviderSessionManagerV2 persists session-scoped runtime requests wit
 
     yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));
   }),
+);
+
+/** The failure a run's subscription to the session's events ends with. */
+const subscriptionFailure = (subscription: ProviderAdapter.ProviderAdapterV2EventSubscription) =>
+  subscription.events.pipe(
+    Stream.runDrain,
+    Effect.flip,
+    Effect.flatMap((error) =>
+      error._tag === "ProviderAdapterEventStreamError"
+        ? Effect.succeed(error)
+        : Effect.die(new Error(`The subscription failed with ${error._tag}`)),
+    ),
+  );
+
+it.effect.each([
+  { release: "detach", deliberate: true },
+  { release: "idle_timeout", deliberate: true },
+  { release: "runtime_error", deliberate: false },
+] as const)(
+  "ProviderSessionManagerV2 marks a $release release's subscriber failure deliberate: $deliberate",
+  ({ release, deliberate }) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make(`thread-provider-session-manager-release-${release}`);
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const failure = yield* subscriptionFailure(yield* runtime.subscribeEvents!).pipe(
+          Effect.forkScoped,
+        );
+        if (release === "detach") {
+          yield* manager.detach({ providerSessionId, threadId, detail: "Thread deleted." });
+        } else {
+          yield* manager.release({ providerSessionId, reason: release });
+        }
+
+        const error = yield* Fiber.join(failure);
+        assert.equal(
+          ProviderSessionManager.isDeliberateProviderSessionRelease(error.cause),
+          deliberate,
+        );
+      });
+
+      // An exclusive session, as a cell's is: its last thread's detach releases it.
+      yield* effect.pipe(
+        Effect.provide(
+          layerTest({ state, idleTimeoutMs: 60_000, capabilities: ExclusiveCapabilities }),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 does not mark a failure to persist a session-scoped request as a release",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const projectId = yield* idAllocator.allocate.project({
+          fixtureName: "provider-session-manager-request-write-failure",
+        });
+        const threadId = yield* idAllocator.allocate.thread({
+          fixtureName: "provider-session-manager-request-write-failure",
+          projectId,
+        });
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const failure = yield* subscriptionFailure(yield* runtime.subscribeEvents!).pipe(
+          Effect.forkScoped,
+        );
+        const pendingRequest = yield* makePendingRuntimeRequestEvents({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          providerThread,
+          now,
+        });
+        const adapterEvents = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+        assert.isDefined(adapterEvents);
+        yield* Queue.offerAll(adapterEvents!, pendingRequest.providerEvents);
+
+        const error = yield* Fiber.join(failure);
+        assert.isFalse(ProviderSessionManager.isDeliberateProviderSessionRelease(error.cause));
+        // The stream error wraps the ingest failure, not a release.
+        assert.equal(
+          (error.cause as { readonly _tag?: string } | undefined)?._tag,
+          "ProviderEventPublishError",
+        );
+      });
+
+      yield* effect.pipe(
+        Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, failRequestEventWrites: true })),
+      );
+    }),
 );
 
 it.effect(

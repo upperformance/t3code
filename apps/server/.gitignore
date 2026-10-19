@@ -1,1 +1,3 @@
 tmp/
+# A cell recording that failed verification, kept beside its fixture for inspection.
+src/orchestration-v2/testkit/fixtures/*/*.ndjson.partial

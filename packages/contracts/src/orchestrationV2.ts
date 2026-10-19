@@ -196,6 +196,11 @@ export const OrchestrationV2SessionCapabilities = Schema.Struct({
   supportsProviderSwitchingViaHandoff: Schema.Boolean,
   supportsRuntimeModeSwitchInSession: Schema.Boolean,
   pendingRequestsSurviveRestart: Schema.Boolean,
+  // The provider's work runs on without the server: a turn in progress and the
+  // background tasks it started outlive a restart, and the session that resumes
+  // the thread takes them back. Recovery then leaves no note telling the next
+  // turn that its background work was cancelled. Absent means it does not.
+  backgroundWorkSurvivesRestart: Schema.optional(Schema.Boolean),
 });
 export type OrchestrationV2SessionCapabilities = typeof OrchestrationV2SessionCapabilities.Type;
 

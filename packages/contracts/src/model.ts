@@ -119,6 +119,7 @@ const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER_KIND = ProviderDriverKind.make("cursor");
 const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 const MUSE_DRIVER_KIND = ProviderDriverKind.make("muse");
+const CELL_DRIVER_KIND = ProviderDriverKind.make("cell");
 const PI_DRIVER_KIND = ProviderDriverKind.make("pi");
 const ACP_REGISTRY_DRIVER_KIND = ProviderDriverKind.make("acpRegistry");
 const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
@@ -142,6 +143,22 @@ export const DEFAULT_TEXT_GENERATION_REASONING_EFFORT = "low";
 
 /** Let Muse pick the account's default model. Never send this ID to Muse. */
 export const MUSE_DEFAULT_MODEL = "default";
+/** The cell runs the model its tenant configured; the adapter never sends a model. */
+const CELL_DEFAULT_MODEL = "default";
+
+/**
+ * Providers whose model is decided elsewhere: Antigravity by its signed-in
+ * session, a cell by its tenant. A custom model slug would never reach them,
+ * so clients offer none and the server catalogs none.
+ */
+const PROVIDERS_WITHOUT_CUSTOM_MODELS: ReadonlySet<string> = new Set([
+  "antigravity",
+  CELL_DRIVER_KIND,
+]);
+
+export function providerSupportsCustomModels(driver: string | null | undefined): boolean {
+  return driver == null || !PROVIDERS_WITHOUT_CUSTOM_MODELS.has(driver);
+}
 
 export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, string>> = {
   [CODEX_DRIVER_KIND]: DEFAULT_MODEL,
@@ -150,6 +167,7 @@ export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, strin
   // Product slug, not an ACP model id. The Grok adapter treats it as "the session's current model".
   [GROK_DRIVER_KIND]: "grok-build",
   [MUSE_DRIVER_KIND]: MUSE_DEFAULT_MODEL,
+  [CELL_DRIVER_KIND]: CELL_DEFAULT_MODEL,
   [ACP_REGISTRY_DRIVER_KIND]: "default",
   // "default" defers to the user's own Pi settings.json model selection.
   [PI_DRIVER_KIND]: "default",
@@ -200,6 +218,7 @@ export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>>
   [CURSOR_DRIVER_KIND]: "Cursor",
   [GROK_DRIVER_KIND]: "Grok",
   [MUSE_DRIVER_KIND]: "Muse Code",
+  [CELL_DRIVER_KIND]: "Cell",
   [ACP_REGISTRY_DRIVER_KIND]: "ACP Registry",
   [PI_DRIVER_KIND]: "Pi",
   [OPENCODE_DRIVER_KIND]: "OpenCode",

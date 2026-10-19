@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
+import { providerSupportsCustomModels } from "./model.ts";
 import { ModelSelection } from "./modelSelection.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
@@ -108,3 +109,11 @@ it.effect(
       assert.deepStrictEqual(encoded.options, decoded.options);
     }),
 );
+
+it("providerSupportsCustomModels is false only where the model is decided elsewhere", () => {
+  assert.isFalse(providerSupportsCustomModels("antigravity"));
+  assert.isFalse(providerSupportsCustomModels("cell"));
+  assert.isTrue(providerSupportsCustomModels("codex"));
+  assert.isTrue(providerSupportsCustomModels(undefined));
+  assert.isTrue(providerSupportsCustomModels(null));
+});

@@ -1,5 +1,6 @@
 import type {
   OrchestrationV2PendingBackgroundTask,
+  OrchestrationV2ProviderCapabilities,
   OrchestrationV2ProviderTurn,
   OrchestrationV2RestartCancelledBackgroundWork,
   OrchestrationV2Run,
@@ -119,6 +120,18 @@ export function cancelledRosterTaskWork(task: OrchestrationV2PendingBackgroundTa
       ) ?? "background task",
     id: task.taskId,
   };
+}
+
+/**
+ * What a persisted session says about its provider's work outliving a
+ * restart. Undefined when the record predates the capability (an earlier
+ * build stored it) or a test left it without capabilities: the caller then
+ * asks the provider's adapter rather than assuming the work died.
+ */
+export function persistedBackgroundWorkSurvivesRestart(
+  capabilities: Partial<OrchestrationV2ProviderCapabilities> | null | undefined,
+): boolean | undefined {
+  return capabilities?.sessions?.backgroundWorkSurvivesRestart;
 }
 
 const MAX_NOTE_ENTRIES = 10;
