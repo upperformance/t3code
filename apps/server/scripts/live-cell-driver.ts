@@ -4,18 +4,29 @@
  * (celld) for the scenarios the fixture recorder cannot express, and logs
  * every HTTP exchange and every socket frame with a wall-clock stamp.
  *
- *   node scripts/live-cell-driver.ts --scenario <shell|delegate|limit|reconnect|restart> --url http://127.0.0.1:9884 [--token t] [--log dir]
+ *   node scripts/live-cell-driver.ts --scenario <shell|interrupt|delegate|limit|reconnect|restart|attach-retry|delete-delegate> --url http://127.0.0.1:9884 [--tag t] [--token t] [--log dir]
  *
  * reconnect: the socket is terminated 3 s after the prompt's 202 and the next
  * connect is held for RECONNECT_HOLD_MS, so the run's output lands in the gap
  * and the adapter has to read it back.
  * restart: two orchestrator runtimes over one SQLite file; the first stops the
  * way the server stops while the cell still runs the turn, the second recovers.
+ * attach-retry: the first socket delivers `state` and nothing after it, then
+ * is terminated (1006), so the roster never arrives on it; the second attaches
+ * and the prompt completes.
+ * delete-delegate: the run delegates and completes while the child still runs
+ * (hold the child with the scripted API's CHILD_DELAY_MS), the thread is
+ * deleted, and the cell must have received the task's cancel and list the
+ * task as cancelled.
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { NodeWS as WS } from "@effect/platform-node-shared/NodeSocket";
-import type { OrchestrationV2ThreadProjection, ProviderReplayTranscript } from "@t3tools/contracts";
+import {
+  CommandId,
+  type OrchestrationV2ThreadProjection,
+  type ProviderReplayTranscript,
+} from "@t3tools/contracts";
 import { makeHttpCellTransport, type CellTransport } from "@t3tools/provider-cell/server";
 import { CellSettings } from "@t3tools/provider-cell/settings";
 import { CELL_REPLAY_PROTOCOL } from "@t3tools/provider-cell/testing";
@@ -96,6 +107,7 @@ const PROMPTS = {
   afterLimit: "Respond with exactly: after the limit ok",
   reconnect: "Hold: Respond with exactly: reconnect ok",
   restart: "Hold: Respond with exactly: RESUMED",
+  attachRetry: "Respond with exactly: attach retry ok",
 } as const;
 
 /** The adapter runs on the test clock; the cell on the wall clock. */
@@ -127,6 +139,15 @@ const layerWebSocketConstructor = Layer.succeed(Socket.WebSocketConstructor)(mak
 
 let holdConnectUntil = 0;
 let onPromptAccepted: ((body: string) => void) | undefined;
+let firstSocketCut = false;
+let onTaskCancelAnswered:
+  | ((answer: {
+      readonly url: string;
+      readonly headers: Readonly<Record<string, string>>;
+      readonly status: number;
+      readonly body: string;
+    }) => void)
+  | undefined;
 const redact = (headers: Readonly<Record<string, string>>) =>
   Object.fromEntries(
     Object.entries(headers).map(([key, value]) => [
@@ -152,6 +173,14 @@ const loggingTransport = (live: CellTransport): CellTransport => ({
       if (input.method === "POST" && input.url.endsWith("/prompt") && response.status === 202) {
         onPromptAccepted?.(response.body);
       }
+      if (input.method === "POST" && /\/tasks\/[^/]+\/cancel$/.test(input.url)) {
+        onTaskCancelAnswered?.({
+          url: input.url,
+          headers: input.headers,
+          status: response.status,
+          body: response.body,
+        });
+      }
       return response;
     }),
   connect: (input) =>
@@ -163,8 +192,31 @@ const loggingTransport = (live: CellTransport): CellTransport => ({
       }
       log(`ws connect ${input.url} headers=${JSON.stringify(redact(input.headers))}`);
       const connection = yield* live.connect(input);
+      // attach-retry: the first connection delivers up to `state` and nothing
+      // after it, then is terminated, so its roster never arrives.
+      const cut = scenarioName === "attach-retry" && !firstSocketCut;
+      if (cut) firstSocketCut = true;
+      let cutDone = false;
       return {
         pull: connection.pull.pipe(
+          Effect.map((frames) => {
+            if (!cut) return frames;
+            if (cutDone) {
+              for (const frame of frames)
+                log(`attach-retry: dropped on the cut ws: ${frame.slice(0, 200)}`);
+              return [];
+            }
+            const index = frames.findIndex((frame) => frame.startsWith('{"type":"state"'));
+            if (index === -1) return frames;
+            cutDone = true;
+            const kept = frames.slice(0, index + 1);
+            const socket = latestSocket;
+            log(
+              `attach-retry: delivering ${kept.length} frame(s) up to state, dropping ${frames.length - kept.length}, terminating ws#${socketOrdinal}`,
+            );
+            setTimeout(() => socket?.terminate(), 0);
+            return kept;
+          }),
           Effect.tap((frames) =>
             Effect.sync(() => {
               for (const frame of frames) log(`ws <- ${frame.slice(0, 700)}`);
@@ -277,6 +329,10 @@ const stepsFor = (name: string): ReadonlyArray<OrchestratorFixtureInputStep> => 
       ];
     case "restart":
       return [{ type: "message", text: PROMPTS.restart }];
+    case "attach-retry":
+      return [{ type: "message", text: PROMPTS.attachRetry }];
+    case "delete-delegate":
+      return [{ type: "message", text: PROMPTS.delegate }];
     default:
       throw new Error(`Unknown scenario ${name}`);
   }
@@ -328,6 +384,84 @@ const main = Effect.gen(function* () {
     };
   }
 
+  if (scenarioName === "delete-delegate") {
+    const workspace = yield* checkpointWorkspace("live-delete-delegate");
+    const threadId = materialized.projectionThreadIds[0]!;
+    const firstIdle = materialized.steps.findIndex((step) => step.type === "await_thread_idle");
+    const scenario = {
+      name: `${transcript.scenario}:delete`,
+      transcript,
+      commands: materialized.commands,
+      steps: materialized.steps.slice(0, firstIdle),
+      projectionThreadIds: materialized.projectionThreadIds,
+      runtimePolicyOverride: { cwd: workspace },
+    };
+    const cancelAnswered = new Promise<Parameters<NonNullable<typeof onTaskCancelAnswered>>[0]>(
+      (resolve) => {
+        onTaskCancelAnswered = resolve;
+      },
+    );
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        yield* runOrchestratorV2Scenario(scenario);
+        const running = yield* until(
+          orchestrator.getThreadProjection(threadId),
+          (current) =>
+            current.runs[0]?.status === "completed" &&
+            current.subagents.some((task) => task.status === "running"),
+          "the first run to complete while its delegated task still runs",
+        );
+        report("delete-delegate:before-delete", running);
+        log("delete-delegate: dispatching thread.delete");
+        yield* orchestrator.dispatch({
+          type: "thread.delete",
+          commandId: CommandId.make(`command:live-delete-${runTag}`),
+          threadId,
+        });
+        const settled = yield* until(
+          orchestrator.getThreadProjection(threadId),
+          (current) =>
+            current.thread.deletedAt !== null &&
+            current.subagents.every((task) => task.status !== "running"),
+          "the deletion to settle the task rows",
+        );
+        report("delete-delegate:after-delete", settled);
+        // The session detach the deletion queues sends the cancel.
+        const answer = yield* Effect.promise(() => cancelAnswered).pipe(
+          Effect.timeoutOrElse({
+            duration: "30 seconds",
+            orElse: () => Effect.die(new Error("The deletion sent the cell no task cancel")),
+          }),
+          TestClock.withLive,
+        );
+        if (answer.status !== 200)
+          return yield* Effect.die(new Error(`The cell answered ${answer.status} to the cancel`));
+        const tasks = yield* transport.request({
+          method: "GET",
+          url: answer.url.replace(/\/tasks\/[^/]+\/cancel$/, "/tasks"),
+          headers: answer.headers,
+        });
+        const taskId = /\/tasks\/([^/]+)\/cancel$/.exec(answer.url)?.[1];
+        const listed = (
+          JSON.parse(tasks.body) as ReadonlyArray<{ taskId: string; status: string }>
+        ).find((task) => task.taskId === taskId);
+        if (listed?.status !== "cancelled")
+          return yield* Effect.die(
+            new Error(`The cell lists task ${taskId} as ${listed?.status ?? "missing"}`),
+          );
+        log(`delete-delegate: check passed: the cell cancelled task ${taskId}`);
+      }).pipe(
+        Effect.provide(
+          ProviderReplayHarness.layerProviderReplay(scenario, harness, {
+            runContinuationWorker: true,
+          }),
+        ),
+      ),
+    );
+    return;
+  }
+
   if (scenarioName !== "restart") {
     const workspace = yield* checkpointWorkspace(`live-${scenarioName}`);
     const result = yield* runOrchestratorV2ProviderReplayScenario(
@@ -352,6 +486,24 @@ const main = Effect.gen(function* () {
       )
       .join(" ");
     log(`provider-thread.updated history (status:pendingBackgroundTasks): ${rosterHistory}`);
+    if (scenarioName === "attach-retry") {
+      const [projection] = result.projections.values();
+      const answered = projection?.turnItems.some(
+        (item) => item.type === "assistant_message" && item.text.trim() === "attach retry ok",
+      );
+      if (
+        !firstSocketCut ||
+        socketOrdinal < 2 ||
+        projection?.runs[0]?.status !== "completed" ||
+        !answered
+      )
+        return yield* Effect.die(
+          new Error(
+            `attach-retry: expected the first socket cut and the prompt completed on a later one (sockets ${socketOrdinal}, run ${projection?.runs[0]?.status})`,
+          ),
+        );
+      log(`attach-retry: check passed: ${socketOrdinal} sockets, the prompt completed`);
+    }
     return;
   }
 

@@ -202,6 +202,13 @@ const EVENTS_PAGE_LIMIT = 1_000;
 /** How long a connection may go without its `tasks` roster after `state` before it is dropped. */
 const ROSTER_TIMEOUT_MS = 10_000;
 /**
+ * How long one task's cancel may take when a deleted thread's tasks are
+ * cancelled, and how many go out at once: a cancel that stalls leaves the
+ * others to be tried within the session manager's overall bound on the hook.
+ */
+const TASK_CANCEL_TIMEOUT_MS = 3_000;
+const TASK_CANCEL_CONCURRENCY = 4;
+/**
  * How many connections in a row may fail to deliver a usable snapshot before
  * the active turn stops waiting on them. Reconnecting goes on regardless.
  */
@@ -2367,29 +2374,43 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         // runs for it are asked to stop, best effort, so they do not run on
         // for a thread that no longer exists. The deletion settled their rows
         // itself; a cancel the cell refuses or does not answer changes
-        // nothing here, and a task the cell no longer lists needs none.
+        // nothing here, and a task the cell no longer lists needs none. Each
+        // cancel has its own bound and they go out a few at a time, so one
+        // the cell does not answer does not keep the others from being sent.
         cancelBackgroundWork: (args) =>
           Effect.gen(function* () {
             if (closed || project === undefined || thread?.appThreadId !== args.threadId) return;
             const running = [...tasks.values()].filter(
               (record) => taskStatus(record.task.status) === "running",
             );
-            for (const record of running) {
-              const taskId = record.task.taskId;
-              const response = yield* request(
-                "POST",
-                `/tasks/${encodeURIComponent(taskId)}/cancel`,
-              ).pipe(Effect.result);
-              if (Result.isFailure(response)) {
-                yield* Effect.logWarning(
-                  `Could not ask the cell to cancel task ${taskId} (${args.reason}): ${response.failure.message}`,
-                );
-              } else if (response.success.status >= 300) {
-                yield* Effect.logWarning(
-                  `The cell answered ${response.success.status} to cancelling task ${taskId} (${args.reason})`,
-                );
-              }
-            }
+            yield* Effect.forEach(
+              running,
+              (record) =>
+                Effect.gen(function* () {
+                  const taskId = record.task.taskId;
+                  const response = yield* request(
+                    "POST",
+                    `/tasks/${encodeURIComponent(taskId)}/cancel`,
+                  ).pipe(
+                    Effect.timeoutOrElse({
+                      duration: Math.min(requestTimeoutMs, TASK_CANCEL_TIMEOUT_MS),
+                      orElse: () =>
+                        Effect.fail(protocolError(`Cell POST cancel of task ${taskId} timed out`)),
+                    }),
+                    Effect.result,
+                  );
+                  if (Result.isFailure(response)) {
+                    yield* Effect.logWarning(
+                      `Could not ask the cell to cancel task ${taskId} (${args.reason}): ${response.failure.message}`,
+                    );
+                  } else if (response.success.status >= 300) {
+                    yield* Effect.logWarning(
+                      `The cell answered ${response.success.status} to cancelling task ${taskId} (${args.reason})`,
+                    );
+                  }
+                }),
+              { concurrency: TASK_CANCEL_CONCURRENCY, discard: true },
+            );
           }).pipe(commands.withPermits(1)),
         ensureThread: (args) =>
           register(args).pipe(

@@ -331,6 +331,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     }) => Effect.Effect<void>;
     readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
     readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
+    readonly cancelBackgroundWork?: ProviderAdapter.ProviderAdapterV2SessionRuntime["cancelBackgroundWork"];
     readonly backgroundTasksEndWithProcess?: boolean;
     readonly hangSessionScopeClose?: boolean;
     readonly startTurn?: Effect.Effect<void>;
@@ -423,6 +424,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
             : {
                 hasPendingBackgroundWorkForThread: () => options.hasPendingBackgroundWorkForThread!,
               }),
+          ...(options.cancelBackgroundWork === undefined
+            ? {}
+            : { cancelBackgroundWork: options.cancelBackgroundWork }),
           ensureThread: () => unimplemented("ensureThread unused in test"),
           resumeThread: (threadInput) =>
             Ref.update(state, (current) => ({
@@ -480,6 +484,7 @@ function layerTest(input: {
   };
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
+  readonly cancelBackgroundWork?: ProviderAdapter.ProviderAdapterV2SessionRuntime["cancelBackgroundWork"];
   readonly backgroundTasksEndWithProcess?: boolean;
   readonly hangSessionScopeClose?: boolean;
   readonly startTurn?: Effect.Effect<void>;
@@ -511,6 +516,9 @@ function layerTest(input: {
       ...(input.hasPendingBackgroundWorkForThread === undefined
         ? {}
         : { hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread }),
+      ...(input.cancelBackgroundWork === undefined
+        ? {}
+        : { cancelBackgroundWork: input.cancelBackgroundWork }),
       ...(input.backgroundTasksEndWithProcess === undefined
         ? {}
         : { backgroundTasksEndWithProcess: input.backgroundTasksEndWithProcess }),
@@ -2641,6 +2649,73 @@ it.effect("ProviderSessionManagerV2 terminal detach revokes the thread's MCP cre
 
     yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1_000, mcpConfigs })));
   }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 completes a detach whose background-work cancellation throws before returning its effect",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const mcpConfigs = yield* Ref.make<
+        ReadonlyArray<McpProviderSession.McpProviderSessionConfig | undefined>
+      >([]);
+      let cancelCalls = 0;
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const registry = yield* McpSessionRegistry.McpSessionRegistry;
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread-provider-session-manager-throwing-cancel");
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        const token = (yield* Ref.get(mcpConfigs))
+          .at(-1)
+          ?.authorizationHeader.replace(/^Bearer\s+/, "");
+        assert.isDefined(yield* registry.resolve(token!));
+
+        yield* manager.detach({
+          providerSessionId,
+          threadId,
+          detail: "Thread deleted.",
+          revokeMcpCredential: true,
+          cancelBackgroundWork: true,
+        });
+
+        assert.equal(cancelCalls, 1, "the hook was asked once");
+        assert.isUndefined(yield* registry.resolve(token!), "the credential is revoked");
+        assert.isUndefined(yield* mcpSessions.read(threadId));
+        assert.isTrue(
+          Option.isNone(yield* manager.get(providerSessionId)),
+          "the session is released",
+        );
+        assert.equal((yield* Ref.get(state)).closeCount, 1);
+      });
+
+      yield* effect.pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60_000,
+            capabilities: ExclusiveCapabilities,
+            mcpConfigs,
+            // Throws while building its effect, before there is one to fail.
+            cancelBackgroundWork: () => {
+              cancelCalls += 1;
+              throw new Error("hook threw synchronously");
+            },
+          }),
+        ),
+      );
+    }),
 );
 
 it.effect("ProviderSessionManagerV2 releases idle sessions without sweeping all sessions", () =>

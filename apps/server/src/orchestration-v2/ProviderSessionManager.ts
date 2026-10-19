@@ -2326,11 +2326,15 @@ export const layerWithOptions = (
             ) {
               // Best effort, before the session is released: the deletion
               // settled the work's rows already, so a refusal or a timeout
-              // here changes nothing in the thread.
-              yield* cancelBackgroundWork({
-                threadId: input.threadId,
-                reason: input.detail ?? "Thread detached.",
-              }).pipe(
+              // here changes nothing in the thread. Suspended, so a hook that
+              // throws before returning its effect is a defect handled like
+              // any other failure of it, not one that aborts the detach.
+              yield* Effect.suspend(() =>
+                cancelBackgroundWork({
+                  threadId: input.threadId,
+                  reason: input.detail ?? "Thread detached.",
+                }),
+              ).pipe(
                 Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
                 Effect.catchCause((cause) =>
                   Effect.logWarning(

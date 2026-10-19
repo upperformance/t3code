@@ -5,6 +5,15 @@
  * verifies the recording by replaying it. Pass `--url https://<tenant>` to
  * record against a tenant; without it the fake cell from
  * `@t3tools/provider-cell/testing` answers on a local port.
+ *
+ *   node scripts/record-cell-replay-fixture.ts --scenario <name> [--url <cell> --version <cell version>] [--token t] [--out <file> | --write-fixture]
+ *
+ * The recording goes to `--out`, to the checked-in transcript with
+ * `--write-fixture`, and otherwise to a scratch directory. It is written to
+ * `<path>.partial` and only takes `<path>`'s place once its replay verified
+ * it, so a failed recording never replaces a transcript; the failed one stays
+ * at `<path>.partial` for inspection. A live recording for the checked-in
+ * transcript needs `--version`, the version the cell reports in `GET state`.
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -46,6 +55,7 @@ function readArgValue(name: string): string | undefined {
 }
 
 const scenario = readArgValue("--scenario");
+const writeFixture = process.argv.includes("--write-fixture");
 const fixture = ORCHESTRATOR_REPLAY_FIXTURES.find((entry) => entry.name === scenario);
 const variant = fixture?.providers.find((provider) => provider.driver === CELL_PROVIDER_KIND);
 if (fixture === undefined || variant === undefined) {
@@ -78,8 +88,25 @@ const followWallClock = Effect.gen(function* () {
 const record = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const outputPath = readArgValue("--out") ?? (yield* path.fromFileUrl(variant.transcriptFile));
   const requestedUrl = readArgValue("--url");
+  const requestedOut = readArgValue("--out");
+  if (requestedOut !== undefined && writeFixture) {
+    return yield* Effect.die(new Error("Pass either --out or --write-fixture, not both"));
+  }
+  if (writeFixture && requestedUrl !== undefined && readArgValue("--version") === undefined) {
+    return yield* Effect.die(
+      new Error("A live recording for the checked-in transcript needs --version <cell version>"),
+    );
+  }
+  const outputPath =
+    requestedOut ??
+    (writeFixture
+      ? yield* path.fromFileUrl(variant.transcriptFile)
+      : path.join(
+          yield* fs.makeTempDirectory({ prefix: "cell-recording-" }),
+          path.basename(yield* path.fromFileUrl(variant.transcriptFile)),
+        ));
+  const partialPath = `${outputPath}.partial`;
   const fake =
     requestedUrl === undefined ? yield* Effect.promise(() => startFakeCellServer()) : undefined;
   if (fake) yield* Effect.addFinalizer(() => Effect.promise(() => fake.close()));
@@ -162,10 +189,11 @@ const record = Effect.gen(function* () {
     entries,
   } satisfies ProviderReplayTranscript;
 
-  // Written before the verification replay, so a failed verification leaves
-  // the recording behind for inspection instead of only its error.
+  // Written beside the destination before the verification replay, so a
+  // failed verification leaves the recording behind for inspection without
+  // replacing what is there; it takes the destination's place once verified.
   yield* fs.makeDirectory(path.dirname(outputPath), { recursive: true });
-  yield* fs.writeFileString(outputPath, encodeTranscriptNdjson(transcript));
+  yield* fs.writeFileString(partialPath, encodeTranscriptNdjson(transcript));
   yield* Effect.gen(function* () {
     const replayWorkspace = yield* checkpointWorkspace(fixture.name, fixtureInput.workspaceFiles);
     const materialized = yield* materializeInput;
@@ -182,7 +210,14 @@ const record = Effect.gen(function* () {
       continuationOptions,
     );
     variant.assertOutput(replayResult, transcript);
-  }).pipe(Effect.scoped, provideDeterministicTestRuntime);
+  }).pipe(
+    Effect.scoped,
+    provideDeterministicTestRuntime,
+    Effect.tapCause(() =>
+      Console.error(`The recording failed verification; it is at ${partialPath}`),
+    ),
+  );
+  yield* fs.rename(partialPath, outputPath);
   yield* Console.log(
     `Wrote and verified ${transcript.entries.length} cell replay entries at ${outputPath}`,
   );

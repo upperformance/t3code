@@ -511,6 +511,27 @@ export class RunExecutionIngestError extends Schema.TaggedError<RunExecutionInge
   }
 }
 
+/**
+ * The provider session's event stream failed, as a session release fails it,
+ * as opposed to a failure storing what the stream delivered.
+ */
+const isRunExecutionIngestError = Schema.is(RunExecutionIngestError);
+const isProviderAdapterEventStreamError = Schema.is(
+  ProviderAdapter.ProviderAdapterEventStreamError,
+);
+const isProviderEventStreamEnd = (cause: Cause.Cause<unknown>) => {
+  const failures = cause.reasons.filter(Cause.isFailReason);
+  return (
+    failures.length > 0 &&
+    failures.length === cause.reasons.length &&
+    failures.every(
+      (reason) =>
+        isRunExecutionIngestError(reason.error) &&
+        isProviderAdapterEventStreamError(reason.error.cause),
+    )
+  );
+};
+
 export const RunExecutionServiceV2Error = Schema.Union([
   RunExecutionStartError,
   RunExecutionIngestError,
@@ -1295,16 +1316,25 @@ export const layer: Layer.Layer<
               }),
             ),
             // Server shutdown interrupts the subscription and leaves the run to
-            // restart recovery; every other failure fails the run.
+            // restart recovery; every other failure fails the run. Once the
+            // run has settled, the session's stream ending (a detach releasing
+            // the session, as a thread deletion does) only ends the watch on
+            // the run's background work: it is noted, not warned about.
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) =>
                 Ref.get(rootRunFinalized).pipe(
                   Effect.flatMap((finalized) =>
-                    Effect.logWarning("orchestration V2 provider event ingestion failed", {
-                      runId: input.run.id,
-                      cause,
-                    }).pipe(
+                    (finalized && isProviderEventStreamEnd(cause)
+                      ? Effect.logInfo(
+                          "orchestration V2 provider event stream ended after its run settled",
+                          { runId: input.run.id, cause },
+                        )
+                      : Effect.logWarning("orchestration V2 provider event ingestion failed", {
+                          runId: input.run.id,
+                          cause,
+                        })
+                    ).pipe(
                       Effect.andThen(
                         finalized
                           ? Effect.void

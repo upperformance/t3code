@@ -14,6 +14,7 @@ import {
   type OrchestrationV2ProviderThread,
   type ProviderReplayEntry,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -1268,7 +1269,7 @@ describe("CellAdapterV2 over the fake cell", () => {
           providerSessionId: ProviderSessionId.make("session-cell-2"),
           resume: first,
         });
-        const startedAt = Date.now();
+        const startedAt = yield* Clock.currentTimeMillis;
         yield* resumed.runtime
           .startTurn(yield* turnInput(resumed.providerThread, "Respond with exactly: ONE", 2))
           .pipe(seeded);
@@ -1282,7 +1283,7 @@ describe("CellAdapterV2 over the fake cell", () => {
         assert.equal(failureOf(terminal)?.class, "transport_error");
         assert.include(failureOf(terminal)?.message ?? "", "not new to the cell");
         assert.include(failureOf(terminal)?.message ?? "", "run-1");
-        assert.isBelow(Date.now() - startedAt, 5_000);
+        assert.isBelow((yield* Clock.currentTimeMillis) - startedAt, 5_000);
         assert.deepEqual(
           fake.prompts(project),
           ["Respond with exactly: ONE"],
@@ -1341,6 +1342,65 @@ describe("CellAdapterV2 over the fake cell", () => {
           ["ab12"],
           "a task already ended is not cancelled again",
         );
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live(
+    "the deletion hook still sends the other tasks' cancels while the first one stalls, and gives up on it at its own bound",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* fakeCell({
+          delegateDelayMs: 60_000,
+          script: () => [
+            ...["ab12", "cd34", "ef56"].map((taskId) => ({
+              type: "delegate" as const,
+              taskId,
+              title: `review ${taskId}`,
+              summary: `The review ${taskId} is done.`,
+              wake: [],
+            })),
+            { type: "assistant", text: "STARTED" },
+          ],
+        });
+        const live = yield* liveTransport;
+        const answered = yield* Queue.unbounded<string>();
+        let firstSettled = false;
+        // The cell never answers the first task's cancel.
+        const transport: CellTransport = {
+          ...live,
+          request: (request) => {
+            const taskId = /\/tasks\/([^/]+)\/cancel$/.exec(new URL(request.url).pathname)?.[1];
+            if (taskId === "ab12")
+              return Effect.never.pipe(Effect.ensuring(Effect.sync(() => (firstSettled = true))));
+            return live
+              .request(request)
+              .pipe(
+                Effect.tap(() =>
+                  taskId === undefined ? Effect.void : Queue.offer(answered, taskId),
+                ),
+              );
+          },
+        };
+        const made = yield* makeAdapter(transport, fake.baseUrl, { requestTimeoutMs: 2_000 });
+        const harness = yield* openHarness(made);
+        const project = yield* cellProjectName("t3-", THREAD_ID);
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Delegate three reviews."),
+        );
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
+        const hook = yield* harness.runtime.cancelBackgroundWork!({
+          threadId: THREAD_ID,
+          reason: "Thread deleted.",
+        }).pipe(Effect.forkChild);
+        const others = [yield* Queue.take(answered), yield* Queue.take(answered)];
+        assert.deepEqual(others.toSorted(), ["cd34", "ef56"]);
+        assert.isFalse(firstSettled, "the other cancels went out while the first was still out");
+        assert.deepEqual(fake.taskCancels(project).toSorted(), ["cd34", "ef56"]);
+        const startedAt = yield* Clock.currentTimeMillis;
+        yield* Fiber.join(hook);
+        assert.isTrue(firstSettled, "the stalled cancel was given up at its own bound");
+        assert.isBelow((yield* Clock.currentTimeMillis) - startedAt, 5_000);
       }).pipe(Effect.scoped, Effect.provide(liveLayer)),
   );
 });
