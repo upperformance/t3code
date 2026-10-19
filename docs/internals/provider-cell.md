@@ -729,7 +729,8 @@ there and the prompt has to complete on the second connection;
 `delete-delegate` deletes the thread once its run completed while the
 delegated child still runs (the scripted API holds the child for
 `CHILD_DELAY_MS`), waits for the task's cancel to be sent, then reads the
-cell's `GET tasks` on its own for up to 35 s, since the adapter may stop
+cell's `GET tasks` on its own for up to 35 s on the wall clock, each request
+bounded by what is left of that deadline, since the adapter may stop
 waiting for the answer before the cell carries the cancel out: it passes
 when the cell lists the task as cancelled or no longer lists it, and its
 failure says whether the cancel was never sent or was sent and what, if
@@ -739,7 +740,10 @@ status probe Settings shows against the live cell and against stand-ins for
 an old-protocol tenant, a protocol-2 tenant, an HTML server, a 404, a tenant
 without a key and a closed port.
 
-To repeat the run:
+To repeat the run (celld and every driver or recorder run leave small
+directories under `TMPDIR`: celld's asset cache, and empty
+`t3-orchestration-v2-replay-*` directories, so on a machine short of inodes
+set `TMPDIR` to a scratch path for all of them):
 
 1. Build the cell from upperformance/vim `main` (`./scripts/build-cell.sh`
    there; vim's README, "Cell edition", lists what the build needs) and
@@ -756,18 +760,18 @@ To repeat the run:
    `CHILD_DELAY_MS` (default 4 s); the wake gets `WAKE_DONE`; a prompt
    asking to repeat the previous answer gets it back. The header comment
    lists them.
-3. Point the cell at it: in vim, `dist/cell/.dev.vars` holds
-   `OPENAI_API_KEY=` any value and
+3. Point the cell at it: in vim, write `dist/cell/.dev.vars` after each
+   build (the build recreates `dist/cell`, dropping the file and the cell's
+   local state) with the two lines `OPENAI_API_KEY=sk-test` (any non-empty
+   value: an empty key leaves the cell unconfigured) and
    `OPENAI_BASE_URL=http://127.0.0.1:9815/v1`.
 4. Start the cell with clean state:
    `CELLD_ESBUILD=$PWD/cell/node_modules/.bin/esbuild celld dev dist/cell --port 9884 --clean --no-watch`
    from vim; the cell reports itself in `GET state` (version `0.3.0` at the
    time of the recordings).
 5. From `apps/server`: `node scripts/live-cell-probe.ts --url http://127.0.0.1:9884`,
-   then each driver scenario with
-   `node scripts/live-cell-driver.ts --scenario <name> --url http://127.0.0.1:9884 --log <dir>`
-   (for `delete-delegate`, restart the API with `CHILD_DELAY_MS=30000` so
-   the child is still running when the thread is deleted).
+   then each driver scenario but `delete-delegate` with
+   `node scripts/live-cell-driver.ts --scenario <name> --url http://127.0.0.1:9884 --log <dir>`.
 6. Record each fixture to a scratch path:
    `node scripts/record-cell-replay-fixture.ts --scenario <name> --url http://127.0.0.1:9884 --out <scratch>/<name>.ndjson`.
    Each fixture records once per cell start; recording one again needs the
@@ -776,6 +780,11 @@ To repeat the run:
    with the run that ended last, which the adapter fails at once as a stale
    acceptance. Every driver run gets its own thread
    (`--tag`, by default the time), so the drivers need no restart.
+7. Run `delete-delegate` last, after the recordings: restart the API with
+   `CHILD_DELAY_MS=30000` so the child is still running when the thread is
+   deleted, then run the driver as in step 5. The delay slows every
+   delegation (`cell_wake` records in about 33 s instead of 7 s), so
+   restart the API without it before anything else.
 
 Refreshing the checked-in transcripts is a deliberate step of its own:
 `--write-fixture --version <the version GET state reports>` in place of
