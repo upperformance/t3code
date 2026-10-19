@@ -1,5 +1,5 @@
 // A scripted OpenAI Responses API for the live cell run: point a cell's
-// `OPENAI_BASE_URL` at it and the live driver's scenarios and the six cell
+// `OPENAI_BASE_URL` at it and the live driver's scenarios and the seven cell
 // fixtures get deterministic answers. Plain Node, no dependencies.
 //
 //   node scripts/live-cell-api.mjs [port=9815] [holdMs=20000]
@@ -14,6 +14,9 @@
 //   "Delegate a <title> to a child cell. Reply with exactly: A. When the child
 //    reports, reply with exactly: B"             -> calls delegate_task with the brief
 //                                                   "Review the project", then says A
+//   the same with "Then fail with: E." after A   -> calls delegate_task and says A in one step,
+//                                                   then answers the run's next step with a
+//                                                   500 whose error message is E
 //   "[Delegated task ..." (the wake)             -> says WAKE_WORD (default WAKE_DONE)
 //   "Review the project" (the child's brief)     -> waits CHILD_DELAY_MS (default 4000), calls
 //                                                   shell `echo reviewed > review.txt`, says "Reviewed."
@@ -48,7 +51,7 @@ const call = (name, args) => ({
 });
 
 const DELEGATE =
-  /Delegate a (\w+) to a child cell\. Reply with exactly: (\S+)\. When the child reports, reply with exactly: (\S+)/;
+  /Delegate a (\w+) to a child cell\. Reply with exactly: (\S+)\.(?: Then fail with: ([^.]+)\.)? When the child reports, reply with exactly: (\S+)/;
 const ANSWER = /(?:Respond with|write) (?:exactly|the following text): (.+?)\s*$/im;
 
 NodeHttp.createServer((req, res) => {
@@ -86,12 +89,16 @@ NodeHttp.createServer((req, res) => {
 
     const delegated = DELEGATE.exec(prompt);
     if (delegated) {
-      if (step === 0) {
-        return ok([
-          call("delegate_task", { task: "Review the project", title: delegated[1], mode: "async" }),
-        ]);
-      }
-      return ok([say(delegated[2])]);
+      const delegate = call("delegate_task", {
+        task: "Review the project",
+        title: delegated[1],
+        mode: "async",
+      });
+      const failWith = delegated[3];
+      if (failWith === undefined) return ok(step === 0 ? [delegate] : [say(delegated[2])]);
+      // The run says A after delegating, so the step after the tool's answer can fail it.
+      if (step === 0) return ok([delegate, say(delegated[2])]);
+      return json(500, { error: { type: "server_error", message: failWith } });
     }
     if (prompt.startsWith("[Delegated task")) return ok([say(WAKE_WORD)]);
     if (prompt.startsWith("Review the project")) {
