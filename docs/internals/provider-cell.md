@@ -44,9 +44,15 @@ directory as nothing more than the thread's home in the sidebar.
   cleared, and the cell is asked, best effort, to cancel each task it still
   runs for the thread (`POST tasks/<id>/cancel`, the session runtime's
   `cancelBackgroundWork`, called from the session detach the deletion
-  queues) when the thread's session is open at the time. A task the cell goes
-  on running after that, because no session was open or the cell refused,
-  keeps its result in the cell's transcript only. Attaching a thread to a cell project that already
+  queues) when the thread's session is open at the time. Each task's cancel
+  is bounded on its own (three seconds, or the request bound if that is
+  shorter) and four go out at a time, so one the cell does not answer keeps
+  none of the others from being sent; the session manager bounds the whole
+  hook at ten seconds, the wait for the adapter's command permit included,
+  and goes on with the detach whatever the hook did, a hook that throws
+  included. A task the cell goes
+  on running after that, because no session was open, the cell refused or a
+  bound ran out, keeps its result in the cell's transcript only. Attaching a thread to a cell project that already
   exists goes through the contract's `initialNativeThreadId`, which the
   adapter honours; offering it in the UI needs the native-session listing
   (`nativeSessions.canList`) and a tenant API to list projects, both
@@ -665,11 +671,17 @@ repeat; refusals as `{ runId, error }`; a cancel that names its run; replies
 to its own clients' socket prompts; standalone errors; a delegated task
 announced as `starting` before the tool answers and `running` once the child
 accepted its prompt, cancelled through `POST tasks/<id>/cancel`) and answers
-the shared fixture prompts the way the cell does. The checked-in transcripts
-were recorded against a live tenant, celld dev running the cell of
-upperformance/vim `main` (the cell reports itself as version 0.3.0) with a
-scripted Responses API behind it, and verified by replay; the fake cell is
-for a recording without a tenant. The task's three states are why
+the shared fixture prompts the way the cell does. All six checked-in
+transcripts were recorded live (`generatedBy: live-cell-recorder`, version
+`0.3.0`) against celld dev running the cell of upperformance/vim `main`, which
+speaks level 3, with a scripted Responses API behind it, and verified by
+replay; the fake cell is for a recording without a tenant. The recorder
+writes the checked-in transcript only when asked (`--write-fixture`); without
+it, or `--out`, the recording goes to a scratch directory. Either way it is
+written to `<path>.partial` first and takes `<path>`'s place only once its
+replay verified it, so a failed recording, a stale acceptance on a kept cell
+included, never replaces a transcript and stays at `<path>.partial` for
+inspection. The task's three states are why
 `cell_wake` holds the third `task` event, the child's completion, behind its
 gate: the first two are inside the delegating run. The restart itself is not a transcript:
 `CellRestartAdoption.integration.test.ts` runs two orchestrator runtimes over
@@ -682,9 +694,15 @@ subagent row the first server showed, which goes from running to completed
 and stays the thread's only one. Its waits are driven by the thread's stored
 events and bounded on the wall clock, and the orchestrator's test clock is
 moved by the test alone, between the two servers.
+`CellThreadDeletion.integration.test.ts` deletes a thread whose completed run
+left a delegated child running against the fake cell and checks that the
+detach asks the cell to cancel the task and that the release ending the
+settled run's event stream is logged as information, not as the ingestion
+failure it was logged as before: once a run has settled, a session release
+ending its stream only ends the watch on its background work.
 
 The live run is not a test either, since it needs a running cell.
-`apps/server/scripts/live-cell-driver.ts --scenario shell|interrupt|limit|delegate|reconnect|restart --url <cell> [--tag t] [--log dir]`
+`apps/server/scripts/live-cell-driver.ts --scenario shell|interrupt|limit|delegate|reconnect|restart|attach-retry|delete-delegate --url <cell> [--tag t] [--log dir]`
 runs the real orchestrator and adapter against a cell on celld for what the
 fixtures cannot express and logs every request, response and socket frame
 with a wall-clock stamp to `<log>/<scenario>.frames.log`, with the thread's
@@ -693,15 +711,24 @@ the 202 and holds the next connect (`RECONNECT_HOLD_MS`, default 25 s) so
 the run's output lands in the gap and has to be read back; `restart` runs
 two orchestrator runtimes over one SQLite file and stops the first the way
 the server stops; `delegate` runs the continuation worker so the wake
-reaches the thread. `live-cell-probe.ts --url <cell>` runs the status probe
+reaches the thread; `attach-retry` lets the first socket deliver `state` and
+nothing after it before terminating it (1006), so the roster never arrives
+there and the prompt has to complete on the second connection;
+`delete-delegate` deletes the thread once its run completed while the
+delegated child still runs (the scripted API holds the child for
+`CHILD_DELAY_MS`) and fails unless the cell answered the task's cancel and
+lists the task as cancelled. The two new scenarios check their outcome and
+exit non-zero when it is not met. `live-cell-probe.ts --url <cell>` runs the status probe
 Settings shows against the live cell and against stand-ins for an
 old-protocol tenant, a protocol-2 tenant, an HTML server, a 404, a tenant
 without a key and a closed port. To repeat the run, start celld on a built
 cell bundle whose `.dev.vars` points `OPENAI_BASE_URL` at a scripted
 Responses API that answers the fixture prompts (the vim repository's
-`docs/cell-edition.md` describes the build), record each fixture with
-`node scripts/record-cell-replay-fixture.ts --scenario <name> --url <cell>`,
-then run the drivers. Every driver run gets its own thread (`--tag`), and a
+`docs/cell-edition.md` describes the build), record each fixture from
+`apps/server` with
+`node scripts/record-cell-replay-fixture.ts --scenario <name> --url <cell> --version 0.3.0 --write-fixture`
+(the version the cell reports in `GET state`; the recorder refuses
+`--write-fixture` against a cell without `--version`), then run the drivers. Every driver run gets its own thread (`--tag`), and a
 fixture is re-recorded only against a cell started afresh (`--clean`): the
 deterministic test runtime mints the same request id every run, and a kept
 cell answers it with the run that ended last, which the adapter fails at
@@ -738,7 +765,11 @@ continuation taking back the run the last session owned while the cell still
 runs it and settling from the log when it ended in the gap, a message sent
 meanwhile refused naming T3's own run and the run offered as a continuation,
 and the recorder numbering two turns' request ids on one log page, replayed
-with fresh ids. The reconnect races run over a hand-driven socket, since a
+with fresh ids. The ninth review's are too: the deletion hook sending the
+other tasks' cancels while the first one stalls and giving that one up at its
+own bound, and, in the session manager's tests, a cancellation hook that
+throws before returning its effect leaving the detach to complete, the
+credential revoked and the session released. The reconnect races run over a hand-driven socket, since a
 transcript walk cannot hold a prompt's answer until after the frames that
 race it; the ones that need the roster timeout and the backoff run on the
 test clock.
@@ -752,5 +783,3 @@ test clock.
   native-session listing, once the tenant can list projects.
 - A display name on the tenant, once the cell has an API for it.
 - Attachments through `PUT fs/file`, with the prompt naming the paths.
-- Fixtures recorded against a tenant, once celld speaks level 3 with the
-  request id.
