@@ -33,6 +33,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
@@ -46,6 +47,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
+import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
@@ -3734,6 +3736,104 @@ it.effect("refreshes pull requests after a provider stream exits with an error",
     );
     const error = written.find((item) => item.type === "error");
     assert.include(error?.failure.message ?? "", "provider event stream closed unexpectedly");
+  }),
+);
+
+const INGESTION_FAILED = "orchestration V2 provider event ingestion failed";
+const STREAM_ENDED = "orchestration V2 provider event stream ended after its run settled";
+
+const streamFailure = (key: string, cause: unknown) =>
+  new ProviderAdapter.ProviderAdapterEventStreamError({
+    driver,
+    providerSessionId: ProviderSessionId.make(`session:${key}`),
+    cause,
+  });
+const releasedBy = (reason: ProviderSessionManager.ProviderSessionReleaseReason) => (key: string) =>
+  streamFailure(
+    key,
+    new ProviderSessionManager.ProviderSessionReleasedError({
+      providerSessionId: ProviderSessionId.make(`session:${key}`),
+      reason,
+      detail: "Thread deleted.",
+    }),
+  );
+
+// Only T3's own release of the session, once the run has settled, is an
+// expected end of the watch on the run's background work.
+it.effect.each([
+  {
+    name: "a deliberate release after the run settled",
+    settled: true,
+    failure: releasedBy("manual_shutdown"),
+    logged: ["INFO", STREAM_ENDED],
+  },
+  {
+    name: "a deliberate release while the run is active",
+    settled: false,
+    failure: releasedBy("manual_shutdown"),
+    logged: ["WARN", INGESTION_FAILED],
+  },
+  {
+    name: "an unexpected connection failure after the run settled",
+    settled: true,
+    failure: (key: string) => streamFailure(key, "socket hang up"),
+    logged: ["WARN", INGESTION_FAILED],
+  },
+  {
+    name: "a release a runtime error forced after the run settled",
+    settled: true,
+    failure: releasedBy("runtime_error"),
+    logged: ["WARN", INGESTION_FAILED],
+  },
+  {
+    name: "a session-scoped request's persistence failure after the run settled",
+    settled: true,
+    failure: (key: string) =>
+      streamFailure(
+        key,
+        new ProviderEventIngestor.ProviderEventPublishError({
+          providerSessionId: ProviderSessionId.make(`session:${key}`),
+          eventCount: 3,
+          cause: "database unavailable",
+        }),
+      ),
+    logged: ["WARN", INGESTION_FAILED],
+  },
+] as const)("logs $name as $logged.0", ({ name, settled, failure, logged }) =>
+  Effect.gen(function* () {
+    const key = `stream-failure:${name}`;
+    const logs: Array<readonly [string, unknown]> = [];
+    const capture = Logger.make(({ logLevel, message }) => {
+      const [text] = Array.isArray(message) ? message : [message];
+      if (text === INGESTION_FAILED || text === STREAM_ENDED) logs.push([logLevel, text]);
+    });
+    const { observed } = yield* captureRootRunTermination({
+      key,
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        settled
+          ? // A delegated task keeps the settled run's stream open until it fails.
+            Stream.concat(
+              Stream.fromIterable([
+                {
+                  type: "subagent.updated",
+                  driver,
+                  subagent: makeRunOwnedSubagentFixture({
+                    ids,
+                    providerInstanceId: ProviderInstanceId.make("codex"),
+                    childThreadId: ids.childThreadId,
+                    driver,
+                    status: "running",
+                  }),
+                },
+                rootTerminalEvent(ids, "completed"),
+              ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
+              Stream.fail(failure(key)),
+            )
+          : Stream.fail(failure(key)),
+    }).pipe(Effect.provide(Logger.layer([capture])));
+    assert.deepEqual(logs, [[logged[0] === "INFO" ? "Info" : "Warn", logged[1]]]);
+    assert.deepEqual(observed, [settled ? "run:waiting" : "run:failed", "pull-requests-refreshed"]);
   }),
 );
 

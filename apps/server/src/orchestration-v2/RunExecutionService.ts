@@ -43,6 +43,7 @@ import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
+import { isDeliberateProviderSessionRelease } from "./ProviderSessionManager.ts";
 import type { ProjectionStoreV2Error } from "./ProjectionStore.ts";
 import {
   makeProviderFailure,
@@ -512,14 +513,15 @@ export class RunExecutionIngestError extends Schema.TaggedError<RunExecutionInge
 }
 
 /**
- * The provider session's event stream failed, as a session release fails it,
- * as opposed to a failure storing what the stream delivered.
+ * The provider session's event stream ended because T3 released the session
+ * (a detach, a close, an idle timeout), as opposed to a connection failure, a
+ * release a runtime error forced, or a failure storing what it delivered.
  */
 const isRunExecutionIngestError = Schema.is(RunExecutionIngestError);
 const isProviderAdapterEventStreamError = Schema.is(
   ProviderAdapter.ProviderAdapterEventStreamError,
 );
-const isProviderEventStreamEnd = (cause: Cause.Cause<unknown>) => {
+const isDeliberateSessionRelease = (cause: Cause.Cause<unknown>) => {
   const failures = cause.reasons.filter(Cause.isFailReason);
   return (
     failures.length > 0 &&
@@ -527,7 +529,8 @@ const isProviderEventStreamEnd = (cause: Cause.Cause<unknown>) => {
     failures.every(
       (reason) =>
         isRunExecutionIngestError(reason.error) &&
-        isProviderAdapterEventStreamError(reason.error.cause),
+        isProviderAdapterEventStreamError(reason.error.cause) &&
+        isDeliberateProviderSessionRelease(reason.error.cause.cause),
     )
   );
 };
@@ -1317,15 +1320,15 @@ export const layer: Layer.Layer<
             ),
             // Server shutdown interrupts the subscription and leaves the run to
             // restart recovery; every other failure fails the run. Once the
-            // run has settled, the session's stream ending (a detach releasing
-            // the session, as a thread deletion does) only ends the watch on
-            // the run's background work: it is noted, not warned about.
+            // run has settled, T3 releasing the session (a detach, as a thread
+            // deletion does) only ends the watch on the run's background work:
+            // it is noted, not warned about. Any other failure still warns.
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) =>
                 Ref.get(rootRunFinalized).pipe(
                   Effect.flatMap((finalized) =>
-                    (finalized && isProviderEventStreamEnd(cause)
+                    (finalized && isDeliberateSessionRelease(cause)
                       ? Effect.logInfo(
                           "orchestration V2 provider event stream ended after its run settled",
                           { runId: input.run.id, cause },

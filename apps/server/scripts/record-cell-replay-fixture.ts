@@ -12,7 +12,8 @@
  * `--write-fixture`, and otherwise to a scratch directory. It is written to
  * `<path>.partial` and only takes `<path>`'s place once its replay verified
  * it, so a failed recording never replaces a transcript; the failed one stays
- * at `<path>.partial` for inspection. A live recording for the checked-in
+ * at `<path>.partial` for inspection, which git ignores beside the fixtures
+ * (apps/server/.gitignore). A live recording for the checked-in
  * transcript needs `--version`, the version the cell reports in `GET state`.
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
@@ -179,7 +180,9 @@ const record = Effect.gen(function* () {
   const transcript = {
     provider: CELL_PROVIDER_KIND,
     protocol: CELL_REPLAY_PROTOCOL,
-    // The cell reports its version only in `GET state`, which the adapter never calls.
+    // The cell reports its version in `GET state`; the adapter reads the state
+    // at attachment and in lost-prompt recovery but keeps none of the version,
+    // so the recording cannot carry it and a live one takes `--version`.
     version: fake ? "fake-cell" : (readArgValue("--version") ?? "live"),
     scenario: fixture.name,
     metadata: {
@@ -214,7 +217,9 @@ const record = Effect.gen(function* () {
     Effect.scoped,
     provideDeterministicTestRuntime,
     Effect.tapCause(() =>
-      Console.error(`The recording failed verification; it is at ${partialPath}`),
+      Console.error(
+        `The recording failed verification; it is at ${partialPath} (git ignores *.ndjson.partial beside the fixtures; delete it when done)`,
+      ),
     ),
   );
   yield* fs.rename(partialPath, outputPath);

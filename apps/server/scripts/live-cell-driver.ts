@@ -6,6 +6,10 @@
  *
  *   node scripts/live-cell-driver.ts --scenario <shell|interrupt|delegate|limit|reconnect|restart|attach-retry|delete-delegate> --url http://127.0.0.1:9884 [--tag t] [--token t] [--log dir]
  *
+ * The frames and projections go to --log, by default a new directory under the
+ * OS temp directory named for the scenario and the run's tag; it is printed
+ * first.
+ *
  * reconnect: the socket is terminated 3 s after the prompt's 202 and the next
  * connect is held for RECONNECT_HOLD_MS, so the run's output lands in the gap
  * and the adapter has to read it back.
@@ -39,6 +43,7 @@ import * as Schema from "effect/Schema";
 import * as Socket from "effect/socket/Socket";
 import { TestClock } from "effect/testing";
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -84,10 +89,14 @@ const runTag =
     .replace(/[-:.TZ]/g, "")
     .slice(0, 14);
 const baseUrl = readArgValue("--url") ?? "http://127.0.0.1:9884";
-const logDir = readArgValue("--log") ?? "/srv/t3/tmp/live-adapter";
+// Each run logs to a directory of its own unless --log names one.
+const logDir =
+  readArgValue("--log") ??
+  NodePath.join(NodeOS.tmpdir(), `live-cell-driver-${scenarioName}-${runTag}`);
 NodeFS.mkdirSync(logDir, { recursive: true });
 const framesPath = NodePath.join(logDir, `${scenarioName}.frames.log`);
 NodeFS.writeFileSync(framesPath, "");
+console.log(`logging to ${logDir}`);
 const stamp = () => new Date().toISOString();
 const log = (line: string) => {
   const text = `${stamp()} ${line}`;
@@ -140,13 +149,16 @@ const layerWebSocketConstructor = Layer.succeed(Socket.WebSocketConstructor)(mak
 let holdConnectUntil = 0;
 let onPromptAccepted: ((body: string) => void) | undefined;
 let firstSocketCut = false;
+interface TaskCancelRequest {
+  readonly url: string;
+  readonly headers: Readonly<Record<string, string>>;
+}
+// delete-delegate: a cancel leaving is recorded apart from its answer, which
+// the adapter stops waiting for after its own bound, though the cell may still
+// carry the cancel out.
+let onTaskCancelSent: ((request: TaskCancelRequest) => void) | undefined;
 let onTaskCancelAnswered:
-  | ((answer: {
-      readonly url: string;
-      readonly headers: Readonly<Record<string, string>>;
-      readonly status: number;
-      readonly body: string;
-    }) => void)
+  | ((answer: TaskCancelRequest & { readonly status: number; readonly body: string }) => void)
   | undefined;
 const redact = (headers: Readonly<Record<string, string>>) =>
   Object.fromEntries(
@@ -162,18 +174,21 @@ const loggingTransport = (live: CellTransport): CellTransport => ({
       log(
         `>> ${input.method} ${input.url} headers=${JSON.stringify(redact(input.headers))}${input.body === undefined ? "" : ` body=${JSON.stringify(input.body)}`}`,
       );
-      const response = yield* live
-        .request(input)
-        .pipe(
-          Effect.tapError((error) =>
-            Effect.sync(() => log(`<< ${input.method} ${input.url} FAILED ${error.detail}`)),
-          ),
-        );
+      const isTaskCancel = input.method === "POST" && /\/tasks\/[^/]+\/cancel$/.test(input.url);
+      if (isTaskCancel) onTaskCancelSent?.({ url: input.url, headers: input.headers });
+      const response = yield* live.request(input).pipe(
+        Effect.tapError((error) =>
+          Effect.sync(() => log(`<< ${input.method} ${input.url} FAILED ${error.detail}`)),
+        ),
+        Effect.onInterrupt(() =>
+          Effect.sync(() => log(`<< ${input.method} ${input.url} abandoned before its answer`)),
+        ),
+      );
       log(`<< ${response.status} ${input.method} ${input.url} ${response.body.slice(0, 600)}`);
       if (input.method === "POST" && input.url.endsWith("/prompt") && response.status === 202) {
         onPromptAccepted?.(response.body);
       }
-      if (input.method === "POST" && /\/tasks\/[^/]+\/cancel$/.test(input.url)) {
+      if (isTaskCancel) {
         onTaskCancelAnswered?.({
           url: input.url,
           headers: input.headers,
@@ -396,11 +411,13 @@ const main = Effect.gen(function* () {
       projectionThreadIds: materialized.projectionThreadIds,
       runtimePolicyOverride: { cwd: workspace },
     };
-    const cancelAnswered = new Promise<Parameters<NonNullable<typeof onTaskCancelAnswered>>[0]>(
-      (resolve) => {
-        onTaskCancelAnswered = resolve;
-      },
-    );
+    const cancelSent = new Promise<TaskCancelRequest>((resolve) => {
+      onTaskCancelSent = resolve;
+    });
+    let cancelAnswer: Parameters<NonNullable<typeof onTaskCancelAnswered>>[0] | undefined;
+    onTaskCancelAnswered = (answer) => {
+      cancelAnswer = answer;
+    };
     yield* Effect.scoped(
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -428,29 +445,48 @@ const main = Effect.gen(function* () {
         );
         report("delete-delegate:after-delete", settled);
         // The session detach the deletion queues sends the cancel.
-        const answer = yield* Effect.promise(() => cancelAnswered).pipe(
+        const sent = yield* Effect.promise(() => cancelSent).pipe(
           Effect.timeoutOrElse({
             duration: "30 seconds",
-            orElse: () => Effect.die(new Error("The deletion sent the cell no task cancel")),
+            orElse: () =>
+              Effect.die(new Error("The deletion never sent the cell a task cancel request")),
           }),
           TestClock.withLive,
         );
-        if (answer.status !== 200)
-          return yield* Effect.die(new Error(`The cell answered ${answer.status} to the cancel`));
-        const tasks = yield* transport.request({
-          method: "GET",
-          url: answer.url.replace(/\/tasks\/[^/]+\/cancel$/, "/tasks"),
-          headers: answer.headers,
-        });
-        const taskId = /\/tasks\/([^/]+)\/cancel$/.exec(answer.url)?.[1];
-        const listed = (
-          JSON.parse(tasks.body) as ReadonlyArray<{ taskId: string; status: string }>
-        ).find((task) => task.taskId === taskId);
-        if (listed?.status !== "cancelled")
+        const taskId = decodeURIComponent(/\/tasks\/([^/]+)\/cancel$/.exec(sent.url)?.[1] ?? "");
+        log(`delete-delegate: the cancel of task ${taskId} was sent`);
+        // The cell's state is read on its own: the adapter gives up on the
+        // answer after 3 s, while the cell has 30 s to carry the cancel out,
+        // and a cancelled task may leave the roster.
+        const tasksUrl = sent.url.replace(/\/tasks\/[^/]+\/cancel$/, "/tasks");
+        let listed: string | undefined;
+        for (let attempt = 0; attempt < 35; attempt++) {
+          const tasks = yield* transport.request({
+            method: "GET",
+            url: tasksUrl,
+            headers: sent.headers,
+          });
+          listed =
+            tasks.status === 200
+              ? ((JSON.parse(tasks.body) as ReadonlyArray<{ taskId: string; status: string }>).find(
+                  (task) => task.taskId === taskId,
+                )?.status ?? "removed")
+              : `unreadable (${tasks.status})`;
+          if (listed !== "running" && !listed.startsWith("unreadable")) break;
+          yield* TestClock.withLive(Effect.sleep("1 second"));
+        }
+        const answered =
+          cancelAnswer === undefined
+            ? "no answer to the cancel had been observed (the adapter may have stopped waiting for it)"
+            : `the cell answered the cancel ${cancelAnswer.status}`;
+        if (listed !== "cancelled" && listed !== "removed")
           return yield* Effect.die(
-            new Error(`The cell lists task ${taskId} as ${listed?.status ?? "missing"}`),
+            new Error(
+              `The cancel was sent and ${answered}, but the cell lists task ${taskId} as ${listed ?? "unread"}`,
+            ),
           );
-        log(`delete-delegate: check passed: the cell cancelled task ${taskId}`);
+        log(`delete-delegate: ${answered}; the cell lists task ${taskId} as ${listed}`);
+        log(`delete-delegate: check passed: the cell no longer runs task ${taskId}`);
       }).pipe(
         Effect.provide(
           ProviderReplayHarness.layerProviderReplay(scenario, harness, {

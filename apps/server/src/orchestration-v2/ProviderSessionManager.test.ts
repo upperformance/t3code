@@ -79,6 +79,20 @@ const layerFailingReleaseEventSink = Layer.effect(
   }),
 ).pipe(Layer.provide(layerTestEventSink));
 
+const layerFailingRequestEventSink = Layer.effect(
+  EventSink.EventSinkV2,
+  Effect.gen(function* () {
+    const delegate = yield* EventSink.EventSinkV2;
+    return EventSink.EventSinkV2.of({
+      ...delegate,
+      write: (input) =>
+        input.events.some((event) => event.type === "runtime-request.updated")
+          ? Effect.fail(new EventSink.EventSinkWriteError({ eventCount: input.events.length }))
+          : delegate.write(input),
+    });
+  }),
+).pipe(Layer.provide(layerTestEventSink));
+
 interface FlakyReleaseWrites {
   readonly failing: Ref.Ref<"none" | "session" | "session-and-requests">;
   readonly failures: Queue.Queue<void>;
@@ -475,6 +489,7 @@ function layerTest(input: {
     readonly initialProviderItemIdentityVersion?: 2;
   }) => Effect.Effect<void>;
   readonly failReleaseEventWrites?: boolean;
+  readonly failRequestEventWrites?: boolean;
   readonly flakyReleaseWrites?: FlakyReleaseWrites;
   readonly pauseAttachWrite?: Parameters<typeof layerPausingAttachEventSink>[0];
   readonly beforeUnchangedWrite?: Ref.Ref<Effect.Effect<void>>;
@@ -503,7 +518,9 @@ function layerTest(input: {
           ? layerBeforeUnchangedWriteEventSink(input.beforeUnchangedWrite)
           : input.failReleaseEventWrites
             ? layerFailingReleaseEventSink
-            : layerTestEventSink;
+            : input.failRequestEventWrites
+              ? layerFailingRequestEventSink
+              : layerTestEventSink;
   const layerRegistry = Layer.unwrap(
     makeProviderAdapter(input.state, {
       failEventStream: input.failEventStream ?? false,
@@ -4127,6 +4144,136 @@ it.effect("ProviderSessionManagerV2 persists session-scoped runtime requests wit
 
     yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));
   }),
+);
+
+/** The failure a run's subscription to the session's events ends with. */
+const subscriptionFailure = (subscription: ProviderAdapter.ProviderAdapterV2EventSubscription) =>
+  subscription.events.pipe(
+    Stream.runDrain,
+    Effect.flip,
+    Effect.flatMap((error) =>
+      error._tag === "ProviderAdapterEventStreamError"
+        ? Effect.succeed(error)
+        : Effect.die(new Error(`The subscription failed with ${error._tag}`)),
+    ),
+  );
+
+it.effect.each([
+  { release: "detach", deliberate: true },
+  { release: "idle_timeout", deliberate: true },
+  { release: "runtime_error", deliberate: false },
+] as const)(
+  "ProviderSessionManagerV2 marks a $release release's subscriber failure deliberate: $deliberate",
+  ({ release, deliberate }) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make(`thread-provider-session-manager-release-${release}`);
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const failure = yield* subscriptionFailure(yield* runtime.subscribeEvents!).pipe(
+          Effect.forkScoped,
+        );
+        if (release === "detach") {
+          yield* manager.detach({ providerSessionId, threadId, detail: "Thread deleted." });
+        } else {
+          yield* manager.release({ providerSessionId, reason: release });
+        }
+
+        const error = yield* Fiber.join(failure);
+        assert.equal(
+          ProviderSessionManager.isDeliberateProviderSessionRelease(error.cause),
+          deliberate,
+        );
+      });
+
+      // An exclusive session, as a cell's is: its last thread's detach releases it.
+      yield* effect.pipe(
+        Effect.provide(
+          layerTest({ state, idleTimeoutMs: 60_000, capabilities: ExclusiveCapabilities }),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 does not mark a failure to persist a session-scoped request as a release",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const projectId = yield* idAllocator.allocate.project({
+          fixtureName: "provider-session-manager-request-write-failure",
+        });
+        const threadId = yield* idAllocator.allocate.thread({
+          fixtureName: "provider-session-manager-request-write-failure",
+          projectId,
+        });
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const failure = yield* subscriptionFailure(yield* runtime.subscribeEvents!).pipe(
+          Effect.forkScoped,
+        );
+        const pendingRequest = yield* makePendingRuntimeRequestEvents({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          providerThread,
+          now,
+        });
+        const adapterEvents = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+        assert.isDefined(adapterEvents);
+        yield* Queue.offerAll(adapterEvents!, pendingRequest.providerEvents);
+
+        const error = yield* Fiber.join(failure);
+        assert.isFalse(ProviderSessionManager.isDeliberateProviderSessionRelease(error.cause));
+        // The stream error wraps the ingest failure, not a release.
+        assert.equal(
+          (error.cause as { readonly _tag?: string } | undefined)?._tag,
+          "ProviderEventPublishError",
+        );
+      });
+
+      yield* effect.pipe(
+        Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, failRequestEventWrites: true })),
+      );
+    }),
 );
 
 it.effect(

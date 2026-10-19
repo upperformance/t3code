@@ -30,6 +30,7 @@
         "src/claude-history-worker.ts!",
         "scripts/cli.ts",
         "scripts/evaluate-thread-titles.ts",
+        "scripts/live-cell-api.mjs",
         "scripts/live-cell-driver.ts",
         "scripts/live-cell-probe.ts",
         "scripts/measure-pr-preview.ts",
