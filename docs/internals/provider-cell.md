@@ -38,7 +38,15 @@ directory as nothing more than the thread's home in the sidebar.
   cell has no API to name a project. The first prompt creates the cell: a
   Durable Object exists from its first request. Deleting a T3 thread never
   deletes the cell; the project and its tree stay on the tenant until someone
-  removes them there. Attaching a thread to a cell project that already
+  removes them there. The deletion does settle what the thread still showed
+  as running in the cell: the rows of a delegated task still open (the
+  subagent, its node and its item) are cancelled, the thread's task roster is
+  cleared, and the cell is asked, best effort, to cancel each task it still
+  runs for the thread (`POST tasks/<id>/cancel`, the session runtime's
+  `cancelBackgroundWork`, called from the session detach the deletion
+  queues) when the thread's session is open at the time. A task the cell goes
+  on running after that, because no session was open or the cell refused,
+  keeps its result in the cell's transcript only. Attaching a thread to a cell project that already
   exists goes through the contract's `initialNativeThreadId`, which the
   adapter honours; offering it in the UI needs the native-session listing
   (`nativeSessions.canList`) and a tenant API to list projects, both
@@ -178,7 +186,16 @@ through the same ownership rule as live events, in sequence order. That rule
 is one line: an event is the turn's exactly when it carries the run id the
 202 named. An event of another run numbered below the run's opening event
 (the 202's `seq`) is an earlier run's tail that the 202 overtook on the way
-to T3, nobody's and no evidence about T3's run. An event of another run
+to T3, nobody's and no evidence about T3's run. A 202 naming a run that began
+at or before the snapshot T3 follows the log from, which the cell was not
+running at that snapshot, names a run that had ended before T3 could see it:
+the cell answers a repeated request id with the run it started for it, so
+such an acceptance means the id T3 sent was one the cell had seen (the
+deterministic test runtime mints the same ids every run, so a recorder rerun
+against a kept cell sends one), and the turn fails at once naming the stale
+acceptance instead of waiting for a `done` that was never on the socket. A
+202 naming the run the cell was running at that snapshot keeps the turn,
+which shows the rest of the run. An event of another run
 numbered after it proves T3's run ended without its `done` reaching T3,
 since the cell runs one agent loop at a time, and the turn fails as a
 transport error rather than adopting the stranger; that holds whether the
@@ -407,6 +424,14 @@ adapter reconciles what it was tracking against the snapshot:
 - A queued wake whose run is not the one the cell is running, and whose `done`
   the replay did not supply, is marked lost; its continuation turn ends with a
   transport-error terminal instead of running forever on an incomplete buffer.
+- A thread attaches at the first snapshot to complete since it was attached,
+  on whichever connection delivers it: a connection that ends after `state`
+  and before its roster, or that could not be opened, leaves the next one to
+  attach, and the persisted head of a run to take back is read from on that
+  connection. Three connections in a row that end before their snapshot
+  could be used fail the attach naming the last reason, inside the attach's
+  own timeout. A failed attach leaves nothing behind, so the same session
+  attaches on its next try from that try's first snapshot.
 - Recovery is bounded. Connections dropped for not keeping the protocol (a
   frame before the roster, no roster within ten seconds of `state`, a roster
   numbered elsewhere than its `state`, an unreadable event, a replay that
@@ -506,9 +531,17 @@ the cell thread's work as cancelled, so no note is written, the continuation
 keeps its `restartContinuationOfRunId`, and the adapter adopts. A session
 record stored by a build from before the capability lacks the field; recovery
 then asks the adapter's own capabilities through the registry, so the first
-restart after an upgrade treats the thread the same way, and a note that
-older build already wrote on the cut run is withdrawn by recovery and, should
-one still reach a turn start, ignored for a provider whose work survives.
+restart after an upgrade treats the thread the same way; a lookup that fails
+or throws is read as work that does not survive, and the thread's recovery
+still commits. A note that older build already wrote on the cut run is
+withdrawn when recovery visits the thread, which it does only while the
+thread still has something to recover (a run not yet terminal, a session
+still recorded live): a thread whose run that build already cancelled, with
+the thread idle and the roster cleared, is not visited, and its note stands
+in the stored run. The note is harmless there: the turn start ignores a note
+on a provider whose work survives, so it is neither prompted nor strips the
+continuation's `restartContinuationOfRunId`, and the rows that build
+cancelled are not reopened.
 
 A delegated task survives with its rows. Recovery terminalizes the cut run's
 own rows but leaves a provider-native subagent's rows (the subagent, its node
@@ -526,6 +559,15 @@ rows as cancelled. A session closing leaves the rows alone for the same
 reason: the task runs on, so the adapter no longer reports it cancelled at
 close. The task's completion also wakes the cell, which the next session
 receives as a wake if its socket is open then.
+
+The bound on an open row is therefore the next turn on the thread. A task
+the cell has in fact lost (its cell destroyed, a reset, a roster the cell no
+longer lists it in) is settled at the first roster of the next attachment,
+and a thread attaches when its next turn starts, so until someone sends a
+message, or a wake or a restart continuation starts a turn, the rows stay
+open; there is no elapsed-time bound, and an archived thread keeps its rows
+until it is re-engaged. Deleting the thread settles them at once, as
+described under _Thread_ above.
 
 What restoration does not survive: a prompt whose 202 had not arrived when T3
 stopped, a window of one round trip in which the head names no run yet, so
@@ -547,7 +589,8 @@ errors. `provider_error` is also the class for a prompt the cell refused,
 with the cell's reason; `transport_error` is for what T3 could not observe:
 a lost prompt answer that no request id confirmed, a gap it could not read
 back, a run the cell was no longer running, three dropped connections in a
-row, a regressed numbering, or a 202 that did not name the run. A turn the
+row, a regressed numbering, a 202 that did not name the run, or one naming
+a run that had ended before T3 attached. A turn the
 adapter stopped itself for policy reasons is `permission_error` or
 `validation_error`.
 
@@ -619,10 +662,16 @@ level 3 (numbered, persisted events; `state` then the numbered roster on
 every socket; a paged event log with the protocol's retention; structured
 `done` errors; the request id kept on the run and answered again for a
 repeat; refusals as `{ runId, error }`; a cancel that names its run; replies
-to its own clients' socket prompts; standalone errors) and answers the shared
-fixture prompts the way the cell does. The checked-in transcripts were
-recorded against the fake cell; record them against a tenant once celld
-speaks level 3 with the request id. The restart itself is not a transcript:
+to its own clients' socket prompts; standalone errors; a delegated task
+announced as `starting` before the tool answers and `running` once the child
+accepted its prompt, cancelled through `POST tasks/<id>/cancel`) and answers
+the shared fixture prompts the way the cell does. The checked-in transcripts
+were recorded against a live tenant, celld dev running the cell of
+upperformance/vim `main` (the cell reports itself as version 0.3.0) with a
+scripted Responses API behind it, and verified by replay; the fake cell is
+for a recording without a tenant. The task's three states are why
+`cell_wake` holds the third `task` event, the child's completion, behind its
+gate: the first two are inside the delegating run. The restart itself is not a transcript:
 `CellRestartAdoption.integration.test.ts` runs two orchestrator runtimes over
 one database against the fake cell, stops the first the way the server stops
 (worker halted, continuation prepared, sessions shut down, state reconciled)
@@ -633,6 +682,30 @@ subagent row the first server showed, which goes from running to completed
 and stays the thread's only one. Its waits are driven by the thread's stored
 events and bounded on the wall clock, and the orchestrator's test clock is
 moved by the test alone, between the two servers.
+
+The live run is not a test either, since it needs a running cell.
+`apps/server/scripts/live-cell-driver.ts --scenario shell|interrupt|limit|delegate|reconnect|restart --url <cell> [--tag t] [--log dir]`
+runs the real orchestrator and adapter against a cell on celld for what the
+fixtures cannot express and logs every request, response and socket frame
+with a wall-clock stamp to `<log>/<scenario>.frames.log`, with the thread's
+projection beside it: `reconnect` terminates the socket three seconds after
+the 202 and holds the next connect (`RECONNECT_HOLD_MS`, default 25 s) so
+the run's output lands in the gap and has to be read back; `restart` runs
+two orchestrator runtimes over one SQLite file and stops the first the way
+the server stops; `delegate` runs the continuation worker so the wake
+reaches the thread. `live-cell-probe.ts --url <cell>` runs the status probe
+Settings shows against the live cell and against stand-ins for an
+old-protocol tenant, a protocol-2 tenant, an HTML server, a 404, a tenant
+without a key and a closed port. To repeat the run, start celld on a built
+cell bundle whose `.dev.vars` points `OPENAI_BASE_URL` at a scripted
+Responses API that answers the fixture prompts (the vim repository's
+`docs/cell-edition.md` describes the build), record each fixture with
+`node scripts/record-cell-replay-fixture.ts --scenario <name> --url <cell>`,
+then run the drivers. Every driver run gets its own thread (`--tag`), and a
+fixture is re-recorded only against a cell started afresh (`--clean`): the
+deterministic test runtime mints the same request id every run, and a kept
+cell answers it with the run that ended last, which the adapter fails at
+once as a stale acceptance.
 
 The adapter's own tests cover the rules above: the rejected prompt racing
 another run's events, a 202 overtaking the previous run's tail, a stranger

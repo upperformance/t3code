@@ -52,9 +52,18 @@ Policy examples:
   task's end is published to the rows that showed it start. A session record
   stored before this field existed lacks it; recovery then asks the adapter's
   own capabilities through the registry, so a provider that gains the field
-  in an upgrade is treated by it on the first restart after, and a note an
-  earlier build already wrote on such a run is withdrawn at recovery and
-  ignored when the turn starts.
+  in an upgrade is treated by it on the first restart after; a lookup that
+  fails or throws is read as work that does not survive, and the thread's
+  recovery still commits. A note an earlier build already wrote on such a
+  run is ignored when the turn starts, and withdrawn at recovery when
+  recovery still visits the thread (it has a run not yet terminal or a
+  session still recorded live); a thread that build already settled keeps
+  the note in its stored run, harmlessly, and the rows it cancelled are not
+  reopened. Deleting the thread settles the rows a surviving task keeps open
+  as cancelled, clears the thread's task roster, and asks the adapter to
+  stop the work (`cancelBackgroundWork` on the session runtime, best
+  effort, from the session detach the deletion queues); archiving leaves
+  them until the thread is re-engaged.
 
 Provider-thread resumption is not a capability. It is a required adapter primitive. Adapters must be able to start from a stored provider cursor/session/thread handle or return a runtime resume failure.
 
