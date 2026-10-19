@@ -600,7 +600,10 @@ back, a run the cell was no longer running, three dropped connections in a
 row, a regressed numbering, a 202 that did not name the run, or one naming
 a run that had ended before T3 attached. A turn the
 adapter stopped itself for policy reasons is `permission_error` or
-`validation_error`.
+`validation_error`. A turn T3 asks a session to start while another of its
+turns is still active is refused before anything reaches the cell, as a
+protocol error with the shared `previous_turn_active` reason, so the failure
+T3 shows says the previous turn is still running.
 
 ## Alternatives rejected
 

@@ -2178,9 +2178,11 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         if (!validateThread(turnInput.providerThread) || closed || project === undefined)
           return yield* protocolError("Cell thread is not attached to this session");
         if (active)
-          return yield* protocolError(
-            "The cell already has an active turn; queue through the orchestrator",
-          );
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver: CELL_PROVIDER,
+            detail: "The cell already has an active turn; queue through the orchestrator",
+            reason: "previous_turn_active",
+          });
         if (turnInput.runtimePolicy.interactionMode === "plan")
           return yield* protocolError("Cell does not support a separate Plan mode");
         const continuation =
