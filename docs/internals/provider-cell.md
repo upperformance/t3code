@@ -617,7 +617,9 @@ published, and the wake it starts becomes a continuation, as after a
 completed turn. Without the flag T3 would fail the row with the turn and stop
 reading the run's events, dropping the child's result. The flag is set only
 when the roster has such a task, the same test Codex applies to its live
-subagents: with none, nothing outlives the turn, and T3's settling of any row
+subagents: with none, no known active child needs the failed run's
+subscription (a completed child whose wake is still pending has a settled row
+already, and the wake proceeds on its own), and T3's settling of any row
 it still sees as open stays the backstop for a task the cell no longer lists.
 
 ## Alternatives rejected
