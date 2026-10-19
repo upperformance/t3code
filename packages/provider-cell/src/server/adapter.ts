@@ -1147,6 +1147,11 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             failure,
             failureItemOrdinal,
             threadDisposition: disposition,
+            // A delegated task is a child cell with runs of its own, so a
+            // failed turn leaves it working. Its end still reaches the
+            // thread, as a task report on the rows this turn published and a
+            // wake, so T3 keeps those rows open instead of failing them here.
+            ...(roster().length > 0 ? { childTurnsContinue: true as const } : {}),
           });
         } else {
           yield* emit({

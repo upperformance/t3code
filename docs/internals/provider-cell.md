@@ -609,6 +609,17 @@ The failed terminal is the failure's only report: it reserves the error row's
 place after the turn's items, and T3 writes the row from it, so a failed turn
 shows one error row on its root node.
 
+A turn that fails while a delegated task is still `starting` or `running`
+sets `childTurnsContinue` on its failed terminal. The task is a child cell
+with runs of its own, so the failure does not stop it, and its end still
+reaches the thread: the task report settles the row the failed turn
+published, and the wake it starts becomes a continuation, as after a
+completed turn. Without the flag T3 would fail the row with the turn and stop
+reading the run's events, dropping the child's result. The flag is set only
+when the roster has such a task, the same test Codex applies to its live
+subagents: with none, nothing outlives the turn, and T3's settling of any row
+it still sees as open stays the backstop for a task the cell no longer lists.
+
 ## Alternatives rejected
 
 - **An ACP bridge process.** The cell edition's own design deferred a Node
@@ -654,10 +665,14 @@ shows one error row on its root node.
 ## Testing
 
 Replay fixtures for `simple`, `multi_turn`, `queued_turn`, `turn_interrupt`,
-`provider_thread_resume` and the cell-only `cell_wake` run the real
-orchestrator, adapter and projections over a scripted transport that replaces
-only the HTTP and WebSocket boundary; `cell_wake` runs the continuation
-worker too, so the wake reaches the thread the way it does in production. The
+`provider_thread_resume` and the cell-only `cell_wake` and
+`cell_wake_after_failure` run the real orchestrator, adapter and projections
+over a scripted transport that replaces only the HTTP and WebSocket
+boundary; the two wake fixtures run the continuation worker too, so the wake
+reaches the thread the way it does in production. `cell_wake_after_failure`
+fails the delegating run while its child works on and checks that the
+child's row stays running through the failure, settles with the child's
+result, and that the wake runs. The
 transcript protocol is `cell.http-ws`: outbound frames are the HTTP requests
 and WebSocket connects the adapter makes, inbound frames are the responses,
 transport failures and socket events. Replay binds `<project>` to the first
@@ -680,11 +695,15 @@ repeat; refusals as `{ runId, error }`; a cancel that names its run; replies
 to its own clients' socket prompts; standalone errors; a delegated task
 announced as `starting` before the tool answers and `running` once the child
 accepted its prompt, cancelled through `POST tasks/<id>/cancel`) and answers
-the shared fixture prompts the way the cell does. All six checked-in
-transcripts were recorded live (`generatedBy: live-cell-recorder`, version
-`0.3.0`) against celld dev running the cell of upperformance/vim `main`, which
-speaks level 3, with a scripted Responses API behind it, and verified by
-replay; the fake cell is for a recording without a tenant. The recorder
+the shared fixture prompts the way the cell does, a delegation whose run
+then fails included. Six of the seven checked-in transcripts were recorded
+live (`generatedBy: live-cell-recorder`, version `0.3.0`) against celld dev
+running the cell of upperformance/vim `main`, which speaks level 3, with a
+scripted Responses API behind it, and verified by replay;
+`cell_wake_after_failure` was recorded against the fake cell
+(`generatedBy: fake-cell-recorder`, version `fake-cell`), since the scripted
+Responses API has no step that fails a run after it delegated. The fake cell
+is otherwise for a recording without a tenant. The recorder
 writes to the path `--out` gives, to the checked-in transcript with
 `--write-fixture`, and with neither to a new scratch directory it prints.
 Either way it is written to `<path>.partial` first and takes `<path>`'s
@@ -692,8 +711,8 @@ place only once its replay verified it, so a failed recording, a stale
 acceptance on a kept cell included, never replaces a transcript and stays at
 `<path>.partial` for inspection; git ignores `*.ndjson.partial` beside the
 fixtures (`apps/server/.gitignore`). The task's three states are why
-`cell_wake` holds the third `task` event, the child's completion, behind its
-gate: the first two are inside the delegating run. The restart itself is not a transcript:
+both wake fixtures hold the third `task` event, the child's completion,
+behind their gate: the first two are inside the delegating run. The restart itself is not a transcript:
 `CellRestartAdoption.integration.test.ts` runs two orchestrator runtimes over
 one database against the fake cell, stops the first the way the server stops
 (worker halted, continuation prepared, sessions shut down, state reconciled)
