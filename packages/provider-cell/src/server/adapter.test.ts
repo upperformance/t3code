@@ -547,6 +547,43 @@ describe("CellAdapterV2 over the fake cell", () => {
       }).pipe(Effect.scoped, Effect.provide(liveLayer)),
   );
 
+  it.live(
+    "a turn that fails after delegating says its child continues, and the child's end still wakes the thread",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* fakeCell({
+          script: () => [
+            {
+              type: "delegate",
+              taskId: "ab12",
+              title: "Review",
+              summary: "Fine",
+              wake: [{ type: "assistant", text: "WAKE_DONE" }],
+            },
+            { type: "fail", error: "The model is overloaded" },
+          ],
+        });
+        const transport = yield* liveTransport;
+        const harness = yield* makeHarness(transport, fake.baseUrl);
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Delegate a review"),
+        );
+        const first = yield* harness.takeEvent("turn.terminal");
+        assert.equal(first.status, "failed");
+        assert.isTrue(first.status === "failed" && first.childTurnsContinue === true);
+        const request = yield* harness.takeContinuation;
+        const wake = yield* runContinuation(harness, request, 2);
+        assert.equal(wake.status, "completed", failureOf(wake)?.message);
+        assert.deepEqual(assistantTexts(harness.allEvents, 2), ["WAKE_DONE"]);
+        const subagent = itemsOfType(harness.allEvents, "subagent").at(-1);
+        assert.isTrue(
+          subagent?.type === "subagent" &&
+            subagent.status === "completed" &&
+            subagent.result === "Fine",
+        );
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
   it.live("two children finishing produce two continuations that each carry their own run", () =>
     Effect.gen(function* () {
       const fake = yield* fakeCell({
@@ -1079,6 +1116,15 @@ describe("CellAdapterV2 over the fake cell", () => {
       assert.equal(failureOf(terminal)?.class, "usage_limit");
       assert.equal(failureOf(terminal)?.code, "usage_limit");
       assert.equal(failureOf(terminal)?.resetAt, "2026-10-19T00:00:00.000Z");
+      assert.isTrue(
+        terminal.status === "failed" && terminal.childTurnsContinue === undefined,
+        "with no task running, nothing outlives the turn",
+      );
+      assert.lengthOf(
+        itemsOfType(harness.allEvents, "error"),
+        0,
+        "the terminal is the failure's only report; T3 writes the row",
+      );
     }).pipe(Effect.scoped, Effect.provide(liveLayer)),
   );
 

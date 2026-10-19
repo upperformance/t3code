@@ -138,11 +138,12 @@ const REQUEST_ID_MAX_LENGTH = 128;
 
 /**
  * Answers the shared fixture prompts: "Respond with exactly: X", a shell that
- * waits for Stop, and the resume prompt that repeats the previous answer.
+ * waits for Stop, the resume prompt that repeats the previous answer, and a
+ * delegation whose run may then fail while the child works on.
  */
 const defaultFakeCellScript: FakeCellScript = (prompt, _turn, answers) => {
   const delegated =
-    /Delegate a (\w+) to a child cell\. Reply with exactly: (\S+)\. When the child reports, reply with exactly: (\S+)/.exec(
+    /Delegate a (\w+) to a child cell\. Reply with exactly: (\S+)\.(?: Then fail with: ([^.]+)\.)? When the child reports, reply with exactly: (\S+)/.exec(
       prompt,
     );
   if (delegated) {
@@ -152,9 +153,10 @@ const defaultFakeCellScript: FakeCellScript = (prompt, _turn, answers) => {
         taskId: "ab12",
         title: delegated[1]!,
         summary: `The ${delegated[1]!} is done.`,
-        wake: [{ type: "assistant", text: delegated[3]! }],
+        wake: [{ type: "assistant", text: delegated[4]! }],
       },
       { type: "assistant", text: delegated[2]! },
+      ...(delegated[3] === undefined ? [] : [{ type: "fail" as const, error: delegated[3] }]),
     ];
   }
   const sleep = /`(sleep \d+[^`]*)`/.exec(prompt);

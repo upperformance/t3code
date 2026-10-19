@@ -1134,19 +1134,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             code: failureDetail.code ?? null,
             resetAt: failureDetail.resetAt ?? null,
           });
-          const base = baseItem(turn.scope, allocate(turn), completedAt, completedAt);
-          yield* emit({
-            type: "turn_item.updated",
-            driver: CELL_PROVIDER,
-            turnItem: {
-              ...base,
-              type: "error",
-              status: "failed",
-              title: failureClass === "usage_limit" ? "Usage limit reached" : null,
-              completedAt,
-              failure,
-            },
-          });
+          // The terminal is the failure's only report: T3 writes its error
+          // row from it, at the place reserved here after the turn's items.
+          const failureItemOrdinal = allocate(turn);
           yield* emit({
             type: "turn.terminal",
             driver: CELL_PROVIDER,
@@ -1155,8 +1145,13 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             runOrdinal: turn.input.runOrdinal,
             status,
             failure,
-            failureItemOrdinal: base.ordinal,
+            failureItemOrdinal,
             threadDisposition: disposition,
+            // A delegated task is a child cell with runs of its own, so a
+            // failed turn leaves it working. Its end still reaches the
+            // thread, as a task report on the rows this turn published and a
+            // wake, so T3 keeps those rows open instead of failing them here.
+            ...(roster().length > 0 ? { childTurnsContinue: true as const } : {}),
           });
         } else {
           yield* emit({
@@ -2178,9 +2173,11 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         if (!validateThread(turnInput.providerThread) || closed || project === undefined)
           return yield* protocolError("Cell thread is not attached to this session");
         if (active)
-          return yield* protocolError(
-            "The cell already has an active turn; queue through the orchestrator",
-          );
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver: CELL_PROVIDER,
+            detail: "The cell already has an active turn; queue through the orchestrator",
+            reason: "previous_turn_active",
+          });
         if (turnInput.runtimePolicy.interactionMode === "plan")
           return yield* protocolError("Cell does not support a separate Plan mode");
         const continuation =

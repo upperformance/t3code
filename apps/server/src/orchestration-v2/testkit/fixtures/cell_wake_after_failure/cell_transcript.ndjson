@@ -1,0 +1,19 @@
+{"type":"transcript_start","provider":"cell","protocol":"cell.http-ws","version":"fake-cell","scenario":"cell_wake_after_failure","metadata":{"generatedBy":"fake-cell-recorder","model":"gpt-6-astra"}}
+{"type":"expect_outbound","label":"GET /cell/<project>/state","frame":{"kind":"http","method":"GET","path":"/cell/<project>/state"}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":200,"body":"{\"protocol\":3,\"version\":\"0.4.0\",\"model\":\"gpt-6-astra\",\"running\":false,\"runId\":null,\"requestId\":null,\"seq\":0,\"configured\":true,\"turns\":0,\"sockets\":0,\"parent\":null,\"depth\":0,\"tasks\":0,\"name\":\"fake/t3-6267fd313902022f54bb\",\"misnamed\":null}"}}
+{"type":"expect_outbound","label":"ws_connect","frame":{"kind":"ws_connect","path":"/cell/<project>/ws"}}
+{"type":"emit_inbound","label":"ws:state#1","frame":{"kind":"ws_event","event":{"type":"state","protocol":3,"version":"0.4.0","model":"gpt-6-astra","running":false,"runId":null,"requestId":null,"seq":0,"configured":true,"turns":0,"sockets":1,"parent":null,"depth":0,"tasks":0,"name":"fake/t3-6267fd313902022f54bb","misnamed":null}}}
+{"type":"emit_inbound","label":"ws:tasks#1","frame":{"kind":"ws_event","event":{"type":"tasks","tasks":[],"seq":0}}}
+{"type":"expect_outbound","label":"POST /cell/<project>/prompt","frame":{"kind":"http","method":"POST","path":"/cell/<project>/prompt","body":"Delegate a review to a child cell. Reply with exactly: STARTED. Then fail with: The model is overloaded. When the child reports, reply with exactly: WAKE_DONE"}}
+{"type":"emit_inbound","label":"ws:user#1","frame":{"kind":"ws_event","event":{"type":"user","text":"Delegate a review to a child cell. Reply with exactly: STARTED. Then fail with: The model is overloaded. When the child reports, reply with exactly: WAKE_DONE","requestId":"<request-id:1>","runId":"run-1","origin":"user","seq":1}}}
+{"type":"emit_inbound","label":"ws:tool#1","frame":{"kind":"ws_event","event":{"type":"tool","name":"delegate_task","arguments":{"title":"review"},"runId":"run-1","seq":2}}}
+{"type":"emit_inbound","label":"ws:task#1","frame":{"kind":"ws_event","event":{"type":"task","task":{"taskId":"ab12","title":"review","status":"starting","created":1792444574774,"finished":null},"seq":3}}}
+{"type":"emit_inbound","label":"ws:task#2","frame":{"kind":"ws_event","event":{"type":"task","task":{"taskId":"ab12","title":"review","status":"running","created":1792444574774,"finished":null},"seq":4}}}
+{"type":"emit_inbound","label":"ws:tool_output#1","frame":{"kind":"ws_event","event":{"type":"tool_output","name":"delegate_task","output":"{\"taskId\":\"ab12\",\"status\":\"running\"}","runId":"run-1","seq":5}}}
+{"type":"emit_inbound","label":"ws:assistant#1","frame":{"kind":"ws_event","event":{"type":"assistant","text":"STARTED","runId":"run-1","seq":6}}}
+{"type":"emit_inbound","label":"ws:done#1","frame":{"kind":"ws_event","event":{"type":"done","error":{"code":"provider_error","message":"The model is overloaded"},"runId":"run-1","seq":7}}}
+{"type":"emit_inbound","label":"http_response","frame":{"kind":"http_response","status":202,"body":"{\"runId\":\"run-1\",\"seq\":1}"}}
+{"type":"emit_inbound","label":"ws:task#3","frame":{"kind":"ws_event","event":{"type":"task","task":{"taskId":"ab12","title":"review","status":"completed","created":1792444574774,"finished":1792444574794,"summary":"The review is done.","changes":[]},"seq":8}}}
+{"type":"emit_inbound","label":"ws:wake#1","frame":{"kind":"ws_event","event":{"type":"wake","text":"[Delegated task ab12 \"review\" completed]\nThe review is done.","runId":"run-2","origin":"wake","seq":9}}}
+{"type":"emit_inbound","label":"ws:assistant#2","frame":{"kind":"ws_event","event":{"type":"assistant","text":"WAKE_DONE","runId":"run-2","seq":10}}}
+{"type":"emit_inbound","label":"ws:done#2","frame":{"kind":"ws_event","event":{"type":"done","runId":"run-2","seq":11}}}

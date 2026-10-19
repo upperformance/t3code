@@ -72,6 +72,8 @@ import { assertCellTurnInterruptOutput } from "./turn_interrupt/cell_output.ts";
 import { assertCellProviderThreadResumeOutput } from "./provider_thread_resume/cell_output.ts";
 import { cellWakeInput } from "./cell_wake/input.ts";
 import { assertCellWakeOutput } from "./cell_wake/output.ts";
+import { cellWakeAfterFailureInput } from "./cell_wake_after_failure/input.ts";
+import { assertCellWakeAfterFailureOutput } from "./cell_wake_after_failure/output.ts";
 import { piCompactionInput } from "./pi_compaction/input.ts";
 import { assertPiCompactionOutput } from "./pi_compaction/output.ts";
 import { providerThreadResumeInput } from "./provider_thread_resume/input.ts";
@@ -1353,6 +1355,22 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         modelSelection: CELL_MODEL_SELECTION,
         runContinuationWorker: true,
         assertOutput: assertCellWakeOutput,
+      },
+    ],
+  },
+  {
+    name: "cell_wake_after_failure",
+    buildInput: cellWakeAfterFailureInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("cell"),
+        transcriptFile: new URL(
+          "./cell_wake_after_failure/cell_transcript.ndjson",
+          import.meta.url,
+        ),
+        modelSelection: CELL_MODEL_SELECTION,
+        runContinuationWorker: true,
+        assertOutput: assertCellWakeAfterFailureOutput,
       },
     ],
   },
