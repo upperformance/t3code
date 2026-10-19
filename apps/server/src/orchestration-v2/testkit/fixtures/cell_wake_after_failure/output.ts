@@ -8,7 +8,11 @@ import {
   assertUserMessagesInclude,
   projectionFor,
 } from "../shared.ts";
-import { CELL_WAKE_AFTER_FAILURE_ERROR, CELL_WAKE_AFTER_FAILURE_PROMPT } from "./input.ts";
+import {
+  CELL_WAKE_AFTER_FAILURE_ERROR,
+  CELL_WAKE_AFTER_FAILURE_PROMPT,
+  CELL_WAKE_AFTER_FAILURE_RESULT_LABEL,
+} from "./input.ts";
 
 function runAssistantTexts(
   projection: OrchestrationV2ThreadProjection,
@@ -17,6 +21,10 @@ function runAssistantTexts(
   return projection.turnItems.flatMap((item) =>
     item.runId === runId && item.type === "assistant_message" ? [item.text.trim()] : [],
   );
+}
+
+function field(value: unknown, key: string): unknown {
+  return typeof value === "object" && value !== null ? Reflect.get(value, key) : undefined;
 }
 
 /**
@@ -41,10 +49,15 @@ export function assertCellWakeAfterFailureOutput(
   const [rootRun, wakeRun] = projection.runs;
   assert.deepEqual(runAssistantTexts(projection, rootRun?.id), ["STARTED"]);
   assert.deepEqual(runAssistantTexts(projection, wakeRun?.id), ["WAKE_DONE"]);
-  const failures = projection.turnItems.flatMap((item) =>
-    item.type === "error" ? [`${item.runId}:${item.failure.message}`] : [],
+  // The cell wraps the API's error ("The API responded 500: …"), so the
+  // message only has to carry it.
+  const failures = projection.turnItems.filter((item) => item.type === "error");
+  assert.lengthOf(failures, 1, "the failed run shows one error row");
+  assert.equal(failures[0]?.runId, rootRun?.id);
+  assert.include(
+    failures[0]?.type === "error" ? failures[0].failure.message : "",
+    CELL_WAKE_AFTER_FAILURE_ERROR,
   );
-  assert.deepEqual(failures, [`${rootRun?.id}:${CELL_WAKE_AFTER_FAILURE_ERROR}`]);
 
   const wakeMessage = projection.messages.find((message) => message.id === wakeRun?.userMessageId);
   assert.equal(`${wakeMessage?.createdBy}:${wakeMessage?.creationSource}`, "agent:provider");
@@ -54,7 +67,14 @@ export function assertCellWakeAfterFailureOutput(
   const row = subagents[0];
   assert.equal(row?.runId, rootRun?.id, "the row belongs to the run that delegated");
   assert.equal(row?.status, "completed");
-  assert.equal(row?.type === "subagent" ? row.result : null, "The review is done.");
+  const [completion] = transcript.entries.flatMap((entry) =>
+    entry.type === "emit_inbound" && entry.label === CELL_WAKE_AFTER_FAILURE_RESULT_LABEL
+      ? [entry.frame]
+      : [],
+  );
+  const summary = field(field(field(completion, "event"), "task"), "summary");
+  assert.isString(summary, "the child's completion carries its summary");
+  assert.equal(row?.type === "subagent" ? row.result : null, summary);
   assert.deepEqual(
     projection.subagents.map((subagent) => `${subagent.runId}:${subagent.status}`),
     [`${rootRun?.id}:completed`],

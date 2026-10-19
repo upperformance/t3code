@@ -10,7 +10,7 @@ export const CELL_WAKE_AFTER_FAILURE_PROMPT = `Delegate a review to a child cell
  * cell announces the task as `starting` and `running` inside the delegating
  * run, which then fails.
  */
-const CELL_WAKE_AFTER_FAILURE_RESULT_LABEL = cellReplayEventLabel("task", 3);
+export const CELL_WAKE_AFTER_FAILURE_RESULT_LABEL = cellReplayEventLabel("task", 3);
 
 /**
  * The delegating run fails while its child works on. The gate holds the

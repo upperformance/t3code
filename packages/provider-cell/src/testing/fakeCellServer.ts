@@ -139,7 +139,9 @@ const REQUEST_ID_MAX_LENGTH = 128;
 /**
  * Answers the shared fixture prompts: "Respond with exactly: X", a shell that
  * waits for Stop, the resume prompt that repeats the previous answer, and a
- * delegation whose run may then fail while the child works on.
+ * delegation whose run may then fail while the child works on. The failure
+ * reads the way the cell words the 500 that
+ * `apps/server/scripts/live-cell-api.mjs` answers there, its error as JSON.
  */
 const defaultFakeCellScript: FakeCellScript = (prompt, _turn, answers) => {
   const delegated =
@@ -156,7 +158,15 @@ const defaultFakeCellScript: FakeCellScript = (prompt, _turn, answers) => {
         wake: [{ type: "assistant", text: delegated[4]! }],
       },
       { type: "assistant", text: delegated[2]! },
-      ...(delegated[3] === undefined ? [] : [{ type: "fail" as const, error: delegated[3] }]),
+      ...(delegated[3] === undefined
+        ? []
+        : [
+            {
+              type: "fail" as const,
+              error: `The API responded 500: ${JSON.stringify({ error: { type: "server_error", message: delegated[3] } })}`,
+              status: 500,
+            },
+          ]),
     ];
   }
   const sleep = /`(sleep \d+[^`]*)`/.exec(prompt);

@@ -698,14 +698,13 @@ to its own clients' socket prompts; standalone errors; a delegated task
 announced as `starting` before the tool answers and `running` once the child
 accepted its prompt, cancelled through `POST tasks/<id>/cancel`) and answers
 the shared fixture prompts the way the cell does, a delegation whose run
-then fails included. Six of the seven checked-in transcripts were recorded
-live (`generatedBy: live-cell-recorder`, version `0.3.0`) against celld dev
-running the cell of upperformance/vim `main`, which speaks level 3, with a
-scripted Responses API behind it, and verified by replay;
-`cell_wake_after_failure` was recorded against the fake cell
-(`generatedBy: fake-cell-recorder`, version `fake-cell`), since the scripted
-Responses API has no step that fails a run after it delegated. The fake cell
-is otherwise for a recording without a tenant. The recorder
+then fails included, worded as the cell words the API's 500 ("The API
+responded 500: " and the error body; `cell_wake_after_failure` asserts only
+that the message carries the API's text). All seven checked-in transcripts
+were recorded live (`generatedBy: live-cell-recorder`, version `0.3.0`)
+against celld dev running the cell of upperformance/vim `main`, which speaks
+level 3, with a scripted Responses API behind it, and verified by replay.
+The fake cell is for a recording without a tenant. The recorder
 writes to the path `--out` gives, to the checked-in transcript with
 `--write-fixture`, and with neither to a new scratch directory it prints.
 Either way it is written to `<path>.partial` first and takes `<path>`'s
@@ -785,7 +784,9 @@ set `TMPDIR` to a scratch path for all of them):
    answers 429 `usage_limit_reached` with `resets_in_seconds`; the
    "Delegate a review to a child cell" prompt calls `delegate_task` with the
    child's brief "Review the project", which the child answers after
-   `CHILD_DELAY_MS` (default 4 s); the wake gets `WAKE_DONE`; a prompt
+   `CHILD_DELAY_MS` (default 4 s), and with `Then fail with: E.` in it
+   answers the delegating run's next step with a 500 whose error message is
+   E (`cell_wake_after_failure`); the wake gets `WAKE_DONE`; a prompt
    asking to repeat the previous answer gets it back. The header comment
    lists them.
 3. Point the cell at it: in vim, write `dist/cell/.dev.vars` after each
@@ -800,7 +801,9 @@ set `TMPDIR` to a scratch path for all of them):
 5. From `apps/server`: `node scripts/live-cell-probe.ts --url http://127.0.0.1:9884`,
    then each driver scenario but `delete-delegate` with
    `node scripts/live-cell-driver.ts --scenario <name> --url http://127.0.0.1:9884 --log <dir>`.
-6. Record each fixture to a scratch path:
+6. Record each of the seven cell fixtures (`simple`, `multi_turn`,
+   `turn_interrupt`, `queued_turn`, `provider_thread_resume`, `cell_wake`,
+   `cell_wake_after_failure`) to a scratch path:
    `node scripts/record-cell-replay-fixture.ts --scenario <name> --url http://127.0.0.1:9884 --out <scratch>/<name>.ndjson`.
    Each fixture records once per cell start; recording one again needs the
    cell started afresh (`--clean`): the deterministic test runtime mints the
