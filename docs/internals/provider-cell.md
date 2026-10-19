@@ -605,6 +605,10 @@ turns is still active is refused before anything reaches the cell, as a
 protocol error with the shared `previous_turn_active` reason, so the failure
 T3 shows says the previous turn is still running.
 
+The failed terminal is the failure's only report: it reserves the error row's
+place after the turn's items, and T3 writes the row from it, so a failed turn
+shows one error row on its root node.
+
 ## Alternatives rejected
 
 - **An ACP bridge process.** The cell edition's own design deferred a Node

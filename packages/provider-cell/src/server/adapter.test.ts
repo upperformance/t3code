@@ -1079,6 +1079,11 @@ describe("CellAdapterV2 over the fake cell", () => {
       assert.equal(failureOf(terminal)?.class, "usage_limit");
       assert.equal(failureOf(terminal)?.code, "usage_limit");
       assert.equal(failureOf(terminal)?.resetAt, "2026-10-19T00:00:00.000Z");
+      assert.lengthOf(
+        itemsOfType(harness.allEvents, "error"),
+        0,
+        "the terminal is the failure's only report; T3 writes the row",
+      );
     }).pipe(Effect.scoped, Effect.provide(liveLayer)),
   );
 

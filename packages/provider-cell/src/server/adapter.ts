@@ -1134,19 +1134,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             code: failureDetail.code ?? null,
             resetAt: failureDetail.resetAt ?? null,
           });
-          const base = baseItem(turn.scope, allocate(turn), completedAt, completedAt);
-          yield* emit({
-            type: "turn_item.updated",
-            driver: CELL_PROVIDER,
-            turnItem: {
-              ...base,
-              type: "error",
-              status: "failed",
-              title: failureClass === "usage_limit" ? "Usage limit reached" : null,
-              completedAt,
-              failure,
-            },
-          });
+          // The terminal is the failure's only report: T3 writes its error
+          // row from it, at the place reserved here after the turn's items.
+          const failureItemOrdinal = allocate(turn);
           yield* emit({
             type: "turn.terminal",
             driver: CELL_PROVIDER,
@@ -1155,7 +1145,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             runOrdinal: turn.input.runOrdinal,
             status,
             failure,
-            failureItemOrdinal: base.ordinal,
+            failureItemOrdinal,
             threadDisposition: disposition,
           });
         } else {
