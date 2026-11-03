@@ -15,6 +15,12 @@ export interface ThreadDeletionPlan {
   readonly effects: ReadonlyArray<PendingOrchestrationEffectV2>;
 }
 
+/** The only turn items a deletion settles: open native subagent rows. The rest of history stays unread. */
+export const DELETION_TURN_ITEMS = {
+  turnItemTypes: ["subagent"],
+  turnItemStatuses: ["pending", "running", "waiting"],
+} as const;
+
 export const planThreadDeletion = Effect.fn("ThreadDeletion.planThreadDeletion")(function* (input: {
   readonly command: Extract<OrchestrationV2Command, { readonly type: "thread.delete" }>;
   readonly projection: Pick<

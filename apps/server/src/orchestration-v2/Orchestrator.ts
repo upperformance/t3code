@@ -188,7 +188,7 @@ import {
   isForkableSourceRunStatus,
   ThreadForkServiceV2,
 } from "./ThreadForkService.ts";
-import { planThreadDeletion } from "./ThreadDeletion.ts";
+import { DELETION_TURN_ITEMS, planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
 
@@ -13108,16 +13108,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           deletion: typeof command,
         ) {
           const projection = yield* projectionStore
-            .getThreadRecords(deletion.threadId, [
-              "runs",
-              "attempts",
-              "nodes",
-              "runtimeRequests",
-              "subagents",
-              "providerSessions",
-              "providerThreads",
-              "turnItems",
-            ])
+            .getThreadRecords(
+              deletion.threadId,
+              [
+                "runs",
+                "attempts",
+                "nodes",
+                "runtimeRequests",
+                "subagents",
+                "providerSessions",
+                "providerThreads",
+                "turnItems",
+              ],
+              DELETION_TURN_ITEMS,
+            )
             .pipe(
               Effect.mapError(
                 (cause) => new OrchestratorProjectionError({ threadId: deletion.threadId, cause }),

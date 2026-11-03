@@ -30,7 +30,7 @@ import {
 } from "../orchestration-v2/ProjectCommands.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
-import { planThreadDeletion } from "../orchestration-v2/ThreadDeletion.ts";
+import { DELETION_TURN_ITEMS, planThreadDeletion } from "../orchestration-v2/ThreadDeletion.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectEnrichmentService from "./ProjectEnrichmentService.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
@@ -411,16 +411,20 @@ export const make = Effect.gen(function* () {
     threadId: ThreadId,
   ) {
     yield* legacyImporter.ensureTranscript(threadId);
-    const projection = yield* threadProjections.getThreadRecords(threadId, [
-      "runs",
-      "attempts",
-      "nodes",
-      "runtimeRequests",
-      "subagents",
-      "providerSessions",
-      "providerThreads",
-      "turnItems",
-    ]);
+    const projection = yield* threadProjections.getThreadRecords(
+      threadId,
+      [
+        "runs",
+        "attempts",
+        "nodes",
+        "runtimeRequests",
+        "subagents",
+        "providerSessions",
+        "providerThreads",
+        "turnItems",
+      ],
+      DELETION_TURN_ITEMS,
+    );
     if (projection.thread.deletedAt !== null || projection.thread.projectId !== input.projectId) {
       return;
     }
