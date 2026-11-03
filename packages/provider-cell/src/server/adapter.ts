@@ -2411,19 +2411,31 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             const turn = target;
             if (turn.run === undefined)
               return yield* protocolError("The cell has not named this turn's run yet");
+            const unconfirmed = (timeoutMs: number) =>
+              new ProviderAdapter.ProviderAdapterInterruptTimeoutError({
+                driver: CELL_PROVIDER,
+                providerThreadId: args.providerThread.id,
+                providerTurnId: args.providerTurnId,
+                timeoutMs,
+              });
+            // A cancel the cell never answered, hung or lost, is unconfirmed like a missing `done`;
+            // only an answer refuses it.
+            const cancelMs = Math.min(requestTimeoutMs, STOP_CANCEL_TIMEOUT_MS);
+            const runId = turn.run.id;
             const response = yield* request("POST", "/cancel", undefined, {
-              "x-run-id": turn.run.id,
+              "x-run-id": runId,
             }).pipe(
-              Effect.timeoutOrElse({
-                duration: Math.min(requestTimeoutMs, STOP_CANCEL_TIMEOUT_MS),
-                orElse: () => Effect.fail(protocolError("Cell POST cancel timed out")),
-              }),
+              Effect.timeout(cancelMs),
+              Effect.tapError((cause) =>
+                Effect.logWarning(`The cell did not answer the cancel of run ${runId}`, cause),
+              ),
+              Effect.mapError(() => unconfirmed(cancelMs)),
             );
             if (response.status === 409) {
               // The cell runs another run now, so this turn's has ended; its
               // `done` reaches the turn live or by replay and settles it.
               yield* Effect.logDebug(
-                `The cell refused to cancel run ${turn.run.id}: it runs ${readCellRefusal(response.body)?.runId ?? "another run"}`,
+                `The cell refused to cancel run ${runId}: it runs ${readCellRefusal(response.body)?.runId ?? "another run"}`,
               );
             } else if (response.status >= 400) {
               return yield* protocolError(`The cell answered ${response.status} to cancel`);
@@ -2434,15 +2446,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             yield* Deferred.await(turn.done).pipe(
               Effect.timeoutOrElse({
                 duration: confirmMs,
-                orElse: () =>
-                  Effect.fail(
-                    new ProviderAdapter.ProviderAdapterInterruptTimeoutError({
-                      driver: CELL_PROVIDER,
-                      providerThreadId: args.providerThread.id,
-                      providerTurnId: args.providerTurnId,
-                      timeoutMs: confirmMs,
-                    }),
-                  ),
+                orElse: () => Effect.fail(unconfirmed(confirmMs)),
               }),
             );
           },

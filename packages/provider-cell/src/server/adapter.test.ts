@@ -2084,8 +2084,10 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
     readonly answerPrompt: (status: number, body?: string) => Effect.Effect<void>;
     /** Fails the next `POST prompt` at the transport, as a dropped socket would. */
     readonly failPrompt: (detail: string) => Effect.Effect<void>;
-    /** Answers the next `POST cancel`; without one queued, a cancel answers 204. */
+    /** Answers the next `POST cancel`; without one queued, a cancel answers 204. Status 0 fails it at the transport. */
     readonly answerCancel: (status: number, body?: string) => Effect.Effect<void>;
+    /** Leaves the next `POST cancel` unanswered for good. */
+    readonly holdCancel: Effect.Effect<void>;
     readonly replayRequests: Array<string>;
     /** The `x-request-id` of every prompt posted, in order. */
     readonly promptRequestIds: Array<string | undefined>;
@@ -2113,7 +2115,7 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
     Effect.gen(function* () {
       const incoming = yield* Queue.unbounded<ReadonlyArray<string> | "close">();
       const answers = yield* Queue.unbounded<Answer>();
-      const cancelAnswers = yield* Queue.unbounded<Answer>();
+      const cancelAnswers = yield* Queue.unbounded<Answer | "hold">();
       let opening: ReadonlyArray<Record<string, unknown>> = [];
       let replay: (
         after: number,
@@ -2154,7 +2156,16 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
           if (request.method === "POST" && url.pathname.endsWith("/cancel")) {
             cancels.push(request.headers["x-run-id"]);
             return Queue.poll(cancelAnswers).pipe(
-              Effect.map(Option.getOrElse((): Answer => ({ status: 204, body: "" }))),
+              Effect.map(Option.getOrElse((): Answer | "hold" => ({ status: 204, body: "" }))),
+              Effect.flatMap((answer) =>
+                answer === "hold"
+                  ? Effect.never
+                  : answer.status === 0
+                    ? Effect.fail(
+                        new CellTransportError({ operation: "POST cancel", detail: answer.body }),
+                      )
+                    : Effect.succeed(answer),
+              ),
             );
           }
           if (url.pathname.endsWith("/events")) {
@@ -2207,6 +2218,7 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
           Queue.offer(answers, { status: 0, body: detail }).pipe(Effect.asVoid),
         answerCancel: (status, body = "") =>
           Queue.offer(cancelAnswers, { status, body }).pipe(Effect.asVoid),
+        holdCancel: Queue.offer(cancelAnswers, "hold").pipe(Effect.asVoid),
         replayRequests,
         promptRequestIds,
         cancels,
@@ -2970,6 +2982,53 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
           .pipe(Effect.flip);
         assert.equal(stop._tag, "ProviderAdapterInterruptTimeoutError");
         assert.deepEqual(cell.cancels, ["A"]);
+        assert.isFalse(
+          harness.allEvents.some((event) => event.type === "turn.terminal"),
+          "the unconfirmed turn stays open for the user to Force stop",
+        );
+        yield* cell.send([
+          {
+            type: "done",
+            runId: "A",
+            error: { code: "cancelled", message: "Cancelled." },
+            seq: 2,
+          },
+        ]);
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "interrupted");
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a Stop whose cancel the cell never answers, hung or lost, is reported unconfirmed like a missing done, and a definite refusal keeps its own error",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        // Shorter than the 5 s cancel bound, so the request's own timeout is the one that fires.
+        const harness = yield* makeHarness(cell.transport, "https://cell.test", {
+          adapterOptions: { requestTimeoutMs: 300 },
+        });
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+        yield* harness.takeEvent("provider_turn.updated");
+        yield* cell.send([{ type: "user", text: "Mine", runId: "A", seq: 1, origin: "user" }]);
+        const stop = harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: activeTurnId(harness.allEvents),
+          })
+          .pipe(Effect.flip);
+        yield* cell.holdCancel;
+        const hung = yield* stop;
+        assert.equal(hung._tag, "ProviderAdapterInterruptTimeoutError", hung.message);
+        yield* cell.answerCancel(0, "connection reset");
+        const lost = yield* stop;
+        assert.equal(lost._tag, "ProviderAdapterInterruptTimeoutError", lost.message);
+        yield* cell.answerCancel(500, '{"error":"no"}');
+        const refused = yield* stop;
+        assert.equal(refused._tag, "ProviderAdapterInterruptError");
+        assert.deepEqual(cell.cancels, ["A", "A", "A"]);
         assert.isFalse(
           harness.allEvents.some((event) => event.type === "turn.terminal"),
           "the unconfirmed turn stays open for the user to Force stop",
