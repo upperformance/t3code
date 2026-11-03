@@ -119,12 +119,9 @@ export const planThreadDeletion = Effect.fn("ThreadDeletion.planThreadDeletion")
       payload: { ...node, status: "cancelled", completedAt: now },
     });
   }
-  // A provider-native subagent that outlives its run (a cell's delegated
-  // task) keeps its subagent, node and item open until a later turn publishes
-  // the task's end. A deleted thread has no later turn, so the rows are
-  // settled here as cancelled, the roster that pinned the thread as waiting
-  // on the task goes with them, and the provider is asked to stop the task
-  // when its session is detached (below).
+  // A native subagent that outlives its run (a cell's task) waits for a later turn to publish its
+  // end; a deleted thread has none, so its rows and roster settle as cancelled here and the
+  // provider is asked to stop the task when the session detaches (below).
   const cancelledNodeIds = new Set(
     events.flatMap((event) => (event.type === "node.updated" ? [event.payload.id] : [])),
   );
@@ -288,6 +285,12 @@ export const planThreadDeletion = Effect.fn("ThreadDeletion.planThreadDeletion")
       },
     });
   }
+  effects.push({
+    id: `effect:${command.commandId}:scheduled-tasks.cleanup`,
+    commandId: command.commandId,
+    threadId: command.threadId,
+    request: { type: "scheduled-tasks.cleanup" },
+  });
   effects.push({
     id: `effect:${command.commandId}:terminal.cleanup`,
     commandId: command.commandId,
