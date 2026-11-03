@@ -1,14 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off preferSchemaOverJson:off - a plain Node stand-in for celld, used by recorders and tests.
 /**
- * A stand-in for a celld tenant speaking cell protocol 3: the cell's HTTP API
- * and WebSocket on a local port, with a scripted model instead of the
- * Responses API. It answers the shared fixture prompts the way the real cell
- * does, so transcripts recorded against it carry the real protocol shape:
- * every event numbered and persisted, run-scoped events naming their run,
- * `state` then the numbered `tasks` roster first on every socket, a paged
- * event log with bounded retention, structured `done` errors, the request id
- * a prompt is posted with kept on the run and answered again for a repeat,
- * refusals as `{ runId, error }`, and a cancel that names the run it is for.
+ * A stand-in for a celld tenant speaking cell protocol 3 on a local port, with a scripted model:
+ * it answers the shared fixture prompts with the real protocol's shape (docs/internals/provider-cell.md).
  */
 import * as NodeHttp from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -137,11 +130,8 @@ const PAGE_LIMIT = 1_000;
 const REQUEST_ID_MAX_LENGTH = 128;
 
 /**
- * Answers the shared fixture prompts: "Respond with exactly: X", a shell that
- * waits for Stop, the resume prompt that repeats the previous answer, and a
- * delegation whose run may then fail while the child works on. The failure
- * reads the way the cell words the 500 that
- * `apps/server/scripts/live-cell-api.mjs` answers there, its error as JSON.
+ * Answers the shared fixture prompts: exact replies, a shell that waits for Stop, the resume prompt,
+ * and a delegation whose run may then fail, worded as the cell words live-cell-api.mjs's 500.
  */
 const defaultFakeCellScript: FakeCellScript = (prompt, _turn, answers) => {
   const delegated =
@@ -512,11 +502,9 @@ export async function startFakeCellServer(
     if (path === "/state" && request.method === "GET") {
       return json(200, stateOf(target));
     }
-    // A prompt repeated with the request id of the run in progress, or of the
-    // run that ended last, is answered with that run rather than run again, so
-    // a client whose answer was lost can ask once more. Another id while a run
-    // is in progress is refused naming that run; every other refusal names no
-    // run and gives its reason.
+    // A repeated request id of the run in progress or the last run is answered with that run, not
+    // run again. Another id while a run is in progress is refused naming it; other refusals name
+    // no run and give their reason.
     if (path === "/prompt" && request.method === "POST") {
       const header = request.headers["x-request-id"];
       const requestId = typeof header === "string" && header.length > 0 ? header : null;

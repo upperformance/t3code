@@ -864,6 +864,7 @@ describe("CellAdapterV2 over the fake cell", () => {
         yield* Effect.promise(() => fake.onceIdle(project));
         const raced = yield* Effect.race(
           Effect.promise(() => connected).pipe(Effect.as("reconnected" as const)),
+          // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- proves that no reconnect happens; an absence has no event to await.
           Effect.sleep("150 millis").pipe(Effect.as("quiet" as const)),
         );
         assert.equal(raced, "quiet");
@@ -1840,6 +1841,7 @@ describe("CellAdapterV2 over a scripted socket", () => {
       assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
       assert.deepEqual(assistantTexts(harness.allEvents), ["BEFORE_CLOSE"]);
       // The reconnect follows the first short-lived connection's 500 ms backoff.
+      // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- the scripted transport has no completion signal; the backoff runs on the live clock.
       yield* Effect.sleep("700 millis");
       controller.assertComplete();
     }).pipe(Effect.scoped, Effect.provide(scriptedLayer)),
@@ -2240,6 +2242,7 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
   /** Waits on the live clock until the cell has seen as many requests of a kind. */
   const awaitRequests = (count: () => number, expected: number) =>
     Effect.gen(function* () {
+      // oxlint-disable-next-line t3code/no-polling-loop-in-tests, t3code/no-real-time-wait-in-tests -- the driven cell's request counters expose no notification.
       while (count() < expected) yield* Effect.sleep("5 millis");
     });
   /** Starts a turn and leaves it waiting on its unanswered prompt. */
@@ -2929,6 +2932,7 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
             providerTurnId: activeTurnId(harness.allEvents),
           })
           .pipe(Effect.forkScoped);
+        // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- proves the cancel is held behind the replay; an absence has no event to await.
         yield* Effect.sleep("50 millis");
         assert.deepEqual(cell.cancels, [], "the cancel waits behind the replay");
         yield* Deferred.succeed(releaseReplay, undefined);

@@ -1,12 +1,8 @@
 // @effect-diagnostics globalTimers:off - the fake cell runs live I/O; the orchestrator runs on the test clock.
 /**
- * A server restart while a cell runs a turn that has delegated work. The
- * cell notices nothing: the run and the child go on. T3's restart has to
- * take the run back natively, which it can only do if recovery records none
- * of that work as cancelled: a restart note would turn the continuation into
- * a prompt, which the cell refuses while its own run is in progress. The
- * child's rows survive too: the next session is handed them with the thread,
- * and the child's result lands on the subagent row that showed it start.
+ * A server restart while a cell runs a turn with delegated work: recovery records none of it as
+ * cancelled (a note would turn the continuation into a prompt the busy cell refuses), and the
+ * child's result lands on the subagent row that showed it start.
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -86,12 +82,9 @@ const describeProjection = (projection: OrchestrationV2ThreadProjection) =>
   ].join("\n");
 
 /**
- * The thread's projection once `ready` holds for it. The projection is read
- * when the wait begins and again after every event the thread stores from
- * then on, so a milestone is seen when it is persisted and never polled for;
- * the stream starts at the sequence read first, so an event stored between
- * the two is not missed. The bound runs on the wall clock, since the
- * orchestrator's clock does not move on its own here.
+ * The thread's projection once `ready` holds: read at the start and after every event stored from
+ * the sequence read first, so a milestone is seen when persisted, never polled for. The bound runs
+ * on the wall clock, since the orchestrator's clock does not move on its own here.
  */
 const once = Effect.fnUntraced(function* (
   threadId: ThreadId,
@@ -216,13 +209,9 @@ describe("cell restart with background work", () => {
           continueThreadsAfterServerUpdate: true,
         };
 
-        // The first server: the run delegates, answers once and is still in
-        // progress with its child running when the server stops the way it
-        // does: its effect worker stopped first, then the restart continuation
-        // prepared, the sessions shut down and what they left reconciled. The
-        // worker runs only while the run is driven, in a scope of its own, so
-        // that it is not running when the continuation is prepared, which it
-        // would otherwise execute at once against a run that is still live.
+        // The first server stops the way the real one does (worker, continuation, sessions,
+        // reconcile) while the run and its child are in progress. Its worker runs in a scope of
+        // its own that closes first, or it would execute the continuation against the live run.
         const before = yield* Effect.scoped(
           Effect.gen(function* () {
             const orchestrator = yield* Orchestrator.OrchestratorV2;

@@ -1,10 +1,7 @@
 // @effect-diagnostics globalTimers:off - the fake cell runs live I/O; the orchestrator runs on the test clock.
 /**
- * A thread deleted while a cell runs a task its finished run delegated. The
- * deletion settles the task's rows and the session's detach asks the cell to
- * cancel the task, then releases the session. The run settled long before, so
- * the release ending its event stream only ends the watch on the task: it is
- * an expected close, logged as information, not an ingestion failure.
+ * A thread deleted while its settled run's delegated task still runs: the deletion settles the
+ * task's rows, the detach asks the cell to cancel it, and the stream's end logs at info.
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";

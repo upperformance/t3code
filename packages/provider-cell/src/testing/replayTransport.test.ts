@@ -10,10 +10,7 @@ import { makeHttpCellTransport, type CellTransport } from "../server/transport.t
 import { startFakeCellServer, type FakeCellServer } from "./fakeCellServer.ts";
 import { makeRecordingCellTransport, makeReplayCellTransport } from "./replayTransport.ts";
 
-const liveLayer = Layer.mergeAll(
-  NodeHttpClient.layerUndici,
-  NodeWS.layerWebSocketConstructor,
-);
+const liveLayer = Layer.mergeAll(NodeHttpClient.layerUndici, NodeWS.layerWebSocketConstructor);
 const PROJECT = "t3-recorder";
 const PROMPTS = ["Respond with exactly: one", "Respond with exactly: two"] as const;
 

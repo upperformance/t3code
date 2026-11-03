@@ -1,19 +1,7 @@
 /**
- * One T3 thread is one cell project. The adapter posts prompts over HTTP and
- * reads the cell's broadcast events over its WebSocket, which it keeps open
- * for the life of the session and reopens whenever celld closes it. The cell
- * broadcasts the same events to every client, so nothing is attributed to a
- * T3 turn until the cell has said which run is T3's: the 202 to its prompt,
- * or, when that answer was lost, the request id T3 sent with the prompt found
- * on the run in the cell's state or on its opening event. From then on an
- * event is the turn's exactly when it carries that run id. The run T3 owns
- * and the number up to which its output is applied are kept on the provider
- * thread's head ref, which the orchestrator persists and hands back when a
- * later session resumes the thread, so a run that outlives T3 is taken back
- * or read to its end before anything else is sent. The tenant must speak
- * cell protocol 3: every event numbered, every connection opening with
- * `state` and the `tasks` roster, and a paged event log to read a gap back.
- * docs/internals/provider-cell.md records the rules.
+ * One T3 thread is one cell project: prompts over HTTP, the cell's broadcast events over a WebSocket
+ * kept open for the session. An event is a T3 turn's only once the cell named the run (the 202, or
+ * the prompt's request id found on the run); the owned run rides on the thread's head ref. docs/internals/provider-cell.md
  */
 import {
   type MessageId,
@@ -302,11 +290,8 @@ interface ActiveTurn {
   /** The cell's state at the latest reconnect while the prompt was unanswered, judged once the 202 names the run. */
   snapshot: CellSnapshot | undefined;
   /**
-   * The number the thread's head names this turn's run at: the boundary
-   * before anything of the run still to be applied when the run was named,
-   * then the number of each event of the run applied. Undefined until the
-   * head names the run; from then on the turn's end writes the head that
-   * follows it.
+   * The number the thread's head names this turn's run at: the boundary before the run's unapplied
+   * output, then each applied event's number. Undefined until the head names the run.
    */
   head: number | undefined;
 }
@@ -353,13 +338,9 @@ interface TaskRecord {
 }
 
 /**
- * A run no turn owns yet whose output is waiting for one. A `wake` is a run
- * the cell started on its own after a child finished, offered to the
- * orchestrator as a continuation with its own message id, so the continuation
- * turn that starts for it adopts exactly its output. A `restored` run is the
- * one the last session owned when it ended, read from the thread's persisted
- * head: T3's own restart continuation adopts it, and failing that it is
- * offered as a continuation when the next turn starts.
+ * A run no turn owns yet: a `wake` the cell started after a child finished, offered as a
+ * continuation with its own message id, or the `restored` run the last session owned, adopted by
+ * T3's restart continuation or else offered when the next turn starts.
  */
 interface PendingWake {
   readonly kind: "wake" | "restored";
@@ -487,8 +468,12 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: options.instanceId,
     driver: CELL_PROVIDER,
-    getCapabilities: () => Effect.succeed(CellProviderCapabilitiesV2),
-    planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
+    getCapabilities: Effect.fn("CellAdapterV2.getCapabilities")(function () {
+      return Effect.succeed(CellProviderCapabilitiesV2);
+    }),
+    planSelectionTransition: Effect.fn("CellAdapterV2.planSelectionTransition")(function () {
+      return Effect.succeed(turnScopedSelectionTransition());
+    }),
     openSession: Effect.fn("CellAdapterV2.openSession")(function* (
       input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
     ) {
@@ -544,11 +529,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       /** Where the last session left off, when it owned a run: the first snapshot reads the log back from here. */
       let resumeCursor: number | undefined;
       /**
-       * Whether a connection's snapshot has been used since the thread was
-       * attached. The first snapshot to complete, on whichever connection,
-       * is where the cursor starts or where the restored run is read back
-       * from; a connection that ends before its snapshot could be used
-       * leaves the next one to do so.
+       * Whether a connection's snapshot was used since the thread attached: the first complete one
+       * starts the cursor or reads the restored run back; one that ends first leaves it to the next.
        */
       let attached = false;
       /**
@@ -625,15 +607,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         });
       });
       /**
-       * The thread's persisted head while a run is T3's: the run, the request
-       * id its prompt was posted with, and the number up to which the run's
-       * output is applied. The orchestrator keeps it with the provider thread
-       * and hands it back when a later session resumes the thread, so that
-       * session can take the run back if the cell still runs it, or read its
-       * end from the log. The number is never the last one received, which
-       * runs ahead of the output while events wait for the prompt's answer:
-       * a session resuming from the head must find everything below it
-       * already applied, and read everything above it back.
+       * The thread's persisted head while a run is T3's: run, request id and the number up to which
+       * its output is applied (never the last received), so a resuming session finds everything
+       * below it applied and reads everything above it back.
        */
       const publishHead = Effect.fnUntraced(function* (
         turn: ActiveTurn,
@@ -1349,13 +1325,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       });
       const isActive = (turn: ActiveTurn) => active === turn;
       /**
-       * Which turn, if any, a run event belongs to. With no answer to the
-       * prompt yet it is a candidate. Once the run is named it is the turn's
-       * exactly when it carries that run id. Another run's event numbered
-       * below the run's opening event is an earlier run's tail that the 202
-       * overtook on the way here: nobody's, and no evidence about T3's run.
-       * One numbered after it means T3's run ended without its `done`
-       * reaching T3, since the cell runs one agent loop at a time.
+       * Which turn a run event belongs to: a candidate before the 202, then the turn's exactly when
+       * it carries its run id. Another run's event below the opener is an earlier tail; one after it
+       * means T3's run ended unseen, since the cell runs one agent loop at a time.
        */
       const handleRunEvent = Effect.fnUntraced(function* (event: CellRunEvent) {
         const turn = active;
@@ -1381,22 +1353,15 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       const runsRun = (snapshot: CellSnapshot, runId: string) =>
         snapshot.running && snapshot.runId === runId;
       /**
-       * The 202 has named T3's run. The candidates go through the same
-       * ownership rule as live events, in sequence order, so a stranger among
-       * them ends the turn exactly as it would have live and a wake among them
-       * is queued. A reconnect that found the prompt unanswered is judged
-       * next: a run that began at or before that snapshot, which the cell was
-       * not running at it and whose `done` the replay did not supply, ended
-       * unobserved.
+       * The 202 named T3's run: candidates go through the live ownership rule in sequence order, then
+       * a run that began at or before an unanswered reconnect's snapshot, not running then and with
+       * no `done` replayed, ended unobserved.
        */
       const accept = Effect.fnUntraced(function* (turn: ActiveTurn, run: CellRun) {
         turn.run = run;
         const candidates = turn.candidates.splice(0).toSorted((a, b) => a.seq - b.seq);
-        // Ownership is persisted at the number before anything of the run
-        // still to be applied: the candidates were received while the prompt
-        // was unanswered, so the last number received is past them, and a
-        // session that ended with the head there would resume with none of
-        // them. The head then follows each one applied.
+        // Ownership is persisted before the candidates (received while the prompt was unanswered),
+        // so a session ending here resumes with them; the head then follows each one applied.
         const boundary =
           Math.min(
             run.firstSeq,
@@ -1410,12 +1375,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         if (snapshot !== undefined && run.firstSeq <= snapshot.seq && !runsRun(snapshot, run.id)) {
           return yield* finish(turn, "failed", UNOBSERVED_END_MESSAGE, "transport_error");
         }
-        // On a steady connection the same rule holds against the snapshot T3
-        // follows the log from: a run that began at or before it, which the
-        // cell was not running at it, ended before T3 attached, so nothing of
-        // it will come on the socket and its `done` is not in anything T3
-        // applied. The cell answers a repeated request id with that run; the
-        // turn fails at once rather than waiting for an end that never comes.
+        // Likewise against the snapshot a steady connection follows: such a run ended before T3
+        // attached and nothing of it will come, so the turn fails now instead of waiting.
         if (
           latestSnapshot !== undefined &&
           run.firstSeq <= latestSnapshot.seq &&
@@ -1430,21 +1391,14 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         }
       });
       /**
-       * A continuation turn takes a queued run: the run is the turn's from
-       * here, its buffered events are replayed into it, and what the cell
-       * still sends for it arrives live. A run that lost events to a gap, or
-       * whose end T3 could not read back, ends as lost even when its `done`
-       * was read: what the buffer holds is not the whole run. A run a reset
-       * discarded ends naming the reset, after what the cell did for it
-       * before, since nothing more will come.
+       * A continuation turn takes a queued run: its buffered events replay into it, the rest arrives
+       * live. A run with a gap or an unreadable end ends as lost even with its `done`; one a reset
+       * discarded ends naming the reset.
        */
       const adopt = Effect.fnUntraced(function* (turn: ActiveTurn, wake: PendingWake) {
         turn.run = { id: wake.runId, firstSeq: wake.firstSeq };
-        // The head names the run from the number the queue started it at, a
-        // wake's opener or where the last session left off, both applied
-        // already, and follows each buffered event applied as it does live;
-        // so the turn's end writes the head that follows it, and a session
-        // ending during the replay resumes from what it had shown.
+        // The head names the run from the queue's start (already applied) and follows each buffered
+        // event, so a session ending during the replay resumes from what it had shown.
         yield* publishHead(turn, wake.runId, wake.firstSeq);
         for (const event of wake.events) {
           if (!isActive(turn)) break;
@@ -1487,11 +1441,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             return yield* observeTask(event.task);
           }
           case "reset":
-            // Only a dispatched continuation will come asking for its wake;
-            // the rest are simply gone. The run the last session owned stays,
-            // ended by the reset: the turn that comes to take it back, T3's
-            // own restart continuation or the offered one, must learn of the
-            // reset rather than post its text to the cell as a new prompt.
+            // Only a dispatched continuation asks for its wake; the rest are gone. The restored run
+            // stays, ended by the reset, so whoever takes it back learns of the reset.
             for (const wake of wakes.splice(0)) {
               if (wake.kind === "restored") {
                 wake.reset = true;
@@ -1584,11 +1535,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           ),
         );
       /**
-       * Reads the persisted events after `after` up to `upTo` a page at a
-       * time, applying each page in sequence order before fetching the next,
-       * so no more than one page is ever held. Events a page carries beyond
-       * `upTo` are left to the socket, which delivers everything after its
-       * snapshot live. A gap the cell no longer retains cannot be read back.
+       * Reads persisted events after `after` up to `upTo` a page at a time, applying each before the
+       * next. Events past `upTo` are the socket's; a gap the cell no longer retains cannot be read.
        */
       const catchUp: (after: number, upTo: number) => Effect.Effect<CatchUp> = Effect.fnUntraced(
         function* (after: number, upTo: number) {
@@ -1641,15 +1589,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         },
       );
       /**
-       * The connection's snapshot is complete: `state` said where the cell is
-       * and `tasks` is its roster at that number. On a reconnect the gap up to
-       * that number is read back first, so each replayed task row is observed
-       * with the turn that was running when the cell sent it, and the roster
-       * is applied at its own number after them. The active turn and the
-       * queued wakes are then judged against what the cell said it was
-       * running: a replay that was complete has already ended a turn whose
-       * `done` fell in the gap, so a run the cell is not running and that is
-       * still open here ended unobserved.
+       * The snapshot is complete (`state`, then the `tasks` roster at its number). On a reconnect the
+       * gap is read back first and the roster applied after it; a run the cell is not running that is
+       * still open here then ended unobserved.
        */
       const handleRoster = Effect.fnUntraced(function* (
         link: Connection,
@@ -1679,11 +1621,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           resumeCursor = undefined;
         }
         if (snapshot.seq < lastSeq) {
-          // The cell's counter never regresses, so a snapshot below the last
-          // number applied is not the history T3 was following. Nothing from
-          // it carries over: the turn and the queued wakes end as lost, and
-          // the adapter attaches afresh at the new snapshot, as on a first
-          // connection.
+          // The cell's counter never regresses, so a lower snapshot is another history: the turn and
+          // wakes end as lost and the adapter attaches afresh, as on a first connection.
           yield* Effect.logWarning(
             `The cell's event numbering went backwards from ${lastSeq} to ${snapshot.seq}; attaching afresh`,
           );
@@ -1759,11 +1698,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         if (first && ready) yield* Deferred.succeed(ready, undefined);
       });
       /**
-       * Frames follow the connection's phase: `state` first, then the `tasks`
-       * roster numbered at the same point, then events applied by their
-       * numbers. A frame out of that order, or a roster numbered elsewhere
-       * than its state, means the tenant is not keeping the protocol, and the
-       * connection is dropped rather than applied around.
+       * Frames follow the connection's phase: `state`, the roster at the same number, then numbered
+       * events. Anything out of that order means the tenant breaks the protocol; the socket is dropped.
        */
       const handleEvent: (event: CellEvent) => Effect.Effect<void> = Effect.fnUntraced(function* (
         event: CellEvent,
@@ -1855,14 +1791,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
                   yield* Fiber.interrupt(dropped.phase.timer);
                 }
                 connection = undefined;
-                // Decided here, after the connection's frames, so a snapshot
-                // that did complete before the close has attached the thread.
-                // One that ended before its snapshot could be used leaves the
-                // thread attaching: the next connection's snapshot attaches
-                // it. A connection the consumer dropped was counted when it
-                // was dropped; one that ended on its own, or that could not
-                // be opened, counts here, and after three in a row the attach
-                // fails naming the last reason, as a turn does.
+                // Decided after the connection's frames, so a snapshot completed before the close has
+                // attached. A connection that ended on its own or never opened counts here (a dropped
+                // one counted when dropped); three in a row fail the attach naming the last reason.
                 if (ready && !attached) {
                   if (dropped === undefined || dropped.phase.kind !== "broken") {
                     consecutiveBreaks += 1;
@@ -2107,15 +2038,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             event.type === "user" && event.requestId === turn.requestId,
         );
       /**
-       * The prompt's answer never came: a timeout, a dropped socket, or a
-       * status from something between T3 and the cell. The cell may still
-       * have started the run, and only the request id T3 sent with the prompt
-       * can say so: the run's opening event carries it, among the candidates
-       * or in the event log read from where T3 left off up to what `GET
-       * state` reports, and the state names the id of the run in progress.
-       * Nothing else is evidence; the prompt's text is not, since another
-       * client may have sent the same words. Anything less fails the turn
-       * with a message that says what T3 could not confirm.
+       * The prompt's answer was lost. Only the request id T3 sent can prove the cell started the run:
+       * on its opener (candidates or log up to `GET state`) or as state's run in progress. The text is
+       * no evidence; anything less fails the turn saying what could not be confirmed.
        */
       const resolveLostPrompt = Effect.fnUntraced(function* (turn: ActiveTurn, detail: string) {
         const echoed = findOpener(turn);
@@ -2275,11 +2200,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           }
           if (continuation || restart) {
             const messageId = turnInput.message.messageId;
-            // A provider continuation adopts only the wake this message was
-            // offered for, never the next wake's output. T3's own restart
-            // continuation adopts the run the last session owned, which the
-            // thread's persisted head named; with nothing restored, its text
-            // goes to the cell as a prompt like any other.
+            // A provider continuation adopts only the wake it was offered for; T3's restart
+            // continuation adopts the restored run, and with none its text is a prompt like any other.
             const index = continuation
               ? wakes.findIndex((wake) => wake.messageId === messageId)
               : wakes.findIndex((wake) => wake.kind === "restored");
@@ -2320,11 +2242,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             return yield* accept(turn, { id: accepted.runId, firstSeq: accepted.seq });
           }
           const refusal = readCellRefusal(response.body);
-          // A server error whose body is not the cell's own refusal, whatever
-          // else it carries (a proxy's HTML, a gateway's JSON error, nothing
-          // readable), came from something between T3 and the cell, or from a
-          // cell that may already have started the run: an answer as lost as
-          // no answer. Only the refusal shape itself fails the turn outright.
+          // A 5xx whose body is not the cell's refusal came from something in between, or from a cell
+          // that may have started the run: as lost as no answer. Only a refusal fails the turn.
           if (response.status >= 500 && refusal === undefined) {
             return yield* resolveLostPrompt(
               turn,
@@ -2367,48 +2286,43 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             wakes.length > 0 ||
             [...tasks.values()].some((record) => taskStatus(record.task.status) === "running"),
         ),
-        // The thread is being deleted: the delegated tasks the cell still
-        // runs for it are asked to stop, best effort, so they do not run on
-        // for a thread that no longer exists. The deletion settled their rows
-        // itself; a cancel the cell refuses or does not answer changes
-        // nothing here, and a task the cell no longer lists needs none. Each
-        // cancel has its own bound and they go out a few at a time, so one
-        // the cell does not answer does not keep the others from being sent.
-        cancelBackgroundWork: (args) =>
-          Effect.gen(function* () {
-            if (closed || project === undefined || thread?.appThreadId !== args.threadId) return;
-            const running = [...tasks.values()].filter(
-              (record) => taskStatus(record.task.status) === "running",
-            );
-            yield* Effect.forEach(
-              running,
-              (record) =>
-                Effect.gen(function* () {
-                  const taskId = record.task.taskId;
-                  const response = yield* request(
-                    "POST",
-                    `/tasks/${encodeURIComponent(taskId)}/cancel`,
-                  ).pipe(
-                    Effect.timeoutOrElse({
-                      duration: Math.min(requestTimeoutMs, TASK_CANCEL_TIMEOUT_MS),
-                      orElse: () =>
-                        Effect.fail(protocolError(`Cell POST cancel of task ${taskId} timed out`)),
-                    }),
-                    Effect.result,
+        // A deleted thread's running tasks are asked to stop, best effort (the deletion settled their
+        // rows). Each cancel has its own bound and a few go out at a time, so one unanswered cancel
+        // does not hold the others back.
+        cancelBackgroundWork: Effect.fn("CellAdapterV2.cancelBackgroundWork")(function* (args) {
+          if (closed || project === undefined || thread?.appThreadId !== args.threadId) return;
+          const running = [...tasks.values()].filter(
+            (record) => taskStatus(record.task.status) === "running",
+          );
+          yield* Effect.forEach(
+            running,
+            (record) =>
+              Effect.gen(function* () {
+                const taskId = record.task.taskId;
+                const response = yield* request(
+                  "POST",
+                  `/tasks/${encodeURIComponent(taskId)}/cancel`,
+                ).pipe(
+                  Effect.timeoutOrElse({
+                    duration: Math.min(requestTimeoutMs, TASK_CANCEL_TIMEOUT_MS),
+                    orElse: () =>
+                      Effect.fail(protocolError(`Cell POST cancel of task ${taskId} timed out`)),
+                  }),
+                  Effect.result,
+                );
+                if (Result.isFailure(response)) {
+                  yield* Effect.logWarning(
+                    `Could not ask the cell to cancel task ${taskId} (${args.reason}): ${response.failure.message}`,
                   );
-                  if (Result.isFailure(response)) {
-                    yield* Effect.logWarning(
-                      `Could not ask the cell to cancel task ${taskId} (${args.reason}): ${response.failure.message}`,
-                    );
-                  } else if (response.success.status >= 300) {
-                    yield* Effect.logWarning(
-                      `The cell answered ${response.success.status} to cancelling task ${taskId} (${args.reason})`,
-                    );
-                  }
-                }),
-              { concurrency: TASK_CANCEL_CONCURRENCY, discard: true },
-            );
-          }).pipe(commands.withPermits(1)),
+                } else if (response.success.status >= 300) {
+                  yield* Effect.logWarning(
+                    `The cell answered ${response.success.status} to cancelling task ${taskId} (${args.reason})`,
+                  );
+                }
+              }),
+            { concurrency: TASK_CANCEL_CONCURRENCY, discard: true },
+          );
+        }, commands.withPermits(1)),
         ensureThread: (args) =>
           register(args).pipe(
             commands.withPermits(1),
@@ -2463,8 +2377,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
               providerThreadId: args.providerThread.id,
             }),
           ),
-        interruptTurn: (args) =>
-          Effect.gen(function* () {
+        interruptTurn: Effect.fn("CellAdapterV2.interruptTurn")(
+          function* (args) {
             if (!validateThread(args.providerThread))
               return yield* protocolError("This cell turn is no longer active");
             // Decided under the event permit, behind whatever reconciliation
@@ -2522,18 +2436,21 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
                     ),
               }),
             );
-          }).pipe(
-            commands.withPermits(1),
-            Effect.mapError(
-              (cause) =>
-                new ProviderAdapter.ProviderAdapterInterruptError({
-                  driver: CELL_PROVIDER,
-                  providerThreadId: args.providerThread.id,
-                  providerTurnId: args.providerTurnId,
-                  cause,
-                }),
+          },
+          commands.withPermits(1),
+          (effect, args) =>
+            effect.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterInterruptError({
+                    driver: CELL_PROVIDER,
+                    providerThreadId: args.providerThread.id,
+                    providerTurnId: args.providerTurnId,
+                    cause,
+                  }),
+              ),
             ),
-          ),
+        ),
         respondToRuntimeRequest: (args) =>
           Effect.fail(
             new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({

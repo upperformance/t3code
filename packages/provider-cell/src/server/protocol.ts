@@ -1,15 +1,7 @@
 /**
- * The cell's wire shapes at cell protocol level 3: `GET state`, the WebSocket
- * events, the prompt and cancel answers, the event-log page, and the project
- * naming the adapter and the status probe share. Every event carries the
- * cell's sequence number, a non-negative integer that only grows; run-scoped
- * events name their run; a tenant that states a lower level, or none, is
- * refused before anything is sent to it. Events the cell adds after this
- * build are ignored rather than failing the socket, so this T3 keeps working
- * against a newer tenant. What the cell sends a client in answer to that
- * client's own socket message (an `exec` result, a refused socket prompt) is
- * a reply, not an event: it carries no number and is not modelled here, since
- * T3 sends no socket commands.
+ * The cell's wire shapes at protocol level 3 (docs/internals/provider-cell.md): every event numbered, run-scoped events naming
+ * their run, an older tenant refused before anything is sent. Unknown events are ignored so a newer
+ * tenant still works; replies to a client's own socket messages are not modelled.
  */
 import { ProviderDriverKind } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -46,11 +38,8 @@ export class CellProtocolError extends Schema.TaggedError<CellProtocolError>()(
 }
 
 /**
- * The cell's identity, in `GET state` and the `state` frame: its name,
- * `<tenant>/<project>`, and `misnamed`, text saying the runtime's and the
- * stored names disagreed when the cell was activated, or null when they
- * agreed. The cell also records a disagreement once as a numbered standalone
- * `error` of kind `identity`.
+ * The cell's identity in `GET state` and `state`: its `<tenant>/<project>` name, and `misnamed`
+ * saying the runtime's and stored names disagreed at activation (null when they agreed).
  */
 const identified = {
   name: Schema.optional(Schema.String),
@@ -230,13 +219,8 @@ export const CellPromptAccepted = Schema.Struct({
 export type CellPromptAccepted = typeof CellPromptAccepted.Type;
 
 /**
- * Body of every other answer to `POST prompt`, and of a 409 to `POST cancel`:
- * the run in progress, if the refusal is about one, and the reason when the
- * cell gives one. A 409 to a prompt names the active run; an empty prompt, a
- * missing API key or a cell busy with a fork or reset carry `runId: null`
- * and `error`; a cancel naming a run other than the active one answers the
- * active run's id and cancels nothing. `runId` is always present: a body
- * without it, whatever else it carries, is not the cell's.
+ * Every other answer to `POST prompt` and a 409 to `POST cancel`: the run in progress (or null)
+ * and the cell's reason. `runId` is always present; a body without it is not the cell's.
  */
 export const CellRefusal = Schema.Struct({
   runId: Schema.NullOr(Schema.String),
@@ -271,11 +255,8 @@ export function readPromptAccepted(body: string): CellPromptAccepted | undefined
 }
 
 /**
- * The cell's own refusal, when the body is exactly its shape: JSON with
- * `runId` present, naming the run in progress or null with a string `error`.
- * A proxy's error page, a gateway's `{ "error": ... }` without `runId`, an
- * empty body or `{ "runId": null }` alone is not one: an answer like that
- * says nothing about whether the cell started the run.
+ * The cell's own refusal, only when the body is exactly its shape (`runId` present, or null with an
+ * `error`); anything else says nothing about whether the cell started the run.
  */
 export function readCellRefusal(body: string): CellRefusal | undefined {
   const refusal = Option.getOrUndefined(decodeRefusal(body));
