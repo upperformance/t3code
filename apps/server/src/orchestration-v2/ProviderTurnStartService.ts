@@ -873,7 +873,12 @@ export const layer: Layer.Layer<
         persistedBackgroundWorkSurvivesRestart(session.providerSession.capabilities) === true;
       const noteContinuation =
         !workSurvivesRestart &&
-        isRestartNoteContinuation(run, projection.runs, projection.providerTurns, projection.attempts);
+        isRestartNoteContinuation(
+          run,
+          projection.runs,
+          projection.providerTurns,
+          projection.attempts,
+        );
       const restartCancelledWork = workSurvivesRestart
         ? []
         : pendingRestartCancelledBackgroundWork({
