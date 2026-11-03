@@ -1,5 +1,5 @@
 import { ProviderDriverKind } from "@t3tools/contracts";
-import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as NodeWS from "@effect/platform-node/NodeWS";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/http/HttpClient";
@@ -53,10 +53,10 @@ export type CellDriverEnv = CellAdapterV2DriverEnv | ProviderHost.ProviderHost;
 
 const makeTransport = makeHttpCellTransport.pipe(
   // The ws-backed constructor carries the bearer token on the handshake; the global one cannot.
-  Effect.provide(NodeSocket.layerWebSocketConstructorWS),
+  Effect.provide(NodeWS.layerWebSocketConstructor),
 );
 
-export const CellAdapterV2Driver: ProviderAdapterDriver<CellSettings, CellAdapterV2DriverEnv> = {
+const CellAdapterV2Driver: ProviderAdapterDriver<CellSettings, CellAdapterV2DriverEnv> = {
   driverKind: DRIVER_KIND,
   configSchema: CellSettings,
   defaultConfig: () => decodeCellSettings({}),

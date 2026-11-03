@@ -8,7 +8,7 @@
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as NodeWS from "@effect/platform-node/NodeWS";
 import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
@@ -219,7 +219,7 @@ describe("cell thread deletion with background work", () => {
             IdAllocator.layer,
             NodeServices.layer,
             NodeHttpClient.layerUndici,
-            NodeSocket.layerWebSocketConstructorWS,
+            NodeWS.layerWebSocketConstructor,
             Logger.layer([capture]),
           ),
         ),

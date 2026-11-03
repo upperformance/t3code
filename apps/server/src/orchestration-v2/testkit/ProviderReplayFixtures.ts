@@ -27,6 +27,7 @@ import { materializeReplayTranscriptRuntimeInstructions } from "./ReplayRuntimeI
 // silently never run, so loading this module fails instead.
 const DRIVERS_WITH_REPLAY_FIXTURE_FILES = new Set([
   "acpRegistry",
+  "cell",
   "claudeAgent",
   "codex",
   "cursor",

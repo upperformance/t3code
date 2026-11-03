@@ -18,7 +18,7 @@
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as NodeWS from "@effect/platform-node/NodeWS";
 import type { ProviderReplayEntry, ProviderReplayTranscript } from "@t3tools/contracts";
 import { makeHttpCellTransport } from "@t3tools/provider-cell/server";
 import { CellSettings } from "@t3tools/provider-cell/settings";
@@ -236,7 +236,7 @@ await Effect.runPromise(
       Layer.mergeAll(
         NodeServices.layer,
         NodeHttpClient.layerUndici,
-        NodeSocket.layerWebSocketConstructorWS,
+        NodeWS.layerWebSocketConstructor,
       ),
     ),
   ),

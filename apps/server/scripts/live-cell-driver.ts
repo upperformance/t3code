@@ -25,7 +25,7 @@
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { NodeWS as WS } from "@effect/platform-node-shared/NodeSocket";
+import * as WS from "@effect/platform-node/NodeWS";
 import {
   CommandId,
   type OrchestrationV2ThreadProjection,

@@ -1,9 +1,4 @@
-export {
-  CellAdapterV2Driver,
-  CellDriver,
-  type CellAdapterV2DriverEnv,
-  type CellDriverEnv,
-} from "./server/driver.ts";
+export { CellDriver, type CellAdapterV2DriverEnv, type CellDriverEnv } from "./server/driver.ts";
 export { makeCellAdapterV2, type CellAdapterV2Options } from "./server/adapter.ts";
 export { checkCellProviderStatus } from "./server/status.ts";
 export {

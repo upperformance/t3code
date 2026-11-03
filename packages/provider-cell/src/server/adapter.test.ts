@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
-import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as NodeWS from "@effect/platform-node/NodeWS";
 import {
   MessageId,
   NodeId,
@@ -68,7 +68,7 @@ const settingsFor = (baseUrl: string, token = "secret-token", enabled = true) =>
 const liveLayer = Layer.mergeAll(
   IdAllocator.layer,
   NodeHttpClient.layerUndici,
-  NodeSocket.layerWebSocketConstructorWS,
+  NodeWS.layerWebSocketConstructor,
 );
 const liveTransport = makeHttpCellTransport;
 
