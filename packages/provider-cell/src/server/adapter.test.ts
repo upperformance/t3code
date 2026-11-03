@@ -3051,6 +3051,14 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
           ),
           ["apply_patch failed"],
         );
+        const nodeIds = new Set(
+          harness.allEvents.flatMap((event) =>
+            event.type === "node.updated" ? [event.node.id] : [],
+          ),
+        );
+        for (const notice of itemsOfType(harness.allEvents, "system_notice")) {
+          assert.isTrue(nodeIds.has(notice.nodeId!), "a notice's node is published with it");
+        }
         yield* cell.answerPrompt(202, '{"runId":"B","seq":6}');
         yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Again", 2));
         yield* cell.send([{ type: "user", text: "Again", runId: "B", seq: 6, origin: "user" }]);

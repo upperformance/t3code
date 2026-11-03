@@ -129,7 +129,7 @@ shapes. What level 3 guarantees, and what the adapter builds on:
 - **A prompt carries a request id.** `POST prompt` takes an optional
   `x-request-id` header, an opaque string of at most 128 characters. The cell
   keeps it on the run it starts: the run's opening `user` event and `GET
-state` carry it as `requestId`, null when the run has none. A prompt
+  state` carry it as `requestId`, null when the run has none. A prompt
   repeated with the request id of the run in progress, or of the run that
   ended last, answers 202 with that run's `{ runId, seq }` instead of starting
   another run, so a client whose answer was lost can ask again safely. The
@@ -253,7 +253,7 @@ tenant rejected the token (401, 403) and as a transport error otherwise.
 | `patch`                  | A completed `file_change` item per changed path. The cell sends no diff, so the item has a name and operation.                                                                                                                                           |
 | `task`                   | Subagent lifecycle: `subagent.updated`, a `subagent` node and a `subagent` item keyed by the task id.                                                                                                                                                    |
 | `wake`                   | A cell-initiated run, queued and offered as a continuation; inside T3's own run, a notice item.                                                                                                                                                          |
-| `error`                  | Naming a run: a `system_notice` item of that run's turn (an apply_patch failure, for example); the turn goes on. Standalone: a warning in the log, assigned to no run; one of kind `identity` is the misnaming `state` reports, logged once per session. |
+| `error`                  | Naming a run: a `system_notice` item and node in that run's turn (patch failure, model retry); the turn goes on. Standalone: a warning in the log, assigned to no run; one of kind `identity` is the misnaming `state` reports, logged once per session. |
 | `done`                   | Turn completed; cancelled or interrupted when the error is a cancellation; otherwise failed, classified.                                                                                                                                                 |
 | `reset`                  | The conversation was reset from another client. An active turn fails, queued wakes are dropped.                                                                                                                                                          |
 | `fs`                     | Ignored: it serves the browser's file sync.                                                                                                                                                                                                              |
@@ -787,13 +787,17 @@ set `TMPDIR` to a scratch path for all of them):
    `CHILD_DELAY_MS` (default 4 s), and with `Then fail with: E.` in it
    answers the delegating run's next step with a 500 whose error message is
    E (`cell_wake_after_failure`); the wake gets `WAKE_DONE`; a prompt
-   asking to repeat the previous answer gets it back. The header comment
-   lists them.
+   asking to repeat the previous answer gets it back.
 3. Point the cell at it: in vim, write `dist/cell/.dev.vars` after each
    build (the build recreates `dist/cell`, dropping the file and the cell's
    local state) with the two lines `OPENAI_API_KEY=sk-test` (any non-empty
-   value: an empty key leaves the cell unconfigured) and
-   `OPENAI_BASE_URL=http://127.0.0.1:9815/v1`.
+   value: an empty key leaves the cell unconfigured),
+   `OPENAI_BASE_URL=http://127.0.0.1:9815/v1` and `MODEL_RETRY_DELAY_MS=1`.
+   The cell retries the API's 500 four times, each a standalone `error`
+   notice in the run; at its default 0.5 s backoff the retries outlast the
+   child, whose completion then reaches the socket before the failed run's
+   `done`, behind the gate `cell_wake_after_failure` holds it at, and that
+   recording never finishes.
 4. Start the cell with clean state:
    `CELLD_ESBUILD=$PWD/cell/node_modules/.bin/esbuild celld dev dist/cell --port 9884 --clean --no-watch`
    from vim; the cell reports itself in `GET state` (version `0.3.0` at the

@@ -856,6 +856,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       ) {
         const time = yield* DateTime.now;
         const base = baseItem(turn.scope, allocate(turn), time, time);
+        yield* emitNode(turn.scope, base, "system", "completed", time);
         yield* emit({
           type: "turn_item.updated",
           driver: CELL_PROVIDER,
