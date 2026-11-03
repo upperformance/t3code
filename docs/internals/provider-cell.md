@@ -260,8 +260,12 @@ tenant rejected the token (401, 403) and as a transport error otherwise.
 
 Interrupt is `POST cancel` naming the turn's run in `x-run-id`; the cell
 confirms with a cancelled `done`, and the adapter waits for that before
-reporting the turn interrupted. A `done` that beats the cancel settles the
-turn as completed. Stop pressed before the prompt registered waits behind the
+reporting the turn interrupted. Both stay inside the session manager's 15 s
+bound on an interrupt: the cancel has 5 s, the confirmation 8 s. Unconfirmed,
+Stop fails with `ProviderAdapterInterruptTimeoutError` and leaves the turn
+open, so T3 marks the run unresponsive and the user decides on Force stop; a
+late `done` still ends the turn as interrupted. A `done` that beats the
+cancel settles the turn as completed. Stop pressed before the prompt registered waits behind the
 prompt: start and interrupt share one permit, so the cancel goes out only
 once the cell has said which run it would cancel. Which turn is active is
 decided under the event permit, behind whatever reconciliation is in

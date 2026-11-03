@@ -195,6 +195,12 @@ const ROSTER_TIMEOUT_MS = 10_000;
  * others to be tried within the session manager's overall bound on the hook.
  */
 const TASK_CANCEL_TIMEOUT_MS = 3_000;
+/**
+ * Stop's cancel and the cell's confirming `done`, both inside the session manager's 15 s bound on
+ * an interrupt: past them the adapter reports the Stop unconfirmed and T3 offers Force stop.
+ */
+const STOP_CANCEL_TIMEOUT_MS = 5_000;
+const STOP_CONFIRM_TIMEOUT_MS = 8_000;
 const TASK_CANCEL_CONCURRENCY = 4;
 /**
  * How many connections in a row may fail to deliver a usable snapshot before
@@ -2407,7 +2413,12 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
               return yield* protocolError("The cell has not named this turn's run yet");
             const response = yield* request("POST", "/cancel", undefined, {
               "x-run-id": turn.run.id,
-            });
+            }).pipe(
+              Effect.timeoutOrElse({
+                duration: Math.min(requestTimeoutMs, STOP_CANCEL_TIMEOUT_MS),
+                orElse: () => Effect.fail(protocolError("Cell POST cancel timed out")),
+              }),
+            );
             if (response.status === 409) {
               // The cell runs another run now, so this turn's has ended; its
               // `done` reaches the turn live or by replay and settles it.
@@ -2417,38 +2428,36 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             } else if (response.status >= 400) {
               return yield* protocolError(`The cell answered ${response.status} to cancel`);
             }
+            // Unconfirmed, the turn stays open: a late `done` still ends it as interrupted, and the
+            // user decides whether to Force stop.
+            const confirmMs = Math.min(requestTimeoutMs, STOP_CONFIRM_TIMEOUT_MS);
             yield* Deferred.await(turn.done).pipe(
-              Effect.timeout(requestTimeoutMs),
-              Effect.catchTags({
-                TimeoutError: (cause) =>
-                  eventPermit
-                    .withPermits(1)(
-                      finish(
-                        turn,
-                        "failed",
-                        "The cell did not confirm the interruption in time.",
-                        "transport_error",
-                      ),
-                    )
-                    .pipe(
-                      Effect.andThen(
-                        protocolError("The cell did not confirm the interruption", cause),
-                      ),
-                    ),
+              Effect.timeoutOrElse({
+                duration: confirmMs,
+                orElse: () =>
+                  Effect.fail(
+                    new ProviderAdapter.ProviderAdapterInterruptTimeoutError({
+                      driver: CELL_PROVIDER,
+                      providerThreadId: args.providerThread.id,
+                      providerTurnId: args.providerTurnId,
+                      timeoutMs: confirmMs,
+                    }),
+                  ),
               }),
             );
           },
           commands.withPermits(1),
           (effect, args) =>
             effect.pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapter.ProviderAdapterInterruptError({
-                    driver: CELL_PROVIDER,
-                    providerThreadId: args.providerThread.id,
-                    providerTurnId: args.providerTurnId,
-                    cause,
-                  }),
+              Effect.mapError((cause) =>
+                cause._tag === "ProviderAdapterInterruptTimeoutError"
+                  ? cause
+                  : new ProviderAdapter.ProviderAdapterInterruptError({
+                      driver: CELL_PROVIDER,
+                      providerThreadId: args.providerThread.id,
+                      providerTurnId: args.providerTurnId,
+                      cause,
+                    }),
               ),
             ),
         ),

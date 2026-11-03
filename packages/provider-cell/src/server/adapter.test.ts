@@ -2949,6 +2949,45 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
   );
 
   it.live(
+    "a Stop the cell does not confirm in time is reported unconfirmed, inside the session manager's bound, and a late done still ends the turn as interrupted",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test", {
+          adapterOptions: { requestTimeoutMs: 300 },
+        });
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+        yield* harness.takeEvent("provider_turn.updated");
+        yield* cell.send([{ type: "user", text: "Mine", runId: "A", seq: 1, origin: "user" }]);
+        yield* cell.answerCancel(204);
+        const stop = yield* harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: activeTurnId(harness.allEvents),
+          })
+          .pipe(Effect.flip);
+        assert.equal(stop._tag, "ProviderAdapterInterruptTimeoutError");
+        assert.deepEqual(cell.cancels, ["A"]);
+        assert.isFalse(
+          harness.allEvents.some((event) => event.type === "turn.terminal"),
+          "the unconfirmed turn stays open for the user to Force stop",
+        );
+        yield* cell.send([
+          {
+            type: "done",
+            runId: "A",
+            error: { code: "cancelled", message: "Cancelled." },
+            seq: 2,
+          },
+        ]);
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "interrupted");
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
     "a cancel the cell refuses because another run is active means the run ended: the replayed done settles the turn",
     () =>
       Effect.gen(function* () {
