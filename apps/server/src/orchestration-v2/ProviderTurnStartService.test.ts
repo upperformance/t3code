@@ -829,32 +829,35 @@ function makeLocalCommandHarness(input: {
               providerSession,
               ensureThread: ensureThreadAfterResume,
             } as never)
-          : "historyReadFailureAfterFallback" in input || "resumeFailure" in input
+          : "historyReadFailureAfterFallback" in input
             ? Effect.succeed(resumeFallbackSession as never)
-            : "ensureThreadFailure" in input
-              ? Effect.succeed({ driver: providerThread.driver, ensureThread } as never)
-              : "openFailure" in input
-                ? Effect.sync(() => {
-                    if (input.interruptRunBeforeOpenFailure === true) interruptRun();
-                  }).pipe(
-                    Effect.andThen(
-                      Effect.fail(
-                        new ProviderSessionManager.ProviderSessionOpenError({
-                          instanceId: newInstanceId,
-                          providerSessionId,
-                          cause: input.openFailure,
-                        }),
+            : "resumeFailure" in input
+              ? // Turn start reads the session's capabilities before it resumes.
+                Effect.succeed({ ...resumeFallbackSession, providerSession } as never)
+              : "ensureThreadFailure" in input
+                ? Effect.succeed({ driver: providerThread.driver, ensureThread } as never)
+                : "openFailure" in input
+                  ? Effect.sync(() => {
+                      if (input.interruptRunBeforeOpenFailure === true) interruptRun();
+                    }).pipe(
+                      Effect.andThen(
+                        Effect.fail(
+                          new ProviderSessionManager.ProviderSessionOpenError({
+                            instanceId: newInstanceId,
+                            providerSessionId,
+                            cause: input.openFailure,
+                          }),
+                        ),
                       ),
-                    ),
-                  )
-                : input.failReadsAfterRunning === true || input.previousTurn !== undefined
-                  ? Effect.succeed({
-                      driver: providerThread.driver,
-                      providerSession,
-                      ensureThread: () => Effect.succeed(providerThread),
-                      resumeThread: () => Effect.succeed(projection.providerThreads[0]),
-                    } as never)
-                  : Effect.die("A local command must not open a native session."),
+                    )
+                  : input.failReadsAfterRunning === true || input.previousTurn !== undefined
+                    ? Effect.succeed({
+                        driver: providerThread.driver,
+                        providerSession,
+                        ensureThread: () => Effect.succeed(providerThread),
+                        resumeThread: () => Effect.succeed(projection.providerThreads[0]),
+                      } as never)
+                    : Effect.die("A local command must not open a native session."),
   );
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
