@@ -19,9 +19,10 @@ tenant, and T3 Code uses an API token.
    address your invite named. The bare base domain is the operator's own
    tenant.
 2. Open `<base URL>/login` in a browser and log in: the invite code and a
-   passphrase the first time, the passphrase after that.
-3. Choose **Create an API token** on the page that follows. The token is shown
-   once; copy it then. Only a browser session can create a token.
+   passphrase the first time, the passphrase after that. The editor opens.
+3. Choose **Account** in the editor's toolbar (or open `<base URL>/login`
+   again), then **Create an API token**. The token is shown once; copy it
+   then. Only a browser session can create a token.
 4. Paste it into the Cell instance's **Access token**. Changing the settings
    restarts the instance, so the next message uses the new token.
 
@@ -32,10 +33,22 @@ refuses the token, provider status and the thread say so with the steps above:
 create a new token and paste it in. Logging out in the browser does not end a
 token; to end every session and token of a tenant, ask its operator.
 
-The tenant also bounds what it runs: a daily allowance of model tokens, a few
-runs at a time, and a number of projects. A message refused for one of these
-fails with the tenant's words, which say what was reached and when it resets;
-the allowance shows as a usage limit with its reset time.
+The tenant also bounds what it runs, and each bound clears in its own way. A
+message refused for one of them fails with the tenant's words, which say
+which bound was reached and what to do. The numbers below are the defaults;
+the tenant's operator may set others.
+
+- **Model tokens per day** (5,000,000). The allowance renews at midnight UTC;
+  a message refused for it shows as a usage limit with that time.
+- **Runs at a time** (4), each for at most 30 minutes. A message refused
+  because every run is taken can be sent again once one ends. A run stopped at
+  its time limit keeps what it finished; the next message goes on from there.
+- **Projects** (200, counting the tenant's projects and the helper cells its
+  agents delegate to). This bound has no timed reset. Every T3 Code thread
+  takes one project for good, and so does provider status's check; deleting a
+  thread frees none. Once the tenant is full, a new thread's first message is
+  refused: ask the operator to delete projects. A helper cell's place comes
+  back when its task is removed from the task list on the project's page.
 
 ## How a cell thread works
 
@@ -74,10 +87,10 @@ each, in order.
 
 ## Status
 
-Provider status checks that the tenant answers and whether it has a model API
-key. If the tenant is unreachable, messages fail until it is back.
+Provider status checks that the tenant answers, that it accepts the access
+token, and whether it has a model API key. If the tenant is unreachable, messages fail until it is back.
 
-T3 Code needs a tenant whose celld speaks cell protocol 3 or later. An older
+T3 Code needs a tenant that speaks cell protocol 3 or later. An older
 tenant shows an error in provider status naming the protocol it speaks and the
 one T3 Code needs, and a message to it fails before anything is sent; the
 tenant's operator has to update it.

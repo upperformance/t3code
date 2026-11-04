@@ -162,7 +162,7 @@ export const checkCellProviderStatus = Effect.fn("checkCellProviderStatus")(func
         status: "warning",
         auth,
         message:
-          "The tenant has no model API key, so prompts will be refused until OPENAI_API_KEY is configured on celld.",
+          "The tenant has no model API key, so prompts will be refused until its operator configures OPENAI_API_KEY.",
       },
       state.success.model,
     );

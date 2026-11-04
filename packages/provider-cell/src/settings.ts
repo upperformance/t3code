@@ -28,7 +28,7 @@ export const CellSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Access token",
         description:
-          "An API token of the tenant, sent as a bearer token with every request. Create one at <base URL>/login → Create an API token; a tenant without a login needs none.",
+          "An API token of the tenant, sent as a bearer token with every request. Log in at <base URL>/login, then choose Account → Create an API token; a tenant without a login needs none.",
         providerSettingsForm: { control: "password", clearWhenEmpty: "omit" },
       }),
     ),
