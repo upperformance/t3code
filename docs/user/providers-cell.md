@@ -6,8 +6,36 @@ coding agent that works on them. Nothing is installed on the machine hosting
 your environment; T3 Code talks to the tenant over the network.
 
 Open **Settings → Providers**, add a **Cell** instance, and set **Base URL** to
-your tenant, such as `https://acme.vim.app`. Set **Access token** if the tenant
-requires one. Refresh provider status, then pick Cell in a thread's model picker.
+your tenant, such as `https://acme.vim.app`. Set **Access token** to an API
+token of the tenant (below). Refresh provider status, then pick Cell in a
+thread's model picker.
+
+## Connecting to a tenant
+
+A deployed tenant has its login on: every request needs a session of the
+tenant, and T3 Code uses an API token.
+
+1. **Base URL** is the tenant's origin, `https://<tenant>.<base domain>`, the
+   address your invite named. The bare base domain is the operator's own
+   tenant.
+2. Open `<base URL>/login` in a browser and log in: the invite code and a
+   passphrase the first time, the passphrase after that.
+3. Choose **Create an API token** on the page that follows. The token is shown
+   once; copy it then. Only a browser session can create a token.
+4. Paste it into the Cell instance's **Access token**. Changing the settings
+   restarts the instance, so the next message uses the new token.
+
+A token lasts 90 days. It ends earlier when the tenant's passphrase is reset
+with a new invite code, or when the operator suspends the tenant; it never
+works again after that, even once the tenant is resumed. When the tenant
+refuses the token, provider status and the thread say so with the steps above:
+create a new token and paste it in. Logging out in the browser does not end a
+token; to end every session and token of a tenant, ask its operator.
+
+The tenant also bounds what it runs: a daily allowance of model tokens, a few
+runs at a time, and a number of projects. A message refused for one of these
+fails with the tenant's words, which say what was reached and when it resets;
+the allowance shows as a usage limit with its reset time.
 
 ## How a cell thread works
 
@@ -51,8 +79,8 @@ key. If the tenant is unreachable, messages fail until it is back.
 
 T3 Code needs a tenant whose celld speaks cell protocol 3 or later. An older
 tenant shows an error in provider status naming the protocol it speaks and the
-one T3 Code needs, and a message to it fails before anything is sent; update
-celld on the tenant.
+one T3 Code needs, and a message to it fails before anything is sent; the
+tenant's operator has to update it.
 
 The connection to a cell may be reset while the tenant moves it; T3 Code
 reconnects on its own, reads back what it missed, and the turn carries on. If
