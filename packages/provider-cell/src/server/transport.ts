@@ -36,6 +36,8 @@ export class CellTransportError extends Schema.TaggedError<CellTransportError>()
     operation: Schema.String,
     detail: Schema.String,
     closed: Schema.optional(Schema.Boolean),
+    /** The close code the socket ended with, when it was closed rather than lost. */
+    closeCode: Schema.optional(Schema.Number),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -113,15 +115,17 @@ export const makeHttpCellTransport: Effect.Effect<
           Effect.map((frames) =>
             frames.map((frame) => (typeof frame === "string" ? frame : decoder.decode(frame))),
           ),
-          Effect.mapError(
-            (cause) =>
-              new CellTransportError({
-                operation: `read ${input.url}`,
-                detail: errorDetail(cause),
-                closed: true,
-                cause,
-              }),
-          ),
+          Effect.mapError((cause) => {
+            const closeCode =
+              cause.reason._tag === "SocketCloseError" ? cause.reason.code : undefined;
+            return new CellTransportError({
+              operation: `read ${input.url}`,
+              detail: errorDetail(cause),
+              closed: true,
+              ...(closeCode === undefined ? {} : { closeCode }),
+              cause,
+            });
+          }),
         ),
       };
     }),

@@ -1,7 +1,7 @@
 // A scripted OpenAI Responses API for the live cell run: point a cell's OPENAI_BASE_URL at it.
 //   node scripts/live-cell-api.mjs [port=9815] [holdMs=20000]   (CHILD_DELAY_MS=30000 for delete-delegate)
 // The latest user message picks the answer; the prompt table is in docs/internals/provider-cell.md (Testing).
-// Every request is logged with its step (function calls since the prompt) and prompt.
+// Every request is logged with its step and prompt; every answer reports usage (bytes / 4).
 import * as NodeHttp from "node:http";
 
 const port = Number(process.argv[2] ?? 9815);
@@ -58,7 +58,14 @@ NodeHttp.createServer((req, res) => {
       .find((item) => item.type === "message" && item.role === "assistant");
     const previousText =
       previous?.content?.find?.((part) => part.type === "output_text")?.text ?? "";
-    const ok = (output) => json(200, { id: `resp_${n}`, status: "completed", output });
+    const usage = (output) => ({
+      input_tokens: Math.ceil(data.length / 4),
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens: Math.ceil(JSON.stringify(output).length / 4),
+      output_tokens_details: { reasoning_tokens: 0 },
+    });
+    const ok = (output) =>
+      json(200, { id: `resp_${n}`, status: "completed", output, usage: usage(output) });
     console.log(
       `${stamp()} [api] #${n} step ${step} model=${body.model} prompt=${JSON.stringify(prompt.split("\n")[0].slice(0, 100))}`,
     );

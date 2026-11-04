@@ -1,6 +1,8 @@
 /**
  * The status probe reads `GET state` of a dedicated probe project and never
  * posts a prompt, so a background refresh cannot start a run or spend tokens.
+ * It sends the instance's token, so a tenant with the login on answers it as
+ * it will answer the threads: a refusal shows here with what to do.
  */
 import type { ServerProviderModel } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -20,6 +22,7 @@ import {
   cellProbeProjectName,
   readCellState,
 } from "./protocol.ts";
+import { CELL_ACCESS_STATUSES, cellAccessError } from "./errors.ts";
 import type { CellTransport } from "./transport.ts";
 
 const CELL_PRESENTATION = {
@@ -110,13 +113,21 @@ export const checkCellProviderStatus = Effect.fn("checkCellProviderStatus")(func
     });
   }
   const { status, body } = response.success.value;
-  if (status === 401 || status === 403) {
+  // The tenant refused the token, the request, or everything: a cell tenant
+  // all the same, whose answer says what to do.
+  if (CELL_ACCESS_STATUSES.has(status)) {
+    const refused = cellAccessError({
+      baseUrl: settings.baseUrl,
+      token: settings.token,
+      status,
+      body,
+    });
     return snapshot({
       installed: true,
       version: null,
       status: "error",
-      auth: { status: "unknown" },
-      message: "The cell tenant rejected the access token. Update it in Settings → Providers.",
+      auth: { status: status === 401 ? "unauthenticated" : "unknown" },
+      message: refused.message,
     });
   }
   const state = yield* readCellState(body).pipe(Effect.result);
@@ -140,21 +151,21 @@ export const checkCellProviderStatus = Effect.fn("checkCellProviderStatus")(func
     });
   }
   const version = state.success.version ?? null;
+  // A state read with the token is the token accepted; without one the
+  // tenant has no login and nothing is known about accounts.
+  const auth = { status: settings.token ? "authenticated" : "unknown" } as const;
   if (!state.success.configured) {
     return snapshot(
       {
         installed: true,
         version,
         status: "warning",
-        auth: { status: "unknown" },
+        auth,
         message:
           "The tenant has no model API key, so prompts will be refused until OPENAI_API_KEY is configured on celld.",
       },
       state.success.model,
     );
   }
-  return snapshot(
-    { installed: true, version, status: "ready", auth: { status: "unknown" } },
-    state.success.model,
-  );
+  return snapshot({ installed: true, version, status: "ready", auth }, state.success.model);
 });

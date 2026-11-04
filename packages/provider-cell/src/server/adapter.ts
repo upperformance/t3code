@@ -24,6 +24,7 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
+import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -48,7 +49,14 @@ import {
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 
 import type { CellSettings } from "../settings.ts";
-import { CellModelError, CellRuntimeModeError } from "./errors.ts";
+import {
+  CELL_ACCESS_STATUSES,
+  CELL_SESSION_CLOSE,
+  CellModelError,
+  CellRuntimeModeError,
+  cellAccessError,
+  type CellAccessError,
+} from "./errors.ts";
 import {
   CELL_PROVIDER,
   CellEvent,
@@ -64,7 +72,9 @@ import {
   readCellRefusal,
   readCellState,
   readPromptAccepted,
+  readRunUsage,
   type CellRunEvent,
+  type CellRunUsage,
   type CellTask,
 } from "./protocol.ts";
 import { CellTransportError, type CellTransport } from "./transport.ts";
@@ -300,6 +310,8 @@ interface ActiveTurn {
    * output, then each applied event's number. Undefined until the head names the run.
    */
   head: number | undefined;
+  /** What the run used, as its `done` reported it. */
+  usage: CellRunUsage | undefined;
 }
 
 /** A run of the cell's agent loop: its id and the number of its opening event. */
@@ -320,7 +332,9 @@ interface CellSnapshot {
 type CatchUp =
   | { readonly kind: "complete" }
   | { readonly kind: "truncated"; readonly after: number; readonly upTo: number }
-  | { readonly kind: "failed"; readonly detail: string };
+  | { readonly kind: "failed"; readonly detail: string }
+  /** The log answered 401: the session's reading has ended, and the turn with it. */
+  | { readonly kind: "access_lost" };
 
 /** The rows a task is published to: its subagent node and item, and its place among the turn's items. */
 interface TaskRows extends OpenItem {
@@ -402,7 +416,21 @@ type Inbox =
   | { readonly type: "connected"; readonly broken: Deferred.Deferred<string> }
   | { readonly type: "frame"; readonly text: string }
   | { readonly type: "roster_timeout"; readonly connection: number }
-  | { readonly type: "disconnected"; readonly detail: string };
+  | { readonly type: "disconnected"; readonly detail: string }
+  /**
+   * A connection the cell closed with 4401, or one that never opened, ended:
+   * `GET state` decides, behind the connection's frames, whether the session
+   * still reads. `decided` is completed whatever the answer.
+   */
+  | { readonly type: "check_access"; readonly decided: Deferred.Deferred<void> };
+
+/**
+ * A cell request's outcome once the tenant refused the token: the request
+ * itself entered access loss (or found it entered), so its caller only stops.
+ */
+class CellAccessLost extends Data.TaggedError("CellAccessLost")<{
+  readonly refused: CellAccessError;
+}> {}
 
 const decodeFrame = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeEvent = Schema.decodeUnknownEffect(CellEvent);
@@ -454,6 +482,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       detail,
       ...(payload === undefined ? {} : { payload }),
     });
+  /** The tenant's refusal of T3 itself (401, 403, 503, a 4401 close), in words that say what to do. */
+  const refusedAccess = (status: number, body: string) =>
+    cellAccessError({ baseUrl, token, status, body });
   const nativeRef = (
     nativeId: string | null,
     strength: OrchestrationV2ProviderRef["strength"],
@@ -519,6 +550,21 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       const inbox = yield* Queue.unbounded<Inbox>();
       const commands = yield* Semaphore.make(1);
       const eventPermit = yield* Semaphore.make(1);
+      /** The fiber holding the event permit, so a request it makes enters access loss without asking for the permit again. */
+      let permitHolder: Fiber.Fiber<unknown, unknown> | undefined;
+      /** The event permit: every cell event, prompt answer, reconciliation and access loss is applied under it. */
+      const underPermit = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+        eventPermit.withPermits(1)(
+          Effect.withFiber((fiber) => {
+            permitHolder = fiber;
+            return Effect.ensuring(
+              effect,
+              Effect.sync(() => {
+                permitHolder = undefined;
+              }),
+            );
+          }),
+        );
       let closed = false;
       let project: string | undefined;
       let tenantModel: string | undefined;
@@ -552,7 +598,14 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
        * entry leaves when that turn starts or the orchestrator clears it.
        */
       const resetWakes = new Set<MessageId>();
-      let ready: Deferred.Deferred<void, ProviderAdapter.ProviderAdapterProtocolError> | undefined;
+      let ready:
+        | Deferred.Deferred<void, ProviderAdapter.ProviderAdapterProtocolError | CellAccessError>
+        | undefined;
+      /**
+       * The tenant refused this session's token (401), which never holds again. Set once, by
+       * `loseAccess`, never cleared: the session's reader is over until the instance gets a new token.
+       */
+      let accessLost: CellAccessError | undefined;
       const tasks = new Map<string, TaskRecord>();
       const finishedBackground: Array<BackgroundWorkReport> = [];
       const wakes: Array<PendingWake> = [];
@@ -633,38 +686,69 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           },
         });
       });
+      /**
+       * Access loss once a request was answered 401, entered under the event
+       * permit: directly when the requesting fiber holds it, else by taking
+       * it. The caller learns only that access is lost.
+       */
+      const enterAccessLoss = (refused: CellAccessError) =>
+        Effect.withFiber((fiber) =>
+          fiber === permitHolder ? loseAccess(refused) : underPermit(loseAccess(refused)),
+        ).pipe(
+          Effect.andThen(
+            Effect.suspend(() =>
+              Effect.fail(new CellAccessLost({ refused: accessLost ?? refused })),
+            ),
+          ),
+        );
+      /**
+       * Every cell request of the session, and the one place its answer is judged for access: a 401,
+       * whatever asked and whether or not its turn is still in progress, enters access loss before the
+       * caller sees it (`CellAccessLost`). A shorter bound goes in `timeoutMs`, never around the call.
+       */
       const request = (
         method: "GET" | "POST",
         path: string,
-        body?: string,
-        extraHeaders: Readonly<Record<string, string>> = {},
+        extra: {
+          readonly body?: string;
+          readonly headers?: Readonly<Record<string, string>>;
+          readonly timeoutMs?: number;
+        } = {},
       ) =>
-        options.transport
-          .request({
-            method,
-            url: cellApiUrl(baseUrl, project ?? "", path),
-            headers: {
-              ...headers,
-              "x-client": `t3-${input.providerSessionId}`,
-              ...extraHeaders,
-            },
-            ...(body === undefined ? {} : { body }),
-          })
-          .pipe(
-            Effect.timeout(requestTimeoutMs),
-            Effect.mapError((cause) =>
-              protocolError(
-                cause._tag === "TimeoutError"
-                  ? `Cell ${method} ${path} timed out`
-                  : `Cell ${method} ${path} failed: ${cause.detail}`,
-                cause,
-              ),
-            ),
-          );
+        Effect.suspend(() =>
+          accessLost !== undefined
+            ? Effect.fail(new CellAccessLost({ refused: accessLost }))
+            : options.transport
+                .request({
+                  method,
+                  url: cellApiUrl(baseUrl, project ?? "", path),
+                  headers: {
+                    ...headers,
+                    "x-client": `t3-${input.providerSessionId}`,
+                    ...extra.headers,
+                  },
+                  ...(extra.body === undefined ? {} : { body: extra.body }),
+                })
+                .pipe(
+                  Effect.timeout(extra.timeoutMs ?? requestTimeoutMs),
+                  Effect.mapError((cause) =>
+                    protocolError(
+                      cause._tag === "TimeoutError"
+                        ? `Cell ${method} ${path} timed out`
+                        : `Cell ${method} ${path} failed: ${cause.detail}`,
+                      cause,
+                    ),
+                  ),
+                  Effect.filterOrElse(
+                    (response) => response.status !== 401,
+                    (response) => enterAccessLoss(refusedAccess(401, response.body)),
+                  ),
+                ),
+        );
       const readState = Effect.fnUntraced(function* () {
         const response = yield* request("GET", "/state");
-        if (response.status === 401 || response.status === 403)
-          return yield* protocolError("The cell tenant rejected the access token");
+        if (CELL_ACCESS_STATUSES.has(response.status))
+          return yield* refusedAccess(response.status, response.body);
         if (response.status !== 200)
           return yield* protocolError(`The cell answered ${response.status} to GET state`);
         const state = yield* readCellState(response.body).pipe(
@@ -1090,7 +1174,31 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         if (active !== turn) return;
         const completedAt = yield* DateTime.now;
         yield* closeOpenItems(turn, status === "completed" ? "failed" : status);
-        turn.providerTurn = { ...turn.providerTurn, status, completedAt };
+        // What the run used, as its `done` said: complete for a run that
+        // completed, partial for one that ended otherwise, whose last request
+        // may have been cut off before its usage was read.
+        const usage = turn.usage;
+        turn.providerTurn = {
+          ...turn.providerTurn,
+          status,
+          completedAt,
+          ...(usage === undefined
+            ? {}
+            : {
+                turnTokenUsage: {
+                  usageScope: "main_agent" as const,
+                  usageStatus:
+                    status === "completed" ? ("complete" as const) : ("partial" as const),
+                  inputTokens: usage.inputTokens,
+                  cachedInputTokens: usage.cachedTokens,
+                  outputTokens: usage.outputTokens,
+                  reasoningTokens: usage.reasoningTokens,
+                  hasSubagents: [...tasks.values()].some(
+                    (record) => record.owner?.providerTurnId === turn.scope.providerTurnId,
+                  ),
+                },
+              }),
+        };
         lastProviderTurn = turn.providerTurn;
         yield* emit({
           type: "provider_turn.updated",
@@ -1161,12 +1269,14 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           driver: CELL_PROVIDER,
           nativeItemId: `${options.instanceId}:${project}:${kind === "wake" ? "run" : "restored"}:${runId}`,
         });
-      const enqueueWake = Effect.fnUntraced(function* (opening: CellRunEvent) {
+      /** The one place a wake is queued; a session whose token was refused queues none. */
+      const queueWake = (kind: PendingWake["kind"], runId: string, firstSeq: number) => {
+        if (accessLost !== undefined) return undefined;
         const wake: PendingWake = {
-          kind: "wake",
-          messageId: wakeMessageId("wake", opening.runId),
-          runId: opening.runId,
-          firstSeq: opening.seq,
+          kind,
+          messageId: wakeMessageId(kind, runId),
+          runId,
+          firstSeq,
           events: [],
           ended: false,
           lost: false,
@@ -1175,7 +1285,11 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           dispatched: false,
         };
         wakes.push(wake);
-        yield* offerWake(wake);
+        return wake;
+      };
+      const enqueueWake = Effect.fnUntraced(function* (opening: CellRunEvent) {
+        const wake = queueWake("wake", opening.runId, opening.seq);
+        if (wake !== undefined) yield* offerWake(wake);
       });
       /**
        * The run the last session owned is queued like a wake, so what the cell
@@ -1185,22 +1299,13 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
        */
       const restoreRun = (run: RestoredRun) =>
         Effect.sync(() => {
-          wakes.push({
-            kind: "restored",
-            messageId: wakeMessageId("restored", run.runId),
-            runId: run.runId,
-            firstSeq: run.cursor,
-            events: [],
-            ended: false,
-            lost: false,
-            reset: false,
-            offered: false,
-            dispatched: false,
-          });
-          resumeCursor = run.cursor;
+          if (queueWake("restored", run.runId, run.cursor) !== undefined) {
+            resumeCursor = run.cursor;
+          }
         });
       const offerWake = Effect.fnUntraced(function* (wake: PendingWake) {
         wake.offered = true;
+        if (accessLost !== undefined) return;
         if (!thread?.appThreadId || !options.continuationRequests) return;
         const notification = backgroundWorkNotification(finishedBackground.splice(0));
         yield* options.continuationRequests.offer({
@@ -1212,9 +1317,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           messageId: wake.messageId,
           ...(notification ? { notification } : {}),
           dispatchIfCurrent: (dispatch) =>
-            eventPermit.withPermits(1)(
+            underPermit(
               Effect.suspend(() =>
-                wakes.includes(wake) && !closed
+                wakes.includes(wake) && !closed && accessLost === undefined
                   ? dispatch.pipe(
                       Effect.tap(() =>
                         Effect.sync(() => {
@@ -1228,7 +1333,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
               ),
             ),
           clearIfCurrent: () =>
-            eventPermit.withPermits(1)(
+            underPermit(
               dropWake(wake).pipe(
                 Effect.tap(() =>
                   Effect.sync(() => {
@@ -1315,6 +1420,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           case "error":
             return yield* publishNotice(turn, "Cell error", event.text);
           case "done": {
+            turn.usage = readRunUsage(event.usage);
             const outcome = classifyCellDone(event.error);
             if (outcome.kind === "completed") return yield* finish(turn, "completed");
             if (outcome.kind === "cancelled")
@@ -1356,6 +1462,31 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       /** Candidates a refused or failed prompt leaves behind still matter when they are a wake's run. */
       const releaseCandidates = Effect.fnUntraced(function* (turn: ActiveTurn) {
         for (const event of turn.candidates.splice(0)) yield* routeUnowned(event);
+      });
+      /**
+       * Access loss, the terminal state of the session's reader (docs/internals/provider-cell.md):
+       * entered once, under the event permit, from `request` or a refused socket. Buffered wakes and
+       * candidates are discarded, the turn in progress gets the refusal as its one terminal.
+       */
+      const loseAccess = Effect.fnUntraced(function* (refused: CellAccessError) {
+        if (accessLost !== undefined) return;
+        accessLost = refused;
+        wakes.splice(0);
+        if (ready !== undefined) yield* Deferred.fail(ready, refused);
+        const turn = active;
+        if (turn !== undefined) {
+          turn.candidates.splice(0);
+          yield* finish(turn, "failed", refused.message, "provider_error", "reusable", {
+            code: refused.code,
+          });
+        }
+        yield* updateSession("error", refused.message);
+        yield* Effect.logWarning(
+          `The cell tenant refused the token of thread ${input.threadId}; the session stops reading the cell ${project ?? "?"}`,
+        );
+        const fiber = socketFiber;
+        socketFiber = undefined;
+        if (fiber) yield* Fiber.interrupt(fiber);
       });
       const runsRun = (snapshot: CellSnapshot, runId: string) =>
         snapshot.running && snapshot.runId === runId;
@@ -1554,7 +1685,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
               `/events?after=${cursor}&limit=${EVENTS_PAGE_LIMIT}`,
             ).pipe(Effect.result);
             if (Result.isFailure(response)) {
-              return { kind: "failed", detail: response.failure.detail };
+              return response.failure._tag === "CellAccessLost"
+                ? { kind: "access_lost" }
+                : { kind: "failed", detail: response.failure.detail };
             }
             if (response.success.status !== 200) {
               return {
@@ -1653,6 +1786,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         }
         const caughtUp: CatchUp =
           snapshot.seq > lastSeq ? yield* catchUp(lastSeq, snapshot.seq) : { kind: "complete" };
+        if (caughtUp.kind === "access_lost") return;
         if (caughtUp.kind === "failed") {
           if (!first) {
             // The cursor stays where the replay stopped; the next connection's snapshot presents the rest of the gap again.
@@ -1772,7 +1906,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
       yield* Stream.fromQueue(inbox).pipe(
         Stream.runForEach((entry) =>
           Effect.gen(function* () {
-            if (closed) return;
+            // A session whose token was refused reads nothing more, not even what was already received.
+            if (closed || accessLost !== undefined) return;
             switch (entry.type) {
               case "connected":
                 connections += 1;
@@ -1811,6 +1946,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
                 }
                 return yield* Effect.logDebug(`Cell socket closed: ${entry.detail}`);
               }
+              case "check_access":
+                return yield* checkAccess;
               case "frame": {
                 // A frame that is not an event of the protocol (not JSON, a
                 // known type with a bad number or a missing field) is a
@@ -1826,16 +1963,33 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
                 );
               }
             }
-          }).pipe(eventPermit.withPermits(1)),
+          }).pipe(
+            underPermit,
+            Effect.ensuring(
+              entry.type === "check_access"
+                ? Deferred.succeed(entry.decided, undefined)
+                : Effect.void,
+            ),
+          ),
         ),
         Effect.forkIn(scope),
       );
 
+      /**
+       * `GET state` after a socket closed with 4401 or never opened, under the event permit behind
+       * its frames. A 401 entered access loss in `request`; a 403 here is the token refused too.
+       */
+      const checkAccess: Effect.Effect<void> = Effect.suspend(() => request("GET", "/state")).pipe(
+        Effect.flatMap((response) =>
+          response.status === 403 ? loseAccess(refusedAccess(403, response.body)) : Effect.void,
+        ),
+        Effect.ignore,
+      );
       const runSocket = Effect.fnUntraced(function* (projectName: string) {
         const url = cellSocketUrl(baseUrl, projectName, `t3-${input.providerSessionId}`);
         let failures = 0;
         for (;;) {
-          if (closed) return;
+          if (closed || accessLost !== undefined) return;
           let connectedAt: number | undefined;
           const broken = yield* Deferred.make<string>();
           const outcome = yield* Effect.scoped(
@@ -1871,6 +2025,15 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             ? `${outcome.failure.detail} (${url})`
             : `socket ended (${url})`;
           yield* Queue.offer(inbox, { type: "disconnected", detail });
+          // A socket closed with 4401, or never opened, asks over HTTP once, behind its frames: a refused
+          // token ends the reading instead of a reconnect loop. Anything else reconnects.
+          const closeCode = Result.isFailure(outcome) ? outcome.failure.closeCode : undefined;
+          if (connectedAt === undefined || closeCode === CELL_SESSION_CLOSE) {
+            const decided = yield* Deferred.make<void>();
+            yield* Queue.offer(inbox, { type: "check_access", decided });
+            yield* Deferred.await(decided);
+            if (accessLost !== undefined) return;
+          }
           const now = yield* Clock.currentTimeMillis;
           const healthy = connectedAt !== undefined && now - connectedAt >= HEALTHY_CONNECTION_MS;
           failures = healthy ? 0 : failures + 1;
@@ -1896,7 +2059,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           yield* Queue.shutdown(inbox);
           // `end`, not `shutdown`: the terminal just emitted must still reach the consumer.
           yield* Queue.end(events);
-        }).pipe(eventPermit.withPermits(1)),
+        }).pipe(underPermit),
       );
 
       const checkModel = (model: string): Effect.Effect<void, CellModelError> =>
@@ -1907,6 +2070,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         args: ProviderAdapter.ProviderAdapterV2EnsureThreadInput,
       ) {
         if (closed) return yield* protocolError("Cell session is closed; reopen it");
+        // Nothing reattaches a session whose token was refused, so a retried attach asks nothing.
+        if (accessLost !== undefined) return yield* accessLost;
         if (active) return yield* protocolError("Cannot change cell threads during an active turn");
         yield* checkRuntimeMode(args.runtimePolicy);
         const existing = args.existingProviderThread;
@@ -1926,6 +2091,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         if (thread) return yield* protocolError("Open a new session to attach another cell");
         project = requested;
         const state = yield* readState().pipe(
+          // A 401 entered access loss in `request`: the attach fails with the refusal.
+          Effect.catchTags({ CellAccessLost: (lost) => Effect.fail(lost.refused) }),
           Effect.onError(() =>
             Effect.sync(() => {
               project = undefined;
@@ -1991,7 +2158,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             };
         const connected = yield* Deferred.make<
           void,
-          ProviderAdapter.ProviderAdapterProtocolError
+          ProviderAdapter.ProviderAdapterProtocolError | CellAccessError
         >();
         ready = connected;
         socketFiber = yield* runSocket(requested).pipe(Effect.forkIn(scope));
@@ -2055,6 +2222,21 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           return yield* accept(turn, { id: echoed.runId, firstSeq: echoed.seq });
         }
         const state = yield* readState().pipe(Effect.result);
+        // A 401 entered access loss in `request`, which ended the turn.
+        if (Result.isFailure(state) && state.failure._tag === "CellAccessLost") return;
+        if (Result.isFailure(state) && state.failure._tag === "CellAccessError") {
+          yield* releaseCandidates(turn);
+          return yield* finish(
+            turn,
+            "failed",
+            state.failure.message,
+            "provider_error",
+            "reusable",
+            {
+              code: state.failure.code,
+            },
+          );
+        }
         if (Result.isFailure(state)) {
           yield* releaseCandidates(turn);
           return yield* finish(
@@ -2066,6 +2248,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         }
         if (state.success.seq > lastSeq) {
           const caughtUp = yield* catchUp(lastSeq, state.success.seq);
+          if (caughtUp.kind === "access_lost") return;
           if (caughtUp.kind !== "complete") {
             yield* releaseCandidates(turn);
             return yield* finish(
@@ -2154,6 +2337,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           candidates: [],
           snapshot: undefined,
           head: undefined,
+          usage: undefined,
         };
         yield* Effect.gen(function* () {
           thread = turnInput.providerThread;
@@ -2175,6 +2359,14 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           yield* updateSession("running");
           for (const record of republish) yield* publishTask(record);
           republish.clear();
+          // The tenant refused this session's token: the turn ends with the
+          // refusal, which says how to make a new token, and nothing is sent.
+          if (accessLost !== undefined) {
+            yield* finish(turn, "failed", accessLost.message, "provider_error", "reusable", {
+              code: accessLost.code,
+            });
+            return yield* updateSession("error", accessLost.message);
+          }
           if (turnInput.runtimePolicy.runtimeMode !== FULL_ACCESS) {
             return yield* finish(
               turn,
@@ -2225,19 +2417,26 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
           // naming it.
           const restored = wakes.find((wake) => wake.kind === "restored" && !wake.offered);
           if (restored !== undefined) yield* offerWake(restored);
-        }).pipe(eventPermit.withPermits(1));
+        }).pipe(underPermit);
         // `active` is read through a call: the guard above narrowed the captured
         // variable to undefined for the rest of this function, which is stale.
         // A turn that adopted a run has nothing to post.
         if (continuation || !isActive(turn) || turn.run !== undefined) return;
-        const outcome = yield* request("POST", "/prompt", turnInput.message.text, {
-          "x-request-id": turn.requestId,
+        const outcome = yield* request("POST", "/prompt", {
+          body: turnInput.message.text,
+          headers: { "x-request-id": turn.requestId },
         }).pipe(Effect.result);
         yield* Effect.gen(function* () {
+          // Access loss, entered by `request` on a 401 or by any other path
+          // while the prompt was in flight, has ended the turn and discarded
+          // what it buffered: nothing of the answer is read.
+          if (accessLost !== undefined) return;
           // A turn that ended while the prompt was in flight leaves its candidates to the unowned path.
           if (!isActive(turn)) return yield* releaseCandidates(turn);
           if (Result.isFailure(outcome)) {
-            return yield* resolveLostPrompt(turn, outcome.failure.detail);
+            return outcome.failure._tag === "CellAccessLost"
+              ? undefined
+              : yield* resolveLostPrompt(turn, outcome.failure.detail);
           }
           const response = outcome.success;
           if (response.status === 202) {
@@ -2257,9 +2456,32 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
               `the cell answered ${response.status} to the prompt`,
             );
           }
+          // A 403 or 503 refuses this request, not the token (a 401 never gets here): the turn fails, the session reads on.
+          if (refusal === undefined && CELL_ACCESS_STATUSES.has(response.status)) {
+            const refused = refusedAccess(response.status, response.body);
+            yield* releaseCandidates(turn);
+            return yield* finish(turn, "failed", refused.message, "provider_error", "reusable", {
+              code: refused.code,
+            });
+          }
           // Nothing broadcast before the refusal was T3's run.
           yield* releaseCandidates(turn);
-          const reason = refusal?.error ?? response.body.trim().slice(0, 500);
+          const reason = (refusal?.error ?? response.body.trim().slice(0, 500)).replace(
+            /[.\s]+$/,
+            "",
+          );
+          // A prompt refused because the tenant's daily allowance is spent is
+          // the usage limit a run's `done` reports, with when it renews.
+          if (refusal?.code === "usage_limit") {
+            return yield* finish(
+              turn,
+              "failed",
+              `The cell did not start the turn: ${reason}.`,
+              "usage_limit",
+              "reusable",
+              { code: "usage_limit", resetAt: refusal.resetAt },
+            );
+          }
           if (response.status === 409) {
             return yield* finish(
               turn,
@@ -2275,11 +2497,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             turn,
             "failed",
             `The cell answered ${response.status} to the prompt${reason ? `: ${reason}` : ""}`,
-            refusal !== undefined || response.status === 401 || response.status === 403
-              ? "provider_error"
-              : "transport_error",
+            refusal !== undefined ? "provider_error" : "transport_error",
           );
-        }).pipe(eventPermit.withPermits(1));
+        }).pipe(underPermit);
       });
 
       const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
@@ -2288,16 +2508,24 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
         providerSessionId: input.providerSessionId,
         providerSession: session,
         events: Stream.fromQueue(events),
+        // A session whose token was refused reads nothing more, so it waits on nothing.
         hasPendingBackgroundWork: Effect.sync(
           () =>
-            wakes.length > 0 ||
-            [...tasks.values()].some((record) => taskStatus(record.task.status) === "running"),
+            accessLost === undefined &&
+            (wakes.length > 0 ||
+              [...tasks.values()].some((record) => taskStatus(record.task.status) === "running")),
         ),
         // A deleted thread's running tasks are asked to stop, best effort (the deletion settled their
         // rows). Each cancel has its own bound and a few go out at a time, so one unanswered cancel
-        // does not hold the others back.
+        // does not hold the others back. A refused token stops them: `request` sends nothing then.
         cancelBackgroundWork: Effect.fn("CellAdapterV2.cancelBackgroundWork")(function* (args) {
-          if (closed || project === undefined || thread?.appThreadId !== args.threadId) return;
+          if (
+            closed ||
+            accessLost !== undefined ||
+            project === undefined ||
+            thread?.appThreadId !== args.threadId
+          )
+            return;
           const running = [...tasks.values()].filter(
             (record) => taskStatus(record.task.status) === "running",
           );
@@ -2305,19 +2533,16 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             running,
             (record) =>
               Effect.gen(function* () {
+                if (accessLost !== undefined) return;
                 const taskId = record.task.taskId;
                 const response = yield* request(
                   "POST",
                   `/tasks/${encodeURIComponent(taskId)}/cancel`,
-                ).pipe(
-                  Effect.timeoutOrElse({
-                    duration: Math.min(requestTimeoutMs, TASK_CANCEL_TIMEOUT_MS),
-                    orElse: () =>
-                      Effect.fail(protocolError(`Cell POST cancel of task ${taskId} timed out`)),
-                  }),
-                  Effect.result,
-                );
+                  { timeoutMs: Math.min(requestTimeoutMs, TASK_CANCEL_TIMEOUT_MS) },
+                ).pipe(Effect.result);
                 if (Result.isFailure(response)) {
+                  // A 401 entered access loss in `request`: it is the session's error already.
+                  if (response.failure._tag === "CellAccessLost") return;
                   yield* Effect.logWarning(
                     `Could not ask the cell to cancel task ${taskId} (${args.reason}): ${response.failure.message}`,
                   );
@@ -2392,7 +2617,7 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
             // is in progress: a replay that has just ended the turn leaves
             // nothing to cancel, and the run the cancel names keeps the cell
             // from ending a later run instead.
-            const target = yield* eventPermit.withPermits(1)(
+            const target = yield* underPermit(
               Effect.sync(() => {
                 const turn = active;
                 if (turn === undefined || turn.providerTurn.id !== args.providerTurnId) {
@@ -2418,19 +2643,22 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
                 providerTurnId: args.providerTurnId,
                 timeoutMs,
               });
-            // Only the cell's 4xx refuses a cancel. A 5xx (the cell's or a gateway's), a lost or
-            // hung request, or a missing `done` leaves it unconfirmed.
+            // A 401 is access loss (entered in `request`, which ends the turn with the refusal), any
+            // other 4xx refuses the cancel, and a 5xx, a lost or hung request, or a missing `done`
+            // leaves it unconfirmed.
             const cancelMs = Math.min(requestTimeoutMs, STOP_CANCEL_TIMEOUT_MS);
             const runId = turn.run.id;
-            const response = yield* request("POST", "/cancel", undefined, {
-              "x-run-id": runId,
+            const response = yield* request("POST", "/cancel", {
+              headers: { "x-run-id": runId },
+              timeoutMs: cancelMs,
             }).pipe(
-              Effect.timeout(cancelMs),
+              Effect.catchTags({ CellAccessLost: () => Effect.succeed("access lost" as const) }),
               Effect.tapError((cause) =>
                 Effect.logWarning(`The cell did not answer the cancel of run ${runId}`, cause),
               ),
               Effect.mapError(() => unconfirmed(cancelMs)),
             );
+            if (response === "access lost") return;
             if (response.status === 409) {
               // The cell runs another run now, so this turn's has ended; its
               // `done` reaches the turn live or by replay and settles it.
@@ -2442,6 +2670,9 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
                 `The cancel of run ${runId} got ${response.status}, so it is unconfirmed`,
               );
               return yield* unconfirmed(cancelMs);
+            } else if (response.status === 403) {
+              // A 403 refuses the Stop, not the token: say why; the run goes on.
+              return yield* refusedAccess(response.status, response.body);
             } else if (response.status >= 400) {
               return yield* protocolError(`The cell answered ${response.status} to cancel`);
             }

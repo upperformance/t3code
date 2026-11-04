@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off globalDateInEffect:off globalConsole:off preferSchemaOverJson:off globalFetchInEffect:off - a live driver: it runs the real orchestrator and adapter against a cell on celld, logs on the wall clock, and bounds its own reads of the cell with an AbortSignal.
+// @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off globalDateInEffect:off globalConsole:off preferSchemaOverJson:off globalFetchInEffect:off globalFetch:off - a live driver: it runs the real orchestrator and adapter against a cell on celld, logs on the wall clock, bounds its own reads of the cell with an AbortSignal, and posts the operator's request and other projects' prompts itself.
 /**
  * Drives the real orchestrator and cell adapter against a live cell for the scenarios the recorder
  * cannot express, logging every HTTP exchange and socket frame with a wall-clock stamp.
@@ -101,6 +101,11 @@ const PROMPTS = {
   reconnect: "Hold: Respond with exactly: reconnect ok",
   restart: "Hold: Respond with exactly: RESUMED",
   attachRetry: "Respond with exactly: attach retry ok",
+  access: "Respond with exactly: access ok",
+  revoke:
+    "Do not answer immediately. First run the local shell command `sleep 35`, then respond with exactly: revoked run should not finish.",
+  afterRevoke: "Respond with exactly: after the revocation",
+  holder: "Hold: Respond with exactly: holder",
 } as const;
 
 /** The adapter runs on the test clock; the cell on the wall clock. */
@@ -122,9 +127,11 @@ const makeWebSocket: Socket.WebSocketConstructor["Service"] = (url, options) => 
   const ordinal = socketOrdinal;
   latestSocket = socket;
   socket.on("open", () => log(`ws#${ordinal} open ${url}`));
-  socket.on("close", (code, reason) =>
-    log(`ws#${ordinal} closed code=${code} reason=${String(reason)}`),
-  );
+  socket.on("close", (code, reason) => {
+    log(`ws#${ordinal} closed code=${code} reason=${String(reason)}`);
+    if (code === 4401 && socketsAfterClose === undefined) socketsAfterClose = 0;
+  });
+  if (socketsAfterClose !== undefined) socketsAfterClose += 1;
   socket.on("error", (error) => log(`ws#${ordinal} error ${error.message}`));
   return socket as unknown as globalThis.WebSocket;
 };
@@ -157,6 +164,7 @@ const loggingTransport = (live: CellTransport): CellTransport => ({
     log(
       `>> ${input.method} ${input.url} headers=${JSON.stringify(redact(input.headers))}${input.body === undefined ? "" : ` body=${JSON.stringify(input.body)}`}`,
     );
+    if (input.method === "POST" && input.url.endsWith("/prompt")) promptsPosted += 1;
     const isTaskCancel = input.method === "POST" && /\/tasks\/[^/]+\/cancel$/.test(input.url);
     if (isTaskCancel) onTaskCancelSent?.({ url: input.url, headers: input.headers });
     const response = yield* live.request(input).pipe(
@@ -226,6 +234,30 @@ const loggingTransport = (live: CellTransport): CellTransport => ({
     };
   }),
 });
+
+/** The login-era scenarios check what the thread shows; each exits non-zero on a miss. */
+const errorsOf = (projection: OrchestrationV2ThreadProjection | undefined) =>
+  (projection?.turnItems ?? []).flatMap((item) => (item.type === "error" ? [item.failure] : []));
+const check = (ok: boolean, what: string) =>
+  ok
+    ? Effect.sync(() => log(`${scenarioName}: check passed: ${what}`))
+    : Effect.die(new Error(`${scenarioName}: check failed: ${what}`));
+/** A POST of the driver's own, beside the adapter: the operator's request, or another project's prompt. */
+const postNow = async (path: string, body: string, headers: Record<string, string>) => {
+  const response = await fetch(`${baseUrl}${path}`, { method: "POST", headers, body });
+  const text = await response.text();
+  log(`driver POST ${path} -> ${response.status} ${text.slice(0, 300)}`);
+  return response.status;
+};
+const post = (path: string, body: string, headers: Record<string, string>) =>
+  Effect.promise(() => postNow(path, body, headers));
+const operateNow = (token: string) =>
+  postNow("/login/operator", new URLSearchParams({ token }).toString(), {
+    "content-type": "application/x-www-form-urlencoded",
+  });
+const operate = (token: string) => Effect.promise(() => operateNow(token));
+let promptsPosted = 0;
+let socketsAfterClose: number | undefined;
 
 const describeProjection = (projection: OrchestrationV2ThreadProjection) =>
   [
@@ -327,6 +359,17 @@ const stepsFor = (name: string): ReadonlyArray<OrchestratorFixtureInputStep> => 
       return [{ type: "message", text: PROMPTS.attachRetry }];
     case "delete-delegate":
       return [{ type: "message", text: PROMPTS.delegate }];
+    case "access":
+    case "runs-bound":
+      return [{ type: "message", text: PROMPTS.access }];
+    // Two model requests, so an allowance that covers the first runs out at the second.
+    case "allowance":
+      return [{ type: "message", text: PROMPTS.shell }];
+    case "revoke":
+      return [
+        { type: "message", text: PROMPTS.revoke },
+        { type: "message", text: PROMPTS.afterRevoke },
+      ];
     default:
       throw new Error(`Unknown scenario ${name}`);
   }
@@ -376,6 +419,27 @@ const main = Effect.gen(function* () {
       }, RECONNECT_KILL_AFTER_MS);
       onPromptAccepted = undefined;
     };
+  }
+
+  const authorization: Record<string, string> = settings.token
+    ? { authorization: `Bearer ${settings.token}` }
+    : {};
+  if (scenarioName === "revoke") {
+    const suspend = readArgValue("--suspend");
+    if (suspend === undefined)
+      return yield* Effect.die(new Error("revoke needs --suspend <token>"));
+    onPromptAccepted = () => {
+      onPromptAccepted = undefined;
+      log("revoke: prompt accepted; the operator suspends the tenant");
+      void operateNow(suspend);
+    };
+  }
+  const holder = `${runTag.replace(/[^A-Za-z0-9._-]/g, "-")}-holder`.slice(0, 60);
+  if (scenarioName === "runs-bound") {
+    yield* post(`/cell/${holder}/prompt`, PROMPTS.holder, {
+      ...authorization,
+      "x-request-id": `holder-${runTag}`,
+    });
   }
 
   if (scenarioName === "delete-delegate") {
@@ -535,6 +599,52 @@ const main = Effect.gen(function* () {
           ),
         );
       log(`attach-retry: check passed: ${socketOrdinal} sockets, the prompt completed`);
+    }
+    const [projection] = result.projections.values();
+    const failures = errorsOf(projection);
+    const first = failures[0];
+    if (scenarioName === "access") {
+      yield* check(
+        projection?.runs[0]?.status === "failed" &&
+          /Settings → Providers|not serving requests|refused T3's request/.test(
+            first?.message ?? "",
+          ),
+        `the run failed with the tenant's refusal and what to do: ${first?.message}`,
+      );
+      yield* check(promptsPosted === 0, `no prompt was posted (${promptsPosted})`);
+    }
+    if (scenarioName === "revoke") {
+      const resume = readArgValue("--resume");
+      yield* check(
+        projection?.runs[0]?.status === "failed" &&
+          first?.code === "cell_unauthorized" &&
+          /suspended/.test(first.message),
+        `the run failed with the refusal naming the suspension: ${first?.message}`,
+      );
+      yield* check(
+        projection?.runs[1]?.status === "failed" && /Access token/.test(failures[1]?.message ?? ""),
+        `the next message failed at once with the refusal: ${failures[1]?.message}`,
+      );
+      yield* check(
+        socketsAfterClose === 0,
+        `no socket opened after the 4401: ${socketsAfterClose ?? "no 4401 seen"}`,
+      );
+      if (resume !== undefined) yield* operate(resume);
+    }
+    if (scenarioName === "allowance") {
+      // vim's cell names the usage limit and its reset time on a prompt's 409 since vim #53.
+      yield* check(
+        first?.class === "usage_limit" && typeof first.resetAt === "string" && first.resetAt !== "",
+        `the run failed as the usage limit with its reset time: ${JSON.stringify(first)}`,
+      );
+    }
+    if (scenarioName === "runs-bound") {
+      yield* post(`/cell/${holder}/cancel`, "", authorization);
+      yield* check(
+        projection?.runs[0]?.status === "failed" &&
+          /send the prompt again/.test(first?.message ?? ""),
+        `the run failed saying to send the prompt again: ${first?.message}`,
+      );
     }
     return;
   }

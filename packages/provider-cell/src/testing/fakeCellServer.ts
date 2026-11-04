@@ -1,7 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off preferSchemaOverJson:off - a plain Node stand-in for celld, used by recorders and tests.
 /**
  * A stand-in for a celld tenant speaking cell protocol 3 on a local port, with a scripted model:
- * it answers the shared fixture prompts with the real protocol's shape (docs/internals/provider-cell.md).
+ * it answers the shared fixture prompts with the real protocol's shape, and with a `token` the
+ * login era's refusals, revocation, fail-closed 503 and spent allowance (docs/internals/provider-cell.md).
  */
 import * as NodeHttp from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -66,6 +67,13 @@ export interface FakeCellServer {
   readonly onceConnected: (project: string) => Promise<void>;
   /** Resolves when the project's current run ends, or at once when it is idle. */
   readonly onceIdle: (project: string) => Promise<void>;
+  /**
+   * The token stops holding (new invite code, suspension): later requests are refused 401, a run in
+   * progress stops, its sockets close 4401. An idle project's sockets stay open, as in the cell.
+   */
+  readonly revokeToken: (reason?: string) => void;
+  /** The tenant's daily allowance is spent until `resetAt`: prompts are refused as the usage limit. */
+  readonly spendAllowance: (resetAt: string | null) => void;
   /** Ends the project's run as the cell's own page would, without going through the client. */
   readonly cancelRun: (project: string) => void;
   /** Starts a run as another client of the same cell would; T3's prompt then answers 409. */
@@ -92,6 +100,8 @@ interface Run {
   /** The `x-request-id` the prompt was posted with; a wake or a socket prompt has none. */
   readonly requestId: string | null;
   cancel: () => void;
+  /** Ends the run as the cell ends one whose session no longer holds. */
+  stop: (reason: string) => void;
 }
 
 type PersistedEvent = Record<string, unknown> & { readonly seq: number };
@@ -128,6 +138,13 @@ const EVENT_RETENTION = 20_000;
 const RUN_RETENTION = 200;
 const PAGE_LIMIT = 1_000;
 const REQUEST_ID_MAX_LENGTH = 128;
+/** The close of a socket whose session no longer holds; a close reason holds at most 123 bytes. */
+const SESSION_CLOSE = 4401;
+const CLOSE_REASON_BYTES = 123;
+const BEARER_NOTE =
+  "log in at /login, or send the token of POST /login/token as Authorization: Bearer";
+const LOGIN_UNSET =
+  "Service unavailable: SESSION_SECRET is not set, so no request to a cell can be checked for a login; set SESSION_SECRET and INVITE_SECRET as secrets of this deployment (docs/cell-edition.md, Login)";
 
 /**
  * Answers the shared fixture prompts: exact replies, a shell that waits for Stop, the resume prompt,
@@ -189,6 +206,8 @@ export async function startFakeCellServer(
     readonly configured?: boolean;
     readonly version?: string;
     readonly token?: string;
+    /** Every request is answered 503, as a tenant with a base domain and no SESSION_SECRET. */
+    readonly loginUnset?: boolean;
     /** How long a delegated child works after its parent's run ended. */
     readonly delegateDelayMs?: number;
   } = {},
@@ -199,6 +218,10 @@ export async function startFakeCellServer(
   const projects = new Map<string, Project>();
   const timers = new Set<NodeJS.Timeout>();
   let rejectSockets = false;
+  /** Why the token no longer holds, once it was revoked. */
+  let revoked: string | undefined;
+  /** When the spent daily allowance renews, while it is spent. */
+  let allowanceResetAt: string | null | undefined;
   const project = (name: string): Project => {
     let existing = projects.get(name);
     if (!existing) {
@@ -278,8 +301,15 @@ export async function startFakeCellServer(
     send(target, sequenced);
     return seq;
   };
-  const authorized = (request: NodeHttp.IncomingMessage) =>
-    !options.token || request.headers.authorization === `Bearer ${options.token}`;
+  /** Why a request is refused 401, in the cell's words, or undefined when it holds a session. */
+  const unauthorized = (request: NodeHttp.IncomingMessage): string | undefined => {
+    if (!options.token) return undefined;
+    const header = request.headers.authorization;
+    if (header === undefined) return "no session of tenant fake came with this request";
+    if (header !== `Bearer ${options.token}`) return "the session is not signed by this server";
+    return revoked;
+  };
+  const refusalText = (reason: string) => `Unauthorized: ${reason}; ${BEARER_NOTE}`;
   const later = (ms: number, run: () => void) => {
     const timer = setTimeout(() => {
       timers.delete(timer);
@@ -336,6 +366,8 @@ export async function startFakeCellServer(
     const runId = `run-${++target.runs}`;
     const scope = { runId };
     let cancelled = false;
+    let stopped: string | undefined;
+    let requests = 0;
     let wakeCancel: (() => void) | undefined;
     const opening = target.seq + 1;
     const run: Run = {
@@ -343,6 +375,11 @@ export async function startFakeCellServer(
       seq: opening,
       requestId,
       cancel: () => {
+        cancelled = true;
+        wakeCancel?.();
+      },
+      stop: (reason) => {
+        stopped = reason;
         cancelled = true;
         wakeCancel?.();
       },
@@ -361,6 +398,8 @@ export async function startFakeCellServer(
       let failure: Extract<FakeCellStep, { readonly type: "fail" }> | undefined;
       for (const step of steps) {
         if (cancelled) break;
+        // Every step but a hold or a failure is one model reply read.
+        if (step.type !== "hold" && step.type !== "fail") requests += 1;
         switch (step.type) {
           case "assistant":
             target.answers.push(step.text);
@@ -462,19 +501,31 @@ export async function startFakeCellServer(
         }
         if (failure !== undefined) break;
       }
-      const error = cancelled
-        ? { code: "cancelled", message: "Cancelled" }
-        : failure === undefined
-          ? undefined
-          : {
-              code: failure.code ?? "provider_error",
-              message: failure.error,
-              ...(failure.status === undefined ? {} : { status: failure.status }),
-              ...(failure.resetAt === undefined ? {} : { resetAt: failure.resetAt }),
-            };
+      const error = stopped
+        ? { code: "tool_error", message: `The run was stopped: ${stopped}` }
+        : cancelled
+          ? { code: "cancelled", message: "Cancelled" }
+          : failure === undefined
+            ? undefined
+            : {
+                code: failure.code ?? "provider_error",
+                message: failure.error,
+                ...(failure.status === undefined ? {} : { status: failure.status }),
+                ...(failure.resetAt === undefined ? {} : { resetAt: failure.resetAt }),
+              };
+      // What the run used, as the cell counts it: the replies read and the tokens they billed.
+      const usage = {
+        requests,
+        inputTokens: 1_000 * requests,
+        cachedTokens: 0,
+        outputTokens: 50 * requests,
+        reasoningTokens: 0,
+      };
       broadcast(
         target,
-        error === undefined ? { type: "done", ...scope } : { type: "done", error, ...scope },
+        error === undefined
+          ? { type: "done", usage, ...scope }
+          : { type: "done", error, usage, ...scope },
       );
       if (target.run === run) target.run = null;
       target.lastRun = run;
@@ -496,7 +547,12 @@ export async function startFakeCellServer(
       response.end(JSON.stringify(body));
     };
     if (!match) return text(404, "Not found");
-    if (!authorized(request)) return text(401, "Unauthorized");
+    if (options.loginUnset) {
+      response.writeHead(503, { "content-type": "text/plain; charset=utf-8", "retry-after": "60" });
+      return response.end(LOGIN_UNSET);
+    }
+    const refused = unauthorized(request);
+    if (refused !== undefined) return text(401, refusalText(refused));
     const target = project(decodeURIComponent(match[1]!));
     const path = match[2] ?? "/";
     if (path === "/state" && request.method === "GET") {
@@ -520,6 +576,16 @@ export async function startFakeCellServer(
       );
       if (repeated) return json(202, { runId: repeated.runId, seq: repeated.seq });
       if (target.run) return json(409, { runId: target.run.runId });
+      // The cell words a spent allowance in its refusal; it names the limit
+      // and its renewal as a `done` error does.
+      if (allowanceResetAt !== undefined && body.trim()) {
+        return json(409, {
+          runId: null,
+          error: `Tenant fake has used its model tokens for today (UTC). The allowance renews at ${allowanceResetAt ?? "midnight UTC"}.`,
+          code: "usage_limit",
+          ...(allowanceResetAt === null ? {} : { resetAt: allowanceResetAt }),
+        });
+      }
       const refusal = refusalOf(target, body);
       if (refusal !== undefined) return json(409, { runId: null, error: refusal });
       const accepted = startRun(target, body, "user", undefined, requestId);
@@ -588,7 +654,23 @@ export async function startFakeCellServer(
   server.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url ?? "/", "http://fake-cell");
     const match = /^\/cell\/([^/]+)\/ws$/.exec(url.pathname);
-    if (!match || !authorized(request) || rejectSockets) {
+    // A refused handshake is answered as the cell answers it, with the
+    // status and its text, which a WebSocket client never shows its caller.
+    const refused = options.loginUnset
+      ? { status: "503 Service Unavailable", body: LOGIN_UNSET }
+      : (() => {
+          const reason = unauthorized(request);
+          return reason === undefined
+            ? undefined
+            : { status: "401 Unauthorized", body: refusalText(reason) };
+        })();
+    if (match && refused !== undefined && !rejectSockets) {
+      socket.end(
+        `HTTP/1.1 ${refused.status}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: ${Buffer.byteLength(refused.body)}\r\nconnection: close\r\n\r\n${refused.body}`,
+      );
+      return;
+    }
+    if (!match || rejectSockets) {
       socket.destroy();
       return;
     }
@@ -655,6 +737,22 @@ export async function startFakeCellServer(
         if (target.run === null) resolve();
         else target.idleWaiters.push(resolve);
       }),
+    revokeToken: (reason = "the session was reset by a new invite code") => {
+      revoked = reason;
+      const closeReason = Buffer.from(`Unauthorized: ${reason}`)
+        .subarray(0, CLOSE_REASON_BYTES)
+        .toString()
+        .replace(/\uFFFD$/, "");
+      for (const target of projects.values()) {
+        if (target.run === null) continue;
+        for (const ws of target.sockets) ws.close(SESSION_CLOSE, closeReason);
+        target.sockets.clear();
+        target.run.stop(reason);
+      }
+    },
+    spendAllowance: (resetAt) => {
+      allowanceResetAt = resetAt;
+    },
     cancelRun: (name) => projects.get(name)?.run?.cancel(),
     startForeignRun: (name, prompt, steps) =>
       startRun(project(name), prompt, "user", steps) !== undefined,

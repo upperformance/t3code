@@ -14,6 +14,7 @@ import {
   readCellRefusal,
   readCellState,
   readPromptAccepted,
+  readRunUsage,
 } from "./protocol.ts";
 
 describe("cellProjectName", () => {
@@ -147,10 +148,23 @@ describe("prompt and cancel answers", () => {
     expect(readPromptAccepted('{"runId":"run-7","seq":-1}')).toBeUndefined();
     expect(readPromptAccepted('{"runId":"run-7","seq":1.5}')).toBeUndefined();
     expect(readPromptAccepted("")).toBeUndefined();
-    expect(readCellRefusal('{"runId":"run-3"}')).toEqual({ runId: "run-3", error: null });
+    const plain = { code: null, resetAt: null };
+    expect(readCellRefusal('{"runId":"run-3"}')).toEqual({ runId: "run-3", error: null, ...plain });
     expect(readCellRefusal('{"runId":null,"error":"The prompt is empty"}')).toEqual({
       runId: null,
       error: "The prompt is empty",
+      ...plain,
+    });
+    // A refusal may name its kind as a `done` error does: the spent allowance.
+    expect(
+      readCellRefusal(
+        '{"runId":null,"error":"Tenant acme has used its tokens","code":"usage_limit","resetAt":"2026-11-05T00:00:00.000Z"}',
+      ),
+    ).toEqual({
+      runId: null,
+      error: "Tenant acme has used its tokens",
+      code: "usage_limit",
+      resetAt: "2026-11-05T00:00:00.000Z",
     });
     // A proxy's error page is nobody's refusal, and neither is a gateway's
     // JSON error without the run, nor a body naming no run and no reason.
@@ -162,7 +176,32 @@ describe("prompt and cancel answers", () => {
     expect(readCellRefusal('{"runId":"run-3","error":"busy"}')).toEqual({
       runId: "run-3",
       error: "busy",
+      ...plain,
     });
+  });
+});
+
+describe("readRunUsage", () => {
+  it("reads a done's usage when every count is a non-negative integer, and nothing otherwise", () => {
+    const usage = {
+      requests: 2,
+      inputTokens: 1_200,
+      cachedTokens: 300,
+      outputTokens: 40,
+      reasoningTokens: 8,
+    };
+    expect(readRunUsage(usage)).toEqual(usage);
+    expect(readRunUsage({ ...usage, later: "ignored" })).toEqual(usage);
+    expect(readRunUsage(undefined)).toBeUndefined();
+    expect(readRunUsage(null)).toBeUndefined();
+    expect(readRunUsage({ ...usage, outputTokens: -1 })).toBeUndefined();
+    expect(readRunUsage({ ...usage, inputTokens: 1.5 })).toBeUndefined();
+    expect(readRunUsage({ requests: 1 })).toBeUndefined();
+  });
+
+  it("keeps a done readable whatever its usage carries", () => {
+    const decode = Schema.decodeUnknownOption(CellEvent);
+    assert.isTrue(Option.isSome(decode({ type: "done", runId: "r", seq: 3, usage: "odd" })));
   });
 });
 

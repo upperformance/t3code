@@ -1,9 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalConsole:off globalConsoleInEffect:off preferSchemaOverJson:off - a live probe driver that prints what it sees.
 /**
- * Runs the cell provider's status probe (the one Settings → Providers shows)
- * against a live tenant and against stand-ins for an old-protocol tenant, a
- * protocol-2 tenant, a non-cell HTTP server and a closed port.
- *   node scripts/live-cell-probe.ts --url http://127.0.0.1:9884
+ * Runs the cell provider's status probe against a live tenant (with --token, and without one) and
+ * stand-ins for old protocols, a non-cell server, a closed port, a 401 and a failing-closed 503.
+ *   node scripts/live-cell-probe.ts --url http://127.0.0.1:9884 [--token t]
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -15,18 +14,28 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as NodeHttp from "node:http";
 
-const liveUrl = process.argv[process.argv.indexOf("--url") + 1] ?? "http://127.0.0.1:9884";
+const argValue = (name: string) => {
+  const index = process.argv.indexOf(name);
+  return index === -1 ? undefined : process.argv[index + 1];
+};
+const liveUrl = argValue("--url") ?? "http://127.0.0.1:9884";
+const liveToken = argValue("--token") ?? "";
 const decode = Schema.decodeUnknownEffect(CellSettings);
 
 function serve(
-  answer: (path: string) => { status: number; type: string; body: string },
+  answer: (path: string) => {
+    status: number;
+    type: string;
+    body: string;
+    headers?: Record<string, string>;
+  },
 ): Promise<{ url: string; close: () => void }> {
   return new Promise((resolve) => {
     const requests: Array<string> = [];
     const server = NodeHttp.createServer((req, res) => {
       requests.push(`${req.method} ${req.url}`);
-      const { status, type, body } = answer(req.url ?? "");
-      res.writeHead(status, { "content-type": type });
+      const { status, type, body, headers } = answer(req.url ?? "");
+      res.writeHead(status, { "content-type": type, ...headers });
       res.end(body);
     });
     server.listen(0, "127.0.0.1", () => {
@@ -60,17 +69,19 @@ const main = Effect.gen(function* () {
   const probe = Effect.fn("LiveCellProbe.probe")(function* (
     label: string,
     baseUrl: string,
+    token = "",
     projectPrefix = "t3-",
   ) {
-    const settings = yield* decode({ enabled: true, baseUrl, token: "", projectPrefix });
+    const settings = yield* decode({ enabled: true, baseUrl, token, projectPrefix });
     const result = yield* checkCellProviderStatus(settings, transport);
     console.log(`${label}: ${baseUrl}`);
     console.log(
       `  status=${result.status} installed=${result.installed} version=${JSON.stringify(result.version)} models=${JSON.stringify(result.models.map((m) => m.slug))}`,
     );
-    console.log(`  message=${JSON.stringify(result.message)}`);
+    console.log(`  auth=${result.auth.status} message=${JSON.stringify(result.message)}`);
   });
-  yield* probe("live cell", liveUrl);
+  yield* probe(liveToken ? "live cell with the token" : "live cell", liveUrl, liveToken);
+  if (liveToken) yield* probe("live cell without a token", liveUrl);
   const legacy = yield* Effect.promise(() =>
     serve(() => ({ status: 200, type: "application/json", body: oldState({}) })),
   );
@@ -100,6 +111,26 @@ const main = Effect.gen(function* () {
   );
   yield* probe("protocol-3 tenant without an API key", unconfigured.url);
   unconfigured.close();
+  const refusing = yield* Effect.promise(() =>
+    serve(() => ({
+      status: 401,
+      type: "text/plain; charset=utf-8",
+      headers: { "www-authenticate": 'Bearer realm="acme"' },
+      body: "Unauthorized: the session was reset by a new invite code; log in at /login, or send the token of POST /login/token as Authorization: Bearer",
+    })),
+  );
+  yield* probe("tenant refusing a stale token (401)", refusing.url, "stale-token");
+  refusing.close();
+  const failingClosed = yield* Effect.promise(() =>
+    serve(() => ({
+      status: 503,
+      type: "text/plain; charset=utf-8",
+      headers: { "retry-after": "60" },
+      body: "Service unavailable: SESSION_SECRET is not set, so no request to a cell can be checked for a login; set SESSION_SECRET and INVITE_SECRET as secrets of this deployment (docs/cell-edition.md, Login)",
+    })),
+  );
+  yield* probe("tenant with a base domain and no SESSION_SECRET (503)", failingClosed.url);
+  failingClosed.close();
   yield* probe("closed port", "http://127.0.0.1:9");
 });
 
