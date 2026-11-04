@@ -825,9 +825,9 @@ that the message carries the API's text). All seven checked-in transcripts
 were recorded live (`generatedBy: live-cell-recorder`, version `0.3.0`)
 against celld dev running the cell of upperformance/vim `main`, which speaks
 level 3, with a scripted Responses API behind it, and verified by replay;
-`cell_wake_after_failure` was recorded again against vim `main` 2e7f884
-with the login on, whose cell retries the API's 500 four times, each retry
-a run-scoped `error`, before the run fails.
+`cell_wake_after_failure` was recorded again against vim `main` 2e7f884,
+whose cell retries the API's 500 four times, each retry a run-scoped
+`error`, before the run fails.
 The fake cell is for a recording without a tenant. The recorder
 writes to the path `--out` gives, to the checked-in transcript with
 `--write-fixture`, and with neither to a new scratch directory it prints.
