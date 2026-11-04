@@ -283,6 +283,7 @@ export class CellReplayController {
             operation: `read ${url}`,
             detail: `socket closed${code === undefined ? "" : ` (${code})`}`,
             closed: true,
+            ...(code === undefined ? {} : { closeCode: code }),
           });
           wakeWaiter();
         },
@@ -471,7 +472,11 @@ export function makeRecordingCellTransport(
           const frames = yield* connection.pull.pipe(
             Effect.tapError((error) =>
               Effect.sync(() => {
-                if (error.closed) record("emit_inbound", { kind: "ws_closed" });
+                if (error.closed)
+                  record("emit_inbound", {
+                    kind: "ws_closed",
+                    ...(error.closeCode === undefined ? {} : { code: error.closeCode }),
+                  });
               }),
             ),
           );

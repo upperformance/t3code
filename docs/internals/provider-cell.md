@@ -20,13 +20,16 @@ the cell as the whole agent plus the whole workspace, and T3's local project
 directory as nothing more than the thread's home in the sidebar.
 
 - **Instance.** A provider instance holds the tenant's base URL
-  (`https://<tenant>.vim.app`), an optional bearer token, and the prefix for
-  project names. Two tenants are two instances. There is no default instance,
+  (`https://<tenant>.vim.app`), a bearer token, and the prefix for project
+  names. Two tenants are two instances. There is no default instance,
   because an instance without a base URL cannot do anything, so the user adds
   one in Settings → Providers. The token is stored as a settings secret and
   sent as `authorization: Bearer <token>` on every request, including the
-  WebSocket handshake. celld has no authentication today, so the field is
-  optional; the adapter is ready for the day it is required.
+  WebSocket handshake. A deployed tenant has its login on and refuses every
+  request without a token; a cell under `celld dev` without the login's
+  secrets needs none, so the field may stay empty there. How to make a token,
+  and what T3 shows when the tenant refuses it, is under
+  [The login](#the-login).
 - **Thread.** One T3 thread is one cell project. The project name is the
   instance prefix plus 20 hex characters of a SHA-256 over the whole thread
   id: opaque on the tenant, fixed in width so child cells keep room for their
@@ -140,7 +143,11 @@ shapes. What level 3 guarantees, and what the adapter builds on:
   is `{ runId, error }`: a different request id while a run is in progress
   answers 409 with `runId` naming that run; an empty prompt, a tenant without
   a model API key and a cell busy with a fork or a reset answer 409 with
-  `runId: null` and the reason in `error`.
+  `runId: null` and the reason in `error`. A refusal may name its kind as a
+  `done` error does, `code: "usage_limit"` with `resetAt` for a tenant whose
+  daily model allowance is spent; the adapter reports such a refusal as the
+  usage limit with its reset time (see [The login](#the-login) for what the
+  cell sends today).
 - **A cancel names its run.** `POST cancel` takes an optional `x-run-id`
   header. When the run in progress is another one, the cell answers 409
   `{ runId }` naming it and cancels nothing; with no run in progress it
@@ -169,7 +176,13 @@ shapes. What level 3 guarantees, and what the adapter builds on:
 - **`done` is structured.** A failed run's `done` carries
   `{ code, status?, message, resetAt? }` with `code` one of `cancelled`,
   `usage_limit`, `provider_error`, `transport_error` or `tool_error`; a
-  successful run's `done` carries no error.
+  successful run's `done` carries no error. Either carries `usage`, what the
+  run used: `{ requests, inputTokens, cachedTokens, outputTokens,
+  reasoningTokens }`. The adapter reports it as the turn's token usage
+  (`turnTokenUsage`: complete for a run that completed, partial otherwise,
+  the input counting cached reads), and reads it leniently: a `usage` that is
+  not all non-negative integers reports nothing and leaves the `done` as
+  readable as before, since a count is reporting, not protocol.
 
 `GET state` is read once per session when the thread is attached, which is
 where the level is checked, the tenant's model learned and a misnaming
@@ -263,8 +276,10 @@ confirms with a cancelled `done`, and the adapter waits for that before
 reporting the turn interrupted. Both stay inside the session manager's 15 s
 bound on an interrupt: the cancel has 5 s (less if the adapter's request
 timeout is shorter), the confirmation 8 s. Only a 4xx answer refuses the
-cancel: 409 is read as below, any other 4xx is reported as
-`ProviderAdapterInterruptError` and the turn goes on. Everything else is
+cancel: 409 is read as below, 401 is access loss (below: the turn ends with
+the refusal and Stop has nothing left to do), any other 4xx (a 403 with the
+cell's reason) is reported as `ProviderAdapterInterruptError` and the turn
+goes on. Everything else is
 unconfirmed — no answer within the bound, a transport failure, any 5xx (the
 cell's own or a gateway's: neither says whether the run was cancelled), or an
 accepted cancel with no `done` in time. Then Stop fails with
@@ -362,10 +377,95 @@ validation error. The status probe reads `GET state` of a dedicated probe
 project (`<prefix>probe`) and never posts a prompt, so a background refresh
 cannot start a run, spend tokens, or create work. The probe creates one empty
 Durable Object per tenant; that is the cost of a probe without a dedicated
-health endpoint. `configured: false` is a warning (the tenant has no model API
+health endpoint. The probe sends the instance's token, so a tenant with the
+login on answers it as it answers the threads: a 401, 403 or 503 is an error
+with the message described under [The login](#the-login) (auth
+`unauthenticated` for a 401), and a state read with a token reports auth
+`authenticated`. `configured: false` is a warning (the tenant has no model API
 key); an unreachable origin or a non-JSON answer is an error. There is no
 version advisory beyond the manifest row: the cell reports its own `version`,
 and nothing on the environment updates it.
+
+## The login
+
+A deployed tenant runs with its login on (vim.app's `docs/deploy.md`, stage
+2): every request to a cell needs a session of the tenant, a browser's
+cookie or a tool's API token. T3 is a tool. Connecting it to a deployed cell:
+
+1. The base URL is the tenant's origin, `https://<tenant>.<base domain>`;
+   the apex, `https://<base domain>`, is the tenant `default`.
+2. Log in at `<base URL>/login` with the tenant's invite code and a
+   passphrase the first time, the passphrase after that.
+3. Choose **Create an API token** on the page that follows. The page shows
+   the token once. Only a browser session makes a token; a token cannot make
+   another.
+4. In T3, Settings → Providers → the cell instance: the base URL, and the
+   token in **Access token**. Changing the settings rebuilds the instance, so
+   the next message opens a session with the new token.
+
+A token is a session of 90 days. It ends earlier when the tenant's
+passphrase is reset with a new invite code and when the operator suspends the
+tenant; a resume lets the tenant log in again, but the sessions from before,
+tokens included, stay ended. A token that has ended never holds again, so
+every refusal of it says the same thing: make a new one.
+
+What the tenant answers, and what T3 shows:
+
+| The tenant answers                                                                                                                                                                       | T3 shows                                                                                                                                                                                                                                                                                                                                                        |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 401 to any request, no token or one that ended                                                                                                                                           | The status probe: an error, auth unauthenticated. A thread: the attach fails, nothing is posted. Either message names the tenant, says the token is missing or was refused, gives the steps above, and quotes the cell's reason (no session came, the session expired, was reset by a new invite code, the tenant is suspended).                                |
+| 401 while a session reads the cell: to any request it makes (a prompt, a Stop, a replay, a task's cancel), or a socket closed with 4401 or not opened and then refused                   | Access loss, below: the turn in progress fails with that message (`provider_error`, code `cell_unauthorized`), the session reports the error, queued wakes are dropped (their runs stay in the cell's transcript), nothing more is read, requested or reconnected, and every later turn fails at once with the same message until the instance has a new token. |
+| 403                                                                                                                                                                                      | The refusal with the cell's reason (code `cell_unauthorized`), failing the turn or the Stop; the session reads on. T3 sends no `Origin` and no `Sec-Fetch-Site` (Node's fetch and the `ws` client send neither), so the cell's rule against other sites' pages never refuses it; a proxy that adds an `Origin` would be refused this way.                       |
+| 503 from a tenant with a base domain and no `SESSION_SECRET`                                                                                                                             | The probe and a thread: the tenant is not serving requests and whoever runs it has to finish its setup, with the cell's text naming the missing secrets (code `cell_unavailable`). The socket keeps its backoff, so a fixed deployment is picked up.                                                                                                            |
+| A run stopped because its session ended (`done` `tool_error`, "The run was stopped: …")                                                                                                  | Read with a token that holds (a new one, taking the run back on resume): a failed turn with the cell's message. With the token the run worked under, the socket closes 4401 before that `done` is sent, which is the row above.                                                                                                                                 |
+| The daily allowance spent at the prompt: 409 `{ runId: null, error }`                                                                                                                    | A failed turn with the cell's words, which say when the allowance renews. When the refusal names `code: "usage_limit"` and `resetAt`, it is T3's usage limit with the reset time, as a `done` reports it.                                                                                                                                                       |
+| The daily allowance spent mid-run: `done` `usage_limit` with `resetAt`                                                                                                                   | The usage limit with the reset time.                                                                                                                                                                                                                                                                                                                            |
+| The tenant's runs bound (`TENANT_MAX_RUNS`, 4): the prompt is accepted and the run's `done` is `tool_error`, "The run did not start: … send the prompt again once one of them has ended" | A failed turn with that message; the thread stays reusable, and the next message runs once a place is free.                                                                                                                                                                                                                                                     |
+| A run bound: the run's time limit, an output cap or a deadline per model attempt (`done`), a conversation past its limit (409 at the prompt)                                             | A failed turn with the cell's message, which says what was reached and what to do.                                                                                                                                                                                                                                                                              |
+| `usage` in `done`                                                                                                                                                                        | The turn's token usage.                                                                                                                                                                                                                                                                                                                                         |
+
+The cell learns of a reset or a suspension within 30 seconds (its policy
+cache), so a model request already in flight may finish and its `done` reach
+T3 before anything is refused; an idle cell's socket hears nothing more and
+stays open, deaf, until the next prompt is refused 401. A run that outlives
+the cache is stopped, and its socket closed with 4401, within those 30
+seconds. Either way the next request ends the session's reading, so T3 never
+loops on a token that will not hold again.
+
+**Access loss** is the terminal state of a session's reader. It is entered
+once, by one function, under the event permit (the lock under which every
+cell event, prompt answer and reconciliation is applied), and it is judged in
+two places only. The session's one request function classifies every answer
+the cell gives before its caller sees it: a 401 to any request (the attach's
+`GET state`, a prompt, the `GET state` after a prompt whose answer was lost,
+a `GET events` page of a replay, a Stop's cancel, a deleted thread's task
+cancels) enters access loss there, directly when the requesting fiber holds
+the permit and by taking it otherwise, whether or not the turn that asked is
+still in progress, and the caller only learns that access is lost. A turn
+that had already ended (a reset, its `done`) gets no second terminal; the
+session reports the error all the same. The socket's close handling is the
+other place: a socket closed with 4401, or not opened, is followed by one
+`GET state` that the event consumer makes behind that connection's frames,
+so a `done` received before the close is applied first; a 401 there is the
+request function's, and a 403 after such a close is the token refused too.
+Entering it discards what is buffered:
+the turn's candidates (events that arrived before its prompt's answer) and
+the queued wakes. After it no wake is queued, offered or dispatched (the one
+function that queues a wake, the offer and a continuation's dispatch each
+check the state), nothing already received is read, no request leaves, the
+socket is not reopened, and an attach is refused at once. The turn in
+progress ends with exactly one terminal, failed with the refusal; every later
+turn ends at once with it. A 403 or 503 refuses one request, not the token:
+the turn fails with the refusal's message, or the Stop does (a 503 leaves it
+unconfirmed, as every 5xx to a cancel does), and the session reads on.
+
+Since the cell's prompt route reads the account before it starts a run, a
+prompt refused for a spent allowance, not a run's `done`, is how a spent
+allowance usually shows. vim's cell names the usage limit on that refusal
+(`{ runId: null, error, code: "usage_limit", resetAt }`, vim main since
+#53), and T3 shows it as a `done` reporting it would. A cell from before
+that sends the words only, which T3 shows as a failed turn; they name when
+the allowance renews.
 
 ## MCP
 
@@ -450,6 +550,12 @@ adapter reconciles what it was tracking against the snapshot:
   could be used fail the attach naming the last reason, inside the attach's
   own timeout. A failed attach leaves nothing behind, so the same session
   attaches on its next try from that try's first snapshot.
+- A connection the cell closed with 4401, its session no longer holding, or
+  one that could not be opened (a client learns nothing of a refused
+  handshake), is followed by one `GET state`. A 401 or 403 there ends the
+  session's reading as described under [The login](#the-login), instead of a
+  reconnect that every attempt would see refused; any other answer, or none,
+  reconnects with the backoff as before.
 - Recovery is bounded. Connections dropped for not keeping the protocol (a
   frame before the roster, no roster within ten seconds of `state`, a roster
   numbered elsewhere than its `state`, an unreadable event, a replay that
@@ -613,7 +719,12 @@ adapter stopped itself for policy reasons is `permission_error` or
 `validation_error`. A turn T3 asks a session to start while another of its
 turns is still active is refused before anything reaches the cell, as a
 protocol error with the shared `previous_turn_active` reason, so the failure
-T3 shows says the previous turn is still running.
+T3 shows says the previous turn is still running. A tenant that refuses T3
+itself (401, 403, 503) fails the turn as `provider_error` with code
+`cell_unauthorized` or `cell_unavailable` and a message that says what to
+do; a 401 also ends the session's reading, as described under
+[The login](#the-login). A prompt refused for a spent allowance that names
+the code is `usage_limit` with its `resetAt`.
 
 The failed terminal is the failure's only report: it reserves the error row's
 place after the turn's items, and T3 writes the row from it, so a failed turn
@@ -713,7 +824,10 @@ responded 500: " and the error body; `cell_wake_after_failure` asserts only
 that the message carries the API's text). All seven checked-in transcripts
 were recorded live (`generatedBy: live-cell-recorder`, version `0.3.0`)
 against celld dev running the cell of upperformance/vim `main`, which speaks
-level 3, with a scripted Responses API behind it, and verified by replay.
+level 3, with a scripted Responses API behind it, and verified by replay;
+`cell_wake_after_failure` was recorded again against vim `main` 2e7f884,
+whose cell retries the API's 500 four times, each retry a run-scoped
+`error`, before the run fails.
 The fake cell is for a recording without a tenant. The recorder
 writes to the path `--out` gives, to the checked-in transcript with
 `--write-fixture`, and with neither to a new scratch directory it prints.
@@ -772,10 +886,23 @@ waiting for the answer before the cell carries the cancel out: it passes
 when the cell lists the task as cancelled or no longer lists it, and its
 failure says whether the cancel was never sent or was sent and what, if
 anything, the cell answered. The two scenarios check their outcome and exit
-non-zero when it is not met. `live-cell-probe.ts --url <cell>` runs the
-status probe Settings shows against the live cell and against stand-ins for
-an old-protocol tenant, a protocol-2 tenant, an HTML server, a 404, a tenant
-without a key and a closed port.
+non-zero when it is not met. `live-cell-probe.ts --url <cell> [--token t]` runs
+the status probe Settings shows against the live cell (with the token and,
+when one is given, without it) and against stand-ins for an old-protocol
+tenant, a protocol-2 tenant, an HTML server, a 404, a tenant without a key,
+a tenant refusing a stale token (401), one failing closed (503) and a closed
+port. The login era adds four scenarios, each checking its outcome and
+exiting non-zero on a miss: `access` (whatever `--token`, none or a stale
+one, against a tenant that refuses it or fails closed: the run fails with the
+refusal and what to do, and no prompt is posted), `revoke --suspend <operator
+token> [--resume <operator token>]` (a run that outlives the cell's 30 s
+session cache, the tenant suspended once the prompt is accepted: the run
+fails with the refusal naming the suspension, no socket is opened after the
+one refused, a second message fails at once, and the resume is posted at the
+end), `allowance` (a tenant whose `TENANT_DAILY_TOKENS` runs out: the usage
+limit with its reset time) and `runs-bound` (another project of
+the tenant holds the only place of `TENANT_MAX_RUNS=1`; the driver starts and
+then cancels that run: the turn fails saying to send the prompt again).
 
 To repeat the run (celld and every driver or recorder run leave small
 directories under `TMPDIR`: celld's asset cache, and empty
@@ -831,6 +958,43 @@ set `TMPDIR` to a scratch path for all of them):
    delegation (`cell_wake` records in about 33 s instead of 7 s), so
    restart the API without it before anything else.
 
+With the login on, as a deployed tenant runs (vim.app's `docs/deploy.md`,
+stage 2), the same run takes a token:
+
+1. Add the login's secrets to `dist/cell/.dev.vars` beside the two lines
+   above: `CELL_BASE_DOMAIN=vim.test`, `SESSION_SECRET=<any>` and
+   `INVITE_SECRET=<any>`. `127.0.0.1` is then the apex, the tenant `default`;
+   other tenants are `Host: <tenant>.vim.test:<port>`, which Node's WebSocket
+   will not send, so the drivers use the apex.
+2. Start celld as above, print the tenant's invite code with
+   `INVITE_SECRET=<same> node cell/invite.mjs default` from vim, log in, and
+   create a token: `POST /login` with the form fields `invite` and
+   `passphrase` (a 303 and a `cell_session` cookie), then `POST /login/token`
+   with that cookie (the page carries the token in `<pre><code>`), or do the
+   same in a browser at `http://127.0.0.1:<port>/login`. Five failed logins
+   within 30 s refuse the client for 30 s.
+3. Pass `--token <token>` to the probe, to every driver scenario and to the
+   recorder. Run `access` without it, and with a made-up one. Six of the
+   seven fixtures record this way; `turn_interrupt` records only with the
+   login off. Its input, shared by every provider, presses Stop as soon as
+   the prompt is accepted, and with the login on that lands while the run's
+   first model request waits for its reservation from the tenant's account,
+   so the cell cancels the run before the shell call and the fixture's check
+   for an interrupted shell row fails. The driver's `interrupt` scenario,
+   which waits for the shell row, passes with the login on.
+4. `revoke` needs the operator's two tokens, printed by
+   `INVITE_SECRET=<same> CELL_BASE_DOMAIN=vim.test node cell/invite.mjs suspend default --origin http://127.0.0.1:<port>`
+   (and `resume`), each good for ten minutes and once. The token is dead after
+   it, resume or not: log in with the passphrase and make a new one.
+5. `allowance` needs celld restarted (`--clean`) with
+   `TENANT_DAILY_TOKENS=1000` in `.dev.vars`, which refuses the prompt, or
+   with a value that covers one request but not two (41500 with the scripted
+   API), which stops the run at its second request; `runs-bound` with
+   `TENANT_MAX_RUNS=1`. A clean start forgets the tenant: log in with a fresh
+   invite code.
+6. For a tenant failing closed, write `CELL_BASE_DOMAIN=vim.test` without
+   `SESSION_SECRET` and run the probe and `access`.
+
 Refreshing the checked-in transcripts is a deliberate step of its own:
 `--write-fixture --version <the version GET state reports>` in place of
 `--out` (the recorder refuses `--write-fixture` against a cell without
@@ -838,6 +1002,35 @@ Refreshing the checked-in transcripts is a deliberate step of its own:
 run's opening event, and that order lands in the transcript, so a refresh
 usually changes bytes, in five of six fixtures on the last run, without
 changing what the transcript means; commit one only for a reason.
+
+The fake cell speaks the login era when given a `token`: a request or a
+socket handshake without it is refused 401 in the cell's words (a refused
+handshake is answered, not dropped), `revokeToken` stops the run in progress
+with the cell's "The run was stopped" `done` after closing its sockets with
+4401, as the cell does at the next event, and leaves an idle project's
+sockets open and deaf; `loginUnset` answers everything 503; every `done`
+reports `usage`; `spendAllowance` refuses prompts naming `code:
+"usage_limit"` and `resetAt`. The login-era tests run the adapter over it: the
+probe's answers to a missing and a refused token and to a tenant failing
+closed, an attach refused before anything is posted, a token revoked during a
+run failing the turn with no socket opened again, a prompt refused 401 on a
+deaf socket, a reconnect refused after a revocation, a spent allowance as the
+usage limit, the runs bound as a readable failure the thread recovers from,
+and a run's usage as the turn's token usage; a scripted socket checks that a
+4401 close is asked about once over HTTP and nothing is sent after the
+refusal. A hand-driven socket sweeps every request path
+answering 401 (`GET state` after a lost prompt, `GET events` during a
+replay, 4401 and `GET state`, a task's cancel, the attach, a prompt, a Stop)
+and checks that the state is entered once, each turn in progress gets one
+terminal, no wake is offered or dispatched afterwards (including one offered
+before the refusal and one buffered during the prompt), nothing more is
+requested and no socket is opened; the same holds when the turn had already
+ended before the 401 came (a prompt or a Stop left unanswered across a reset
+that ended the turn, a replay page refused after the page whose reset ended
+it) with no second terminal, and a run's `done` followed by a 4401 close
+completes the turn before access is lost; a Stop refused 403 says why, one
+answered 503 is unconfirmed, and the run goes on. The recorder keeps a socket's close code in `ws_closed`, so a 4401
+replays as one.
 
 The adapter's own tests cover the rules above: the rejected prompt racing
 another run's events, a 202 overtaking the previous run's tail, a stranger

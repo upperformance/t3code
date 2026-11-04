@@ -25,6 +25,7 @@ import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Random from "effect/Random";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -78,12 +79,14 @@ const fakeCell = (
     readonly configured?: boolean;
     readonly model?: string;
     readonly delegateDelayMs?: number;
+    readonly loginUnset?: boolean;
   } = {},
 ) =>
   Effect.acquireRelease(
     Effect.promise(() =>
       startFakeCellServer({
         token: "secret-token",
+        ...(options.loginUnset === undefined ? {} : { loginUnset: options.loginUnset }),
         ...(options.script ? { script: options.script } : {}),
         ...(options.configured === undefined ? {} : { configured: options.configured }),
         ...(options.model === undefined ? {} : { model: options.model }),
@@ -189,6 +192,7 @@ const openHarness = Effect.fnUntraced(function* (
     allEvents,
     collector,
     takeContinuation: Queue.take(made.continuations),
+    pollContinuation: Queue.poll(made.continuations),
   };
 });
 
@@ -1452,6 +1456,241 @@ describe("CellAdapterV2 over the fake cell", () => {
   );
 });
 
+describe("CellAdapterV2 against a tenant with the login on", () => {
+  /** The live transport, counting the sockets the adapter opens. */
+  const countingConnects = (transport: CellTransport) => {
+    let connects = 0;
+    const counted: CellTransport = {
+      request: transport.request,
+      connect: (input) =>
+        Effect.suspend(() => {
+          connects += 1;
+          return transport.connect(input);
+        }),
+    };
+    return { transport: counted, connects: () => connects };
+  };
+  const lastSession = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
+    events.findLast((event) => event.type === "provider_session.updated");
+  /** A turn after the refusal ends at once with it, posting nothing. */
+  const refusedTurn = Effect.fnUntraced(function* (harness: Harness, ordinal: number) {
+    yield* harness.runtime.startTurn(
+      yield* turnInput(harness.providerThread, "Hello again", ordinal),
+    );
+    const terminal = yield* harness.takeEvent(
+      "turn.terminal",
+      (event) => event.runOrdinal === ordinal,
+    );
+    return failureOf(terminal);
+  });
+
+  it.live(
+    "the status probe says what a missing or refused token and a tenant without its login secret need",
+    () =>
+      Effect.gen(function* () {
+        const transport = yield* liveTransport;
+        const fake = yield* fakeCell();
+        const missing = yield* checkCellProviderStatus(settingsFor(fake.baseUrl, ""), transport);
+        assert.equal(missing.status, "error");
+        assert.equal(missing.auth.status, "unauthenticated");
+        assert.include(missing.message ?? "", "needs an access token");
+        assert.include(missing.message ?? "", `${fake.baseUrl}/login`);
+        assert.include(missing.message ?? "", "Settings → Providers → Cell → Access token");
+        assert.include(missing.message ?? "", "no session of tenant fake came with this request");
+        const wrong = yield* checkCellProviderStatus(settingsFor(fake.baseUrl, "stale"), transport);
+        assert.equal(wrong.status, "error");
+        assert.include(wrong.message ?? "", "refused T3's access token");
+        assert.include(wrong.message ?? "", "the session is not signed by this server");
+        const good = yield* checkCellProviderStatus(settingsFor(fake.baseUrl), transport);
+        assert.equal(good.status, "ready");
+        assert.equal(good.auth.status, "authenticated");
+        const unset = yield* fakeCell({ loginUnset: true });
+        const closed = yield* checkCellProviderStatus(settingsFor(unset.baseUrl), transport);
+        assert.equal(closed.status, "error");
+        assert.isTrue(closed.installed, "a tenant failing closed is a cell tenant all the same");
+        assert.include(closed.message ?? "", "not serving requests");
+        assert.include(closed.message ?? "", "SESSION_SECRET is not set");
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live("a thread without a token the tenant takes fails to attach saying what to do", () =>
+    Effect.gen(function* () {
+      const fake = yield* fakeCell();
+      const transport = yield* liveTransport;
+      const failed = yield* makeHarness(transport, fake.baseUrl, {
+        adapterOptions: { settings: settingsFor(fake.baseUrl, "") },
+      }).pipe(Effect.flip);
+      const cause = (
+        failed as { readonly cause?: { readonly _tag: string; readonly message: string } }
+      ).cause;
+      assert.equal(cause?._tag, "CellAccessError");
+      assert.include(cause?.message ?? "", "needs an access token");
+      assert.include(cause?.message ?? "", "Create an API token");
+      const unset = yield* fakeCell({ loginUnset: true });
+      const closed = yield* makeHarness(transport, unset.baseUrl).pipe(Effect.flip);
+      assert.include(
+        (closed as { readonly cause?: { readonly message: string } }).cause?.message ?? "",
+        "SESSION_SECRET is not set",
+      );
+      const project = yield* cellProjectName("t3-", THREAD_ID);
+      assert.deepEqual(fake.prompts(project), [], "nothing is posted to a tenant that refused T3");
+    }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live(
+    "a token revoked during a run fails the turn with what to do and the socket is not reopened",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* fakeCell({
+          script: () => [{ type: "shell_until_cancel", command: "sleep 30" }],
+        });
+        const counted = countingConnects(yield* liveTransport);
+        const harness = yield* makeHarness(counted.transport, fake.baseUrl);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Work"));
+        yield* harness.takeEvent(
+          "turn_item.updated",
+          (event) => event.turnItem.type === "command_execution",
+        );
+        fake.revokeToken();
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "failed");
+        assert.equal(terminal.threadDisposition, "reusable");
+        assert.equal(failureOf(terminal)?.class, "provider_error");
+        assert.equal(failureOf(terminal)?.code, "cell_unauthorized");
+        assert.include(failureOf(terminal)?.message ?? "", "refused T3's access token");
+        assert.include(
+          failureOf(terminal)?.message ?? "",
+          "the session was reset by a new invite code",
+        );
+        const session = lastSession(harness.allEvents);
+        assert.equal(
+          session?.type === "provider_session.updated" ? session.providerSession.status : null,
+          "error",
+        );
+        // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- proves that no reconnect happens; an absence has no event to await.
+        yield* Effect.sleep("1500 millis");
+        assert.equal(counted.connects(), 1, "a refused token is not retried by reconnecting");
+        const next = yield* refusedTurn(harness, 2);
+        assert.equal(next?.code, "cell_unauthorized");
+        assert.equal(counted.connects(), 1);
+        assert.include(next?.message ?? "", "Create an API token");
+        assert.isFalse(yield* harness.runtime.hasPendingBackgroundWork!);
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live(
+    "a prompt refused 401 on a socket that heard nothing fails the turn and ends the reading",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* fakeCell();
+        const counted = countingConnects(yield* liveTransport);
+        const harness = yield* makeHarness(counted.transport, fake.baseUrl);
+        // An idle cell sends its socket nothing more, so only the prompt learns of it.
+        fake.revokeToken("tenant fake is suspended by the operator");
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Hello"));
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(failureOf(terminal)?.code, "cell_unauthorized");
+        assert.include(
+          failureOf(terminal)?.message ?? "",
+          "tenant fake is suspended by the operator",
+        );
+        const project = yield* cellProjectName("t3-", THREAD_ID);
+        assert.deepEqual(fake.prompts(project), []);
+        // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- proves that no reconnect happens; an absence has no event to await.
+        yield* Effect.sleep("1 second");
+        assert.equal(counted.connects(), 1);
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live("a socket refused after the token was revoked ends the reading without a turn", () =>
+    Effect.gen(function* () {
+      const fake = yield* fakeCell();
+      const counted = countingConnects(yield* liveTransport);
+      const harness = yield* makeHarness(counted.transport, fake.baseUrl);
+      fake.revokeToken();
+      // The cell moves: the reconnect's handshake is refused, and GET state says why.
+      fake.dropSockets();
+      const session = yield* harness.takeEvent(
+        "provider_session.updated",
+        (event) => event.providerSession.status === "error",
+      );
+      assert.include(session.providerSession.lastError ?? "", "refused T3's access token");
+      // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- proves that no reconnect happens; an absence has no event to await.
+      yield* Effect.sleep("1500 millis");
+      assert.equal(counted.connects(), 2, "one refused reconnect, then none");
+      const next = yield* refusedTurn(harness, 1);
+      assert.equal(next?.code, "cell_unauthorized");
+      const project = yield* cellProjectName("t3-", THREAD_ID);
+      assert.deepEqual(fake.prompts(project), [], "a turn after the refusal posts nothing");
+    }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live("a prompt refused for a spent daily allowance is the usage limit with its renewal", () =>
+    Effect.gen(function* () {
+      const fake = yield* fakeCell();
+      const harness = yield* makeHarness(yield* liveTransport, fake.baseUrl);
+      fake.spendAllowance("2026-11-05T00:00:00.000Z");
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Hello"));
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.equal(failureOf(terminal)?.class, "usage_limit");
+      assert.equal(failureOf(terminal)?.code, "usage_limit");
+      assert.equal(failureOf(terminal)?.resetAt, "2026-11-05T00:00:00.000Z");
+      assert.include(failureOf(terminal)?.message ?? "", "renews at 2026-11-05T00:00:00.000Z.");
+      assert.notInclude(failureOf(terminal)?.message ?? "", "..");
+    }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live(
+    "a run the tenant's run bound kept from starting fails readably and the thread goes on",
+    () =>
+      Effect.gen(function* () {
+        const bound =
+          "The run did not start: tenant fake has 4 runs in progress in its projects, the most it may have at once (TENANT_MAX_RUNS); send the prompt again once one of them has ended.";
+        const fake = yield* fakeCell({
+          script: (_prompt, turn) =>
+            turn === 1
+              ? [{ type: "fail", code: "tool_error", error: bound }]
+              : [{ type: "assistant", text: "ok" }],
+        });
+        const harness = yield* makeHarness(yield* liveTransport, fake.baseUrl);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Hello"));
+        const first = yield* harness.takeEvent("turn.terminal");
+        assert.equal(failureOf(first)?.class, "provider_error");
+        assert.equal(failureOf(first)?.message, bound);
+        assert.equal(first.threadDisposition, "reusable");
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Again", 2));
+        const second = yield* harness.takeEvent("turn.terminal", (event) => event.runOrdinal === 2);
+        assert.equal(second.status, "completed");
+      }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+
+  it.live("reports what a run used as the turn's token usage", () =>
+    Effect.gen(function* () {
+      const fake = yield* fakeCell({
+        script: () => [
+          { type: "shell", command: "ls", output: "a\n", exitCode: 0 },
+          { type: "assistant", text: "done" },
+        ],
+      });
+      const harness = yield* makeHarness(yield* liveTransport, fake.baseUrl);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Hello"));
+      const completed = yield* harness.takeEvent(
+        "provider_turn.updated",
+        (event) => event.providerTurn.status === "completed",
+      );
+      assert.deepEqual(completed.providerTurn.turnTokenUsage, {
+        usageScope: "main_agent",
+        usageStatus: "complete",
+        inputTokens: 2_000,
+        cachedInputTokens: 0,
+        outputTokens: 100,
+        reasoningTokens: 0,
+        hasSubagents: false,
+      });
+    }).pipe(Effect.scoped, Effect.provide(liveLayer)),
+  );
+});
+
 describe("CellAdapterV2 against a tenant below cell protocol 3", () => {
   /** Answers `GET state` as a tenant of the stated level would, and must never be asked for a socket. */
   const olderTenant = (state: Record<string, unknown>): CellTransport => ({
@@ -1771,6 +2010,44 @@ describe("CellAdapterV2 over a scripted socket", () => {
     }).pipe(Effect.scoped, Effect.provide(scriptedLayer)),
   );
 
+  it.effect(
+    "a socket closed 4401 is asked about over HTTP once, and a refused token ends the turn",
+    () =>
+      Effect.gen(function* () {
+        const said =
+          "Unauthorized: the session was reset by a new invite code; log in at /login, or send the token of POST /login/token as Authorization: Bearer";
+        // Nothing follows the refusal: a reconnect would be an outbound frame the transcript lacks.
+        const controller = scripted("session-close", [
+          ...prelude(),
+          expectHttp("POST", "/cell/<project>/prompt", "Hi"),
+          httpResponse(202, '{"runId":"run-1","seq":1}'),
+          ws({
+            type: "user",
+            text: "Hi",
+            requestId: "<request-id:1>",
+            runId: "run-1",
+            seq: 1,
+            origin: "user",
+          }),
+          { type: "emit_inbound", frame: { kind: "ws_closed", code: 4401 } },
+          expectHttp("GET", "/cell/<project>/state"),
+          httpResponse(401, said),
+        ]);
+        const harness = yield* makeHarness(controller.transport, "https://cell.test");
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Hi"));
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "failed");
+        assert.equal(failureOf(terminal)?.code, "cell_unauthorized");
+        assert.include(failureOf(terminal)?.message ?? "", "https://cell.test/login");
+        assert.include(
+          failureOf(terminal)?.message ?? "",
+          "The tenant said: Unauthorized: the session was reset by a new invite code",
+        );
+        assert.notInclude(failureOf(terminal)?.message ?? "", "REDACTED");
+        controller.assertComplete();
+      }).pipe(Effect.scoped, Effect.provide(scriptedLayer)),
+  );
+
   it.effect("rejects attachments as a validation failure instead of dropping them", () =>
     Effect.gen(function* () {
       const controller = scripted("attachments", prelude());
@@ -2068,6 +2345,8 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
     readonly send: (frames: ReadonlyArray<Record<string, unknown>>) => Effect.Effect<void>;
     /** Ends the current connection as a dropped socket; the next one opens with `opensWith`. */
     readonly close: Effect.Effect<void>;
+    /** Ends the current connection as the cell closing it with `code`. */
+    readonly closeWith: (code: number) => Effect.Effect<void>;
     readonly opensWith: (frames: ReadonlyArray<Record<string, unknown>>) => void;
     /**
      * What `GET events` answers from now on: the whole log in one complete
@@ -2080,12 +2359,18 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
     ) => void;
     /** What `GET state` answers from now on, over the idle default. */
     readonly states: (over: Record<string, unknown>) => void;
+    /** `GET state` or `GET events` answers this status and body from now on. */
+    readonly refuses: (path: "/state" | "/events", status: number, body?: string) => void;
+    /** Every request the adapter made, as `METHOD /path`, in order. */
+    readonly requests: Array<string>;
     /** Answers the next `POST prompt`; given before the prompt, it answers at once. */
     readonly answerPrompt: (status: number, body?: string) => Effect.Effect<void>;
     /** Fails the next `POST prompt` at the transport, as a dropped socket would. */
     readonly failPrompt: (detail: string) => Effect.Effect<void>;
     /** Answers the next `POST cancel`; without one queued, a cancel answers 204. Status 0 fails it at the transport. */
     readonly answerCancel: (status: number, body?: string) => Effect.Effect<void>;
+    /** From now on a `POST cancel` waits for its `answerCancel` instead of answering 204. */
+    readonly parksCancels: () => void;
     /** Leaves the next `POST cancel` unanswered for good. */
     readonly holdCancel: Effect.Effect<void>;
     readonly replayRequests: Array<string>;
@@ -2113,7 +2398,9 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
    */
   const driven = () =>
     Effect.gen(function* () {
-      const incoming = yield* Queue.unbounded<ReadonlyArray<string> | "close">();
+      const incoming = yield* Queue.unbounded<
+        ReadonlyArray<string> | { readonly close: number | undefined }
+      >();
       const answers = yield* Queue.unbounded<Answer>();
       const cancelAnswers = yield* Queue.unbounded<Answer | "hold">();
       let opening: ReadonlyArray<Record<string, unknown>> = [];
@@ -2123,6 +2410,9 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
       const replayRequests: Array<string> = [];
       const promptRequestIds: Array<string | undefined> = [];
       const cancels: Array<string | undefined> = [];
+      const requests: Array<string> = [];
+      const refusals = new Map<string, Answer>();
+      let cancelsParked = false;
       let connects = 0;
       let state: Record<string, unknown> = {
         protocol: 3,
@@ -2142,6 +2432,9 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
       const transport: CellTransport = {
         request: (request) => {
           const url = new URL(request.url);
+          requests.push(`${request.method} ${url.pathname.replace(/^\/cell\/[^/]+/, "")}`);
+          const refusal = [...refusals].find(([path]) => url.pathname.endsWith(path))?.[1];
+          if (refusal !== undefined) return Effect.succeed(refusal);
           if (request.method === "POST" && url.pathname.endsWith("/prompt")) {
             promptRequestIds.push(request.headers["x-request-id"]);
             // Status 0 stands for no answer at all.
@@ -2155,8 +2448,12 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
           }
           if (request.method === "POST" && url.pathname.endsWith("/cancel")) {
             cancels.push(request.headers["x-run-id"]);
-            return Queue.poll(cancelAnswers).pipe(
-              Effect.map(Option.getOrElse((): Answer | "hold" => ({ status: 204, body: "" }))),
+            const next = cancelsParked
+              ? Queue.take(cancelAnswers)
+              : Queue.poll(cancelAnswers).pipe(
+                  Effect.map(Option.getOrElse((): Answer | "hold" => ({ status: 204, body: "" }))),
+                );
+            return next.pipe(
               Effect.flatMap((answer) =>
                 answer === "hold"
                   ? Effect.never
@@ -2186,11 +2483,12 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
             const pull: Effect.Effect<ReadonlyArray<string>, CellTransportError> = Effect.gen(
               function* () {
                 const batch = yield* Queue.take(incoming);
-                if (batch === "close") {
+                if ("close" in batch) {
                   return yield* new CellTransportError({
                     operation: "read",
                     detail: "closed",
                     closed: true,
+                    ...(batch.close === undefined ? {} : { closeCode: batch.close }),
                   });
                 }
                 return batch;
@@ -2202,7 +2500,8 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
       const cell: DrivenCell = {
         transport,
         send,
-        close: Queue.offer(incoming, "close").pipe(Effect.asVoid),
+        close: Queue.offer(incoming, { close: undefined }).pipe(Effect.asVoid),
+        closeWith: (code) => Queue.offer(incoming, { close: code }).pipe(Effect.asVoid),
         opensWith: (frames) => {
           opening = frames;
         },
@@ -2212,12 +2511,19 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
         states: (over) => {
           state = { ...state, ...over };
         },
+        refuses: (path, status, body = "") => {
+          refusals.set(path, { status, body });
+        },
+        requests,
         answerPrompt: (status, body = "") =>
           Queue.offer(answers, { status, body }).pipe(Effect.asVoid),
         failPrompt: (detail) =>
           Queue.offer(answers, { status: 0, body: detail }).pipe(Effect.asVoid),
         answerCancel: (status, body = "") =>
           Queue.offer(cancelAnswers, { status, body }).pipe(Effect.asVoid),
+        parksCancels: () => {
+          cancelsParked = true;
+        },
         holdCancel: Queue.offer(cancelAnswers, "hold").pipe(Effect.asVoid),
         replayRequests,
         promptRequestIds,
@@ -3163,11 +3469,11 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
         );
         const nodeIds = new Set(
           harness.allEvents.flatMap((event) =>
-            event.type === "node.updated" ? [event.node.id] : [],
+            event.type === "node.updated" && event.node.kind === "system" ? [event.node.id] : [],
           ),
         );
         for (const notice of itemsOfType(harness.allEvents, "system_notice")) {
-          assert.isTrue(nodeIds.has(notice.nodeId!), "a notice's node is published with it");
+          assert.isTrue(nodeIds.has(notice.nodeId!), "a notice's system node is published with it");
         }
         yield* cell.answerPrompt(202, '{"runId":"B","seq":6}');
         yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Again", 2));
@@ -3721,5 +4027,322 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
       assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
       assert.deepEqual(assistantTexts(harness.allEvents), ["REST"]);
     }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  /**
+   * Access loss: one session error, one failed terminal per turn in progress, none for `settled`
+   * ones, then nothing read, queued, offered, dispatched, requested or reconnected; later turns fail.
+   */
+  const assertAccessLost = Effect.fnUntraced(function* (
+    harness: Harness,
+    cell: DrivenCell,
+    label: string,
+    turnsInProgress: number,
+    settled = 0,
+  ) {
+    yield* harness.takeEvent(
+      "provider_session.updated",
+      (event) => event.providerSession.status === "error",
+    );
+    yield* settle;
+    const terminals = harness.allEvents.filter((event) => event.type === "turn.terminal");
+    assert.lengthOf(
+      terminals,
+      settled + turnsInProgress,
+      `${label}: one terminal per turn in progress, none more for a settled one`,
+    );
+    for (const terminal of terminals.slice(settled)) {
+      assert.equal(terminal.status, "failed", label);
+      assert.equal(failureOf(terminal)?.code, "cell_unauthorized", label);
+      assert.include(failureOf(terminal)?.message ?? "", "refused T3's access token", label);
+    }
+    const errors = harness.allEvents.filter(
+      (event) =>
+        event.type === "provider_session.updated" && event.providerSession.status === "error",
+    );
+    assert.lengthOf(errors, 1, `${label}: the state is entered once`);
+    const connects = cell.connects();
+    const requests = cell.requests.length;
+    // What the cell sends after the refusal, on a socket still open, is not read.
+    yield* cell.send([
+      { type: "wake", text: "[Delegated task late done]", runId: "Z", seq: 90, origin: "wake" },
+      { type: "done", runId: "Z", seq: 91 },
+    ]);
+    // Past the reconnect backoff's first two delays.
+    yield* Effect.sleep("1600 millis");
+    assert.equal(cell.connects(), connects, `${label}: no new socket`);
+    assert.isTrue(Option.isNone(yield* harness.pollContinuation), `${label}: no wake offered`);
+    assert.isFalse(yield* harness.runtime.hasPendingBackgroundWork!, label);
+    yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Again", 9));
+    const next = yield* harness.takeEvent("turn.terminal", (event) => event.runOrdinal === 9);
+    assert.equal(failureOf(next)?.code, "cell_unauthorized", `${label}: a later turn ends at once`);
+    assert.equal(cell.requests.length, requests, `${label}: no request leaves after the refusal`);
+  });
+  const refusedBody = "Unauthorized: tenant cell is suspended";
+  /** A turn whose run the cell named and started. */
+  const startAccepted = Effect.fnUntraced(function* (harness: Harness, cell: DrivenCell) {
+    yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+    yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+    yield* cell.send([
+      { type: "user", text: "Mine", runId: "A", seq: 1, origin: "user" },
+      marker(2),
+    ]);
+    yield* awaitMarker(harness);
+  });
+
+  it.live("review r1: a cancel refused 401 ends the turn with the refusal and the reading", () =>
+    Effect.gen(function* () {
+      const cell = yield* driven();
+      cell.opensWith(prelude());
+      const harness = yield* makeHarness(cell.transport, "https://cell.test");
+      yield* startAccepted(harness, cell);
+      yield* cell.answerCancel(401, refusedBody);
+      const stop = yield* harness.runtime
+        .interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: activeTurnId(harness.allEvents),
+        })
+        .pipe(Effect.result);
+      assert.isTrue(Result.isSuccess(stop), "the turn ended; nothing is left to stop");
+      assert.deepEqual(cell.cancels, ["A"]);
+      yield* assertAccessLost(harness, cell, "cancel", 1);
+    }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live("a cancel refused 403 says why, a 503 leaves it unconfirmed, and the run goes on", () =>
+    Effect.gen(function* () {
+      for (const status of [403, 503] as const) {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* startAccepted(harness, cell);
+        yield* cell.answerCancel(status, "Refused");
+        const stop = yield* harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: activeTurnId(harness.allEvents),
+          })
+          .pipe(Effect.flip);
+        if (status === 403) {
+          const cause = (
+            stop as { readonly cause?: { readonly _tag: string; readonly message: string } }
+          ).cause;
+          assert.equal(stop._tag, "ProviderAdapterInterruptError");
+          assert.equal(cause?._tag, "CellAccessError");
+          assert.include(cause?.message ?? "", "refused T3's request");
+        } else {
+          // A 5xx says nothing about the run: unconfirmed, so the user decides on Force stop.
+          assert.equal(stop._tag, "ProviderAdapterInterruptTimeoutError");
+        }
+        assert.isUndefined(
+          harness.allEvents.find((event) => event.type === "turn.terminal"),
+          `${status}: no terminal before the run's done`,
+        );
+        yield* cell.send([{ type: "done", runId: "A", seq: 3 }]);
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "completed", `${status}: the session reads on`);
+      }
+    }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "review r1: a prompt refused 401 discards the wakes it buffered and the ones already offered",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        // A wake the cell started while idle: queued and offered before the prompt.
+        yield* cell.send([
+          { type: "wake", text: "[Delegated task a done]", runId: "W", seq: 1, origin: "wake" },
+        ]);
+        const early = yield* harness.takeContinuation;
+        const started = yield* startParked(harness, "Mine");
+        // Another wake while the prompt is unanswered: a candidate of the turn.
+        yield* cell.send([
+          { type: "wake", text: "[Delegated task b done]", runId: "B", seq: 2, origin: "wake" },
+          { type: "assistant", text: "WAKE", runId: "B", seq: 3 },
+          { type: "done", runId: "B", seq: 4 },
+          marker(5),
+        ]);
+        yield* awaitMarker(harness);
+        yield* cell.answerPrompt(401, refusedBody);
+        yield* Fiber.join(started);
+        const dispatched = yield* early.dispatchIfCurrent!(Effect.succeed("after the 401"));
+        assert.isTrue(Option.isNone(dispatched), "a wake offered before the 401 is not dispatched");
+        yield* assertAccessLost(harness, cell, "prompt", 1);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live("every cell request answered 401 enters access loss once, by one rule", () =>
+    Effect.gen(function* () {
+      // GET state after a prompt whose answer was lost.
+      {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        const started = yield* startParked(harness, "Mine");
+        cell.refuses("/state", 401, refusedBody);
+        yield* cell.failPrompt("socket hang up");
+        yield* Fiber.join(started);
+        yield* assertAccessLost(harness, cell, "GET state after a lost prompt", 1);
+      }
+      // GET events while a reconnect reads the gap back.
+      {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* startAccepted(harness, cell);
+        cell.refuses("/events", 401, refusedBody);
+        cell.opensWith(prelude({ running: true, runId: "A", seq: 6 }));
+        yield* cell.close;
+        yield* assertAccessLost(harness, cell, "GET events", 1);
+      }
+      // A socket the cell closed with 4401, then GET state.
+      {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* startAccepted(harness, cell);
+        cell.refuses("/state", 401, refusedBody);
+        yield* cell.closeWith(4401);
+        yield* assertAccessLost(harness, cell, "4401 and GET state", 1);
+      }
+      // A delegated task's cancel, with no turn in progress.
+      {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test");
+        yield* cell.send([marker(1)]);
+        yield* awaitMarker(harness);
+        yield* cell.answerCancel(401, refusedBody);
+        yield* harness.runtime.cancelBackgroundWork!({
+          threadId: THREAD_ID,
+          reason: "Thread deleted.",
+        });
+        assert.deepEqual(cell.cancels, [undefined]);
+        yield* assertAccessLost(harness, cell, "task cancel", 0);
+      }
+      // The attach itself: the thread fails to attach, and a retried attach asks nothing.
+      {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        cell.refuses("/state", 401, refusedBody);
+        const made = yield* makeAdapter(cell.transport, "https://cell.test");
+        const runtime = yield* made.adapter.openSession({
+          threadId: THREAD_ID,
+          providerSessionId: SESSION_ID,
+          modelSelection: defaultModel,
+          runtimePolicy: fullAccess,
+        });
+        const retry = {
+          threadId: THREAD_ID,
+          modelSelection: defaultModel,
+          runtimePolicy: fullAccess,
+        };
+        assert.equal(
+          (
+            (yield* runtime.ensureThread(retry).pipe(Effect.flip)) as {
+              readonly cause?: { readonly _tag: string };
+            }
+          ).cause?._tag,
+          "CellAccessError",
+        );
+        const asked = cell.requests.length;
+        yield* runtime.ensureThread(retry).pipe(Effect.flip);
+        assert.equal(cell.requests.length, asked, "attach: a retried attach asks nothing");
+        assert.equal(cell.connects(), 0, "attach: no socket");
+      }
+    }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a 401 to a request whose turn had already ended still enters access loss, with no second terminal",
+    () =>
+      Effect.gen(function* () {
+        /** The reset event that ends the turn in progress, and checks it ended so. */
+        const resetEnds = Effect.fnUntraced(function* (
+          harness: Harness,
+          cell: DrivenCell,
+          seq: number,
+        ) {
+          yield* cell.send([{ type: "reset", seq }]);
+          const ended = yield* harness.takeEvent("turn.terminal");
+          assert.include(failureOf(ended)?.message ?? "", "reset");
+        });
+        // A prompt left unanswered, a reset that ends its turn, then the prompt answered 401.
+        {
+          const cell = yield* driven();
+          cell.opensWith(prelude());
+          const harness = yield* makeHarness(cell.transport, "https://cell.test");
+          const started = yield* startParked(harness, "Mine");
+          yield* awaitRequests(() => cell.promptRequestIds.length, 1);
+          yield* resetEnds(harness, cell, 1);
+          yield* cell.answerPrompt(401, refusedBody);
+          yield* Fiber.join(started);
+          yield* assertAccessLost(harness, cell, "prompt after a reset", 0, 1);
+          assert.equal(cell.promptRequestIds.length, 1, "prompt after a reset: one prompt");
+        }
+        // A Stop's cancel left unanswered, a reset that ends its turn, then the cancel answered 401.
+        {
+          const cell = yield* driven();
+          cell.opensWith(prelude());
+          const harness = yield* makeHarness(cell.transport, "https://cell.test");
+          yield* startAccepted(harness, cell);
+          cell.parksCancels();
+          const stop = yield* harness.runtime
+            .interruptTurn({
+              providerThread: harness.providerThread,
+              providerTurnId: activeTurnId(harness.allEvents),
+            })
+            .pipe(Effect.result, Effect.forkScoped);
+          yield* awaitRequests(() => cell.cancels.length, 1);
+          yield* resetEnds(harness, cell, 3);
+          yield* cell.answerCancel(401, refusedBody);
+          assert.isTrue(
+            Result.isSuccess(yield* Fiber.join(stop)),
+            "cancel: nothing is left to stop",
+          );
+          yield* assertAccessLost(harness, cell, "cancel after a reset", 0, 1);
+        }
+        // A replay whose first page carries a reset that ends the turn, and whose next page is refused 401.
+        {
+          const cell = yield* driven();
+          cell.opensWith(prelude());
+          const harness = yield* makeHarness(cell.transport, "https://cell.test");
+          yield* startAccepted(harness, cell);
+          cell.replays((after) => {
+            cell.refuses("/events", 401, refusedBody);
+            return {
+              events: [{ type: "reset", seq: after + 1 }],
+              nextAfter: after + 1,
+              complete: false,
+            };
+          });
+          cell.opensWith(prelude({ running: true, runId: "A", seq: 6 }));
+          yield* cell.close;
+          const ended = yield* harness.takeEvent("turn.terminal");
+          assert.include(failureOf(ended)?.message ?? "", "reset");
+          yield* assertAccessLost(harness, cell, "GET events after a reset", 0, 1);
+          assert.deepEqual(cell.replayRequests, ["/events?after=2&limit=1000"]);
+        }
+        // A run's done, then its socket closed 4401: the close is judged behind the frames before it.
+        {
+          const cell = yield* driven();
+          cell.opensWith(prelude());
+          const harness = yield* makeHarness(cell.transport, "https://cell.test");
+          yield* startAccepted(harness, cell);
+          cell.refuses("/state", 401, refusedBody);
+          yield* cell.send([{ type: "done", runId: "A", seq: 3 }]);
+          yield* cell.closeWith(4401);
+          const ended = yield* harness.takeEvent("turn.terminal");
+          assert.equal(
+            ended.status,
+            "completed",
+            "4401 after done: the run's done is applied first",
+          );
+          yield* assertAccessLost(harness, cell, "4401 after the run's done", 0, 1);
+        }
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
   );
 });

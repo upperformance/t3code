@@ -183,9 +183,11 @@ export const CellEvent = Schema.Union([
     kind: Schema.optional(Schema.String),
     ...sequenced,
   }),
+  /** `usage` is what the run used, read leniently (`readRunUsage`): a count is reporting, not protocol. */
   Schema.Struct({
     type: Schema.Literal("done"),
     error: Schema.optional(Schema.NullOr(CellDoneError)),
+    usage: Schema.optional(Schema.Unknown),
     ...runScoped,
   }),
   Schema.Struct({ type: Schema.Literal("reset"), ...sequenced }),
@@ -225,11 +227,20 @@ export type CellPromptAccepted = typeof CellPromptAccepted.Type;
 export const CellRefusal = Schema.Struct({
   runId: Schema.NullOr(Schema.String),
   error: Schema.optional(Schema.String),
+  code: Schema.optional(Schema.String),
+  resetAt: Schema.optional(Schema.String),
 });
 
+/**
+ * A refusal may name its kind as a `done` error does: `code: "usage_limit"`
+ * with `resetAt` is a prompt refused because the tenant's daily model
+ * allowance is spent until then.
+ */
 export interface CellRefusal {
   readonly runId: string | null;
   readonly error: string | null;
+  readonly code: string | null;
+  readonly resetAt: string | null;
 }
 
 /**
@@ -262,7 +273,32 @@ export function readCellRefusal(body: string): CellRefusal | undefined {
   const refusal = Option.getOrUndefined(decodeRefusal(body));
   if (refusal === undefined) return undefined;
   if (refusal.runId === null && refusal.error === undefined) return undefined;
-  return { runId: refusal.runId, error: refusal.error ?? null };
+  return {
+    runId: refusal.runId,
+    error: refusal.error ?? null,
+    code: refusal.code ?? null,
+    resetAt: refusal.resetAt ?? null,
+  };
+}
+
+/**
+ * What a run used, as `done` reports it: the model replies read and the
+ * tokens they billed. The input counts cached reads, the output reasoning.
+ */
+const CellRunUsage = Schema.Struct({
+  requests: Seq,
+  inputTokens: Seq,
+  cachedTokens: Seq,
+  outputTokens: Seq,
+  reasoningTokens: Seq,
+});
+export type CellRunUsage = typeof CellRunUsage.Type;
+
+const decodeRunUsage = Schema.decodeUnknownOption(CellRunUsage);
+
+/** A `done`'s `usage` when every count is a non-negative integer; anything else reports nothing. */
+export function readRunUsage(usage: unknown): CellRunUsage | undefined {
+  return Option.getOrUndefined(decodeRunUsage(usage));
 }
 
 export type CellDoneOutcome =
