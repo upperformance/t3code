@@ -48,10 +48,11 @@ the tenant's operator may set others.
   takes one project for good, and so does provider status's check; deleting a
   thread frees none. Once the tenant is full, a new thread's first message is
   refused: ask the operator to delete projects. A helper cell's place comes
-  back once the tenant has released it: its task shows "child released", or
-  you removed the task (**Remove** in the agent panel's task list) and the
-  cleanup that follows went through. If the place stays taken, ask the
-  operator to delete the helper's project.
+  back once the cleanup that destroys it goes through. That cleanup starts
+  when you remove its task (**Remove** in the agent panel's task list) or
+  when the task shows "child released"; if it fails, the agent panel on
+  the project's page says so. If the place stays taken, ask the operator
+  to delete the helper's project.
 
 ## How a cell thread works
 
