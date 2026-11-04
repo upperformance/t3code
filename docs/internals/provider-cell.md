@@ -396,7 +396,8 @@ cookie or a tool's API token. T3 is a tool. Connecting it to a deployed cell:
    the apex, `https://<base domain>`, is the tenant `default`.
 2. Log in at `<base URL>/login` with the tenant's invite code and a
    passphrase the first time, the passphrase after that.
-3. Choose **Create an API token** on the page that follows. The page shows
+3. The login lands in the editor: choose **Account** in its toolbar (or open
+   `<base URL>/login` again), then **Create an API token**. The page shows
    the token once. Only a browser session makes a token; a token cannot make
    another.
 4. In T3, Settings → Providers → the cell instance: the base URL, and the

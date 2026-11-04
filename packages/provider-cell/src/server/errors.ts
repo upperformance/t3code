@@ -44,7 +44,7 @@ function tenantName(baseUrl: string): string {
 }
 
 const TOKEN_STEPS = (baseUrl: string) =>
-  `Log in at ${baseUrl.replace(/\/+$/, "")}/login, choose Create an API token, and paste the token into Settings → Providers → Cell → Access token.`;
+  `Log in at ${baseUrl.replace(/\/+$/, "")}/login, choose Account and then Create an API token, and paste the token into Settings → Providers → Cell → Access token.`;
 
 /**
  * The cell's own words: the body's first line, bounded, without the 401's note on how to log in
