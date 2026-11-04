@@ -262,14 +262,16 @@ Interrupt is `POST cancel` naming the turn's run in `x-run-id`; the cell
 confirms with a cancelled `done`, and the adapter waits for that before
 reporting the turn interrupted. Both stay inside the session manager's 15 s
 bound on an interrupt: the cancel has 5 s (less if the adapter's request
-timeout is shorter), the confirmation 8 s. Unconfirmed — the cancel never
-answered, hung or lost at the transport, or answered with no `done` in time —
-Stop fails with `ProviderAdapterInterruptTimeoutError` and leaves the turn
-open, so T3 marks the run unresponsive and the user decides on Force stop; a
-late `done` still ends the turn as interrupted. Only a cancel the cell answers
-with an error other than 409 is a refusal, reported as
-`ProviderAdapterInterruptError`. A `done` that beats the
-cancel settles the turn as completed. Stop pressed before the prompt registered waits behind the
+timeout is shorter), the confirmation 8 s. Only a 4xx answer refuses the
+cancel: 409 is read as below, any other 4xx is reported as
+`ProviderAdapterInterruptError` and the turn goes on. Everything else is
+unconfirmed — no answer within the bound, a transport failure, any 5xx (the
+cell's own or a gateway's: neither says whether the run was cancelled), or an
+accepted cancel with no `done` in time. Then Stop fails with
+`ProviderAdapterInterruptTimeoutError` and leaves the turn open, so T3 marks
+the run unresponsive and the user decides on Force stop; a late `done` still
+ends the turn as interrupted. A `done` that beats the cancel settles the turn
+as completed. Stop pressed before the prompt registered waits behind the
 prompt: start and interrupt share one permit, so the cancel goes out only
 once the cell has said which run it would cancel. Which turn is active is
 decided under the event permit, behind whatever reconciliation is in
@@ -854,7 +856,9 @@ protocol levels, usage limits, and the reconnect backoff. The fifth review's
 probes are tests too: a lost 409 behind another client's identical prompt
 adopting nothing, a lost answer recovered by the request id on the opener,
 in the log, or on the run the state names, a 5xx with and without the cell's
-refusal, Stop decided behind a replay that ended the turn posting no cancel,
+refusal, a Stop whose cancel is hung, lost or answered 500, 502, 503 or 504
+reported unconfirmed and a 403 refused, Stop decided behind a replay that
+ended the turn posting no cancel,
 a cancel the cell refused settled by the replayed `done`, a truncated gap
 marking a wake the cell still runs lost with the loss outranking its `done`,
 a standalone error live and in the log, a replay page that makes no progress

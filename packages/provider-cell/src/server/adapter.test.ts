@@ -3000,7 +3000,7 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
   );
 
   it.live(
-    "a Stop whose cancel the cell never answers, hung or lost, is reported unconfirmed like a missing done, and a definite refusal keeps its own error",
+    "a Stop whose cancel is hung, lost or answered with any 5xx is reported unconfirmed like a missing done, and only a 4xx refuses it",
     () =>
       Effect.gen(function* () {
         const cell = yield* driven();
@@ -3025,10 +3025,22 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
         yield* cell.answerCancel(0, "connection reset");
         const lost = yield* stop;
         assert.equal(lost._tag, "ProviderAdapterInterruptTimeoutError", lost.message);
-        yield* cell.answerCancel(500, '{"error":"no"}');
+        // A 5xx says nothing about whether the cancel reached the run: the cell's own, or a gateway's.
+        const errors: ReadonlyArray<readonly [number, string]> = [
+          [500, '{"error":"no"}'],
+          [502, "<html><body>502 Bad Gateway</body></html>"],
+          [503, "Service Unavailable"],
+          [504, '{"runId":null,"error":"timed out"}'],
+        ];
+        for (const [status, body] of errors) {
+          yield* cell.answerCancel(status, body);
+          const unconfirmed = yield* stop;
+          assert.equal(unconfirmed._tag, "ProviderAdapterInterruptTimeoutError", `${status}`);
+        }
+        yield* cell.answerCancel(403, '{"runId":null,"error":"This cell is not yours"}');
         const refused = yield* stop;
         assert.equal(refused._tag, "ProviderAdapterInterruptError");
-        assert.deepEqual(cell.cancels, ["A", "A", "A"]);
+        assert.deepEqual(cell.cancels, ["A", "A", "A", "A", "A", "A", "A"]);
         assert.isFalse(
           harness.allEvents.some((event) => event.type === "turn.terminal"),
           "the unconfirmed turn stays open for the user to Force stop",

@@ -2418,8 +2418,8 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
                 providerTurnId: args.providerTurnId,
                 timeoutMs,
               });
-            // A cancel the cell never answered, hung or lost, is unconfirmed like a missing `done`;
-            // only an answer refuses it.
+            // Only the cell's 4xx refuses a cancel. A 5xx (the cell's or a gateway's), a lost or
+            // hung request, or a missing `done` leaves it unconfirmed.
             const cancelMs = Math.min(requestTimeoutMs, STOP_CANCEL_TIMEOUT_MS);
             const runId = turn.run.id;
             const response = yield* request("POST", "/cancel", undefined, {
@@ -2437,6 +2437,11 @@ export const makeCellAdapterV2 = Effect.fn("makeCellAdapterV2")(function* (
               yield* Effect.logDebug(
                 `The cell refused to cancel run ${runId}: it runs ${readCellRefusal(response.body)?.runId ?? "another run"}`,
               );
+            } else if (response.status >= 500) {
+              yield* Effect.logWarning(
+                `The cancel of run ${runId} got ${response.status}, so it is unconfirmed`,
+              );
+              return yield* unconfirmed(cancelMs);
             } else if (response.status >= 400) {
               return yield* protocolError(`The cell answered ${response.status} to cancel`);
             }
