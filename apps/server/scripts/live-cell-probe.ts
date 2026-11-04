@@ -7,7 +7,7 @@
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as NodeWS from "@effect/platform-node/NodeWS";
 import { checkCellProviderStatus, makeHttpCellTransport } from "@t3tools/provider-cell/server";
 import { CellSettings } from "@t3tools/provider-cell/settings";
 import * as Effect from "effect/Effect";
@@ -57,16 +57,19 @@ const oldState = (extra: Record<string, unknown>) =>
 
 const main = Effect.gen(function* () {
   const transport = yield* makeHttpCellTransport;
-  const probe = (label: string, baseUrl: string, projectPrefix = "t3-") =>
-    Effect.gen(function* () {
-      const settings = yield* decode({ enabled: true, baseUrl, token: "", projectPrefix });
-      const result = yield* checkCellProviderStatus(settings, transport);
-      console.log(`${label}: ${baseUrl}`);
-      console.log(
-        `  status=${result.status} installed=${result.installed} version=${JSON.stringify(result.version)} models=${JSON.stringify(result.models.map((m) => m.slug))}`,
-      );
-      console.log(`  message=${JSON.stringify(result.message)}`);
-    });
+  const probe = Effect.fn("LiveCellProbe.probe")(function* (
+    label: string,
+    baseUrl: string,
+    projectPrefix = "t3-",
+  ) {
+    const settings = yield* decode({ enabled: true, baseUrl, token: "", projectPrefix });
+    const result = yield* checkCellProviderStatus(settings, transport);
+    console.log(`${label}: ${baseUrl}`);
+    console.log(
+      `  status=${result.status} installed=${result.installed} version=${JSON.stringify(result.version)} models=${JSON.stringify(result.models.map((m) => m.slug))}`,
+    );
+    console.log(`  message=${JSON.stringify(result.message)}`);
+  });
   yield* probe("live cell", liveUrl);
   const legacy = yield* Effect.promise(() =>
     serve(() => ({ status: 200, type: "application/json", body: oldState({}) })),
@@ -107,7 +110,7 @@ await Effect.runPromise(
       Layer.mergeAll(
         NodeServices.layer,
         NodeHttpClient.layerUndici,
-        NodeSocket.layerWebSocketConstructorWS,
+        NodeWS.layerWebSocketConstructor,
       ),
     ),
   ),

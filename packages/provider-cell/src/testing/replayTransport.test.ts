@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
-import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as NodeWS from "@effect/platform-node/NodeWS";
 import type { ProviderReplayEntry } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -10,10 +10,7 @@ import { makeHttpCellTransport, type CellTransport } from "../server/transport.t
 import { startFakeCellServer, type FakeCellServer } from "./fakeCellServer.ts";
 import { makeRecordingCellTransport, makeReplayCellTransport } from "./replayTransport.ts";
 
-const liveLayer = Layer.mergeAll(
-  NodeHttpClient.layerUndici,
-  NodeSocket.layerWebSocketConstructorWS,
-);
+const liveLayer = Layer.mergeAll(NodeHttpClient.layerUndici, NodeWS.layerWebSocketConstructor);
 const PROJECT = "t3-recorder";
 const PROMPTS = ["Respond with exactly: one", "Respond with exactly: two"] as const;
 

@@ -1,30 +1,6 @@
-// A scripted OpenAI Responses API for the live cell run: point a cell's
-// `OPENAI_BASE_URL` at it and the live driver's scenarios and the seven cell
-// fixtures get deterministic answers. Plain Node, no dependencies.
-//
-//   node scripts/live-cell-api.mjs [port=9815] [holdMs=20000]
-//   CHILD_DELAY_MS=30000 node scripts/live-cell-api.mjs   # for delete-delegate
-//
-// The latest user message decides the answer:
-//   "Respond with exactly: X", "Respond with the following text: X",
-//   "... write exactly: X"                       -> says X
-//   "... run the local shell command `sleep N` ..." -> calls shell `sleep N`, then says X;
-//                                                   for N >= 10 (the Stop fixture) it holds
-//                                                   holdMs before answering
-//   "Delegate a <title> to a child cell. Reply with exactly: A. When the child
-//    reports, reply with exactly: B"             -> calls delegate_task with the brief
-//                                                   "Review the project", then says A
-//   the same with "Then fail with: E." after A   -> calls delegate_task and says A in one step,
-//                                                   then answers the run's next step with a
-//                                                   500 whose error message is E
-//   "[Delegated task ..." (the wake)             -> says WAKE_WORD (default WAKE_DONE)
-//   "Review the project" (the child's brief)     -> waits CHILD_DELAY_MS (default 4000), calls
-//                                                   shell `echo reviewed > review.txt`, says "Reviewed."
-//   "Limit ..."                                  -> 429 usage_limit_reached, resets_in_seconds 3600
-//   "Hold ..."                                   -> holds holdMs, then answers
-//   "... repeat the exact final answer you gave in the previous turn ..."
-//                                                -> the previous assistant text, then X
-//   anything else                                -> "Ok: <first line>"
+// A scripted OpenAI Responses API for the live cell run: point a cell's OPENAI_BASE_URL at it.
+//   node scripts/live-cell-api.mjs [port=9815] [holdMs=20000]   (CHILD_DELAY_MS=30000 for delete-delegate)
+// The latest user message picks the answer; the prompt table is in docs/internals/provider-cell.md (Testing).
 // Every request is logged with its step (function calls since the prompt) and prompt.
 import * as NodeHttp from "node:http";
 

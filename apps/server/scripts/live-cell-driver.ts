@@ -1,31 +1,12 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off globalDateInEffect:off globalConsole:off preferSchemaOverJson:off globalFetchInEffect:off - a live driver: it runs the real orchestrator and adapter against a cell on celld, logs on the wall clock, and bounds its own reads of the cell with an AbortSignal.
 /**
- * Drives the real orchestrator and the real cell adapter against a live cell
- * (celld) for the scenarios the fixture recorder cannot express, and logs
- * every HTTP exchange and every socket frame with a wall-clock stamp.
- *
- *   node scripts/live-cell-driver.ts --scenario <shell|interrupt|delegate|limit|reconnect|restart|attach-retry|delete-delegate> --url http://127.0.0.1:9884 [--tag t] [--token t] [--log dir]
- *
- * The frames and projections go to --log, by default a new directory under the
- * OS temp directory named for the scenario and the run's tag; it is printed
- * first.
- *
- * reconnect: the socket is terminated 3 s after the prompt's 202 and the next
- * connect is held for RECONNECT_HOLD_MS, so the run's output lands in the gap
- * and the adapter has to read it back.
- * restart: two orchestrator runtimes over one SQLite file; the first stops the
- * way the server stops while the cell still runs the turn, the second recovers.
- * attach-retry: the first socket delivers `state` and nothing after it, then
- * is terminated (1006), so the roster never arrives on it; the second attaches
- * and the prompt completes.
- * delete-delegate: the run delegates and completes while the child still runs
- * (hold the child with the scripted API's CHILD_DELAY_MS), the thread is
- * deleted, and the cell must have received the task's cancel and, within 35 s,
- * list the task as cancelled or no longer list it.
+ * Drives the real orchestrator and cell adapter against a live cell for the scenarios the recorder
+ * cannot express, logging every HTTP exchange and socket frame with a wall-clock stamp.
+ * Scenarios and flags: docs/internals/provider-cell.md (Testing).
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { NodeWS as WS } from "@effect/platform-node-shared/NodeSocket";
+import * as WS from "@effect/platform-node/NodeWS";
 import {
   CommandId,
   type OrchestrationV2ThreadProjection,
@@ -172,82 +153,78 @@ const redact = (headers: Readonly<Record<string, string>>) =>
   );
 
 const loggingTransport = (live: CellTransport): CellTransport => ({
-  request: (input) =>
-    Effect.gen(function* () {
-      log(
-        `>> ${input.method} ${input.url} headers=${JSON.stringify(redact(input.headers))}${input.body === undefined ? "" : ` body=${JSON.stringify(input.body)}`}`,
-      );
-      const isTaskCancel = input.method === "POST" && /\/tasks\/[^/]+\/cancel$/.test(input.url);
-      if (isTaskCancel) onTaskCancelSent?.({ url: input.url, headers: input.headers });
-      const response = yield* live.request(input).pipe(
-        Effect.tapError((error) =>
-          Effect.sync(() => log(`<< ${input.method} ${input.url} FAILED ${error.detail}`)),
-        ),
-        Effect.onInterrupt(() =>
-          Effect.sync(() => log(`<< ${input.method} ${input.url} abandoned before its answer`)),
-        ),
-      );
-      log(`<< ${response.status} ${input.method} ${input.url} ${response.body.slice(0, 600)}`);
-      if (input.method === "POST" && input.url.endsWith("/prompt") && response.status === 202) {
-        onPromptAccepted?.(response.body);
-      }
-      if (isTaskCancel) {
-        onTaskCancelAnswered?.({
-          url: input.url,
-          headers: input.headers,
-          status: response.status,
-          body: response.body,
-        });
-      }
-      return response;
-    }),
-  connect: (input) =>
-    Effect.gen(function* () {
-      const wait = holdConnectUntil - Date.now();
-      if (wait > 0) {
-        log(`ws connect held for ${wait} ms (${input.url})`);
-        yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, wait)));
-      }
-      log(`ws connect ${input.url} headers=${JSON.stringify(redact(input.headers))}`);
-      const connection = yield* live.connect(input);
-      // attach-retry: the first connection delivers up to `state` and nothing
-      // after it, then is terminated, so its roster never arrives.
-      const cut = scenarioName === "attach-retry" && !firstSocketCut;
-      if (cut) firstSocketCut = true;
-      let cutDone = false;
-      return {
-        pull: connection.pull.pipe(
-          Effect.map((frames) => {
-            if (!cut) return frames;
-            if (cutDone) {
-              for (const frame of frames)
-                log(`attach-retry: dropped on the cut ws: ${frame.slice(0, 200)}`);
-              return [];
-            }
-            const index = frames.findIndex((frame) => frame.startsWith('{"type":"state"'));
-            if (index === -1) return frames;
-            cutDone = true;
-            const kept = frames.slice(0, index + 1);
-            const socket = latestSocket;
-            log(
-              `attach-retry: delivering ${kept.length} frame(s) up to state, dropping ${frames.length - kept.length}, terminating ws#${socketOrdinal}`,
-            );
-            setTimeout(() => socket?.terminate(), 0);
-            return kept;
+  request: Effect.fn("LiveCellDriver.request")(function* (input) {
+    log(
+      `>> ${input.method} ${input.url} headers=${JSON.stringify(redact(input.headers))}${input.body === undefined ? "" : ` body=${JSON.stringify(input.body)}`}`,
+    );
+    const isTaskCancel = input.method === "POST" && /\/tasks\/[^/]+\/cancel$/.test(input.url);
+    if (isTaskCancel) onTaskCancelSent?.({ url: input.url, headers: input.headers });
+    const response = yield* live.request(input).pipe(
+      Effect.tapError((error) =>
+        Effect.sync(() => log(`<< ${input.method} ${input.url} FAILED ${error.detail}`)),
+      ),
+      Effect.onInterrupt(() =>
+        Effect.sync(() => log(`<< ${input.method} ${input.url} abandoned before its answer`)),
+      ),
+    );
+    log(`<< ${response.status} ${input.method} ${input.url} ${response.body.slice(0, 600)}`);
+    if (input.method === "POST" && input.url.endsWith("/prompt") && response.status === 202) {
+      onPromptAccepted?.(response.body);
+    }
+    if (isTaskCancel) {
+      onTaskCancelAnswered?.({
+        url: input.url,
+        headers: input.headers,
+        status: response.status,
+        body: response.body,
+      });
+    }
+    return response;
+  }),
+  connect: Effect.fn("LiveCellDriver.connect")(function* (input) {
+    const wait = holdConnectUntil - Date.now();
+    if (wait > 0) {
+      log(`ws connect held for ${wait} ms (${input.url})`);
+      yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, wait)));
+    }
+    log(`ws connect ${input.url} headers=${JSON.stringify(redact(input.headers))}`);
+    const connection = yield* live.connect(input);
+    // attach-retry: the first connection delivers up to `state` and nothing
+    // after it, then is terminated, so its roster never arrives.
+    const cut = scenarioName === "attach-retry" && !firstSocketCut;
+    if (cut) firstSocketCut = true;
+    let cutDone = false;
+    return {
+      pull: connection.pull.pipe(
+        Effect.map((frames) => {
+          if (!cut) return frames;
+          if (cutDone) {
+            for (const frame of frames)
+              log(`attach-retry: dropped on the cut ws: ${frame.slice(0, 200)}`);
+            return [];
+          }
+          const index = frames.findIndex((frame) => frame.startsWith('{"type":"state"'));
+          if (index === -1) return frames;
+          cutDone = true;
+          const kept = frames.slice(0, index + 1);
+          const socket = latestSocket;
+          log(
+            `attach-retry: delivering ${kept.length} frame(s) up to state, dropping ${frames.length - kept.length}, terminating ws#${socketOrdinal}`,
+          );
+          setTimeout(() => socket?.terminate(), 0);
+          return kept;
+        }),
+        Effect.tap((frames) =>
+          Effect.sync(() => {
+            for (const frame of frames) log(`ws <- ${frame.slice(0, 700)}`);
           }),
-          Effect.tap((frames) =>
-            Effect.sync(() => {
-              for (const frame of frames) log(`ws <- ${frame.slice(0, 700)}`);
-            }),
-          ),
-          Effect.tapError((error) =>
-            Effect.sync(() =>
-              log(`ws pull ended: ${error.detail} closed=${error.closed ?? false}`),
-            ),
-          ),
         ),
-      };
-    }),
+        Effect.tapError((error) =>
+          Effect.sync(() => log(`ws pull ended: ${error.detail} closed=${error.closed ?? false}`)),
+        ),
+      ),
+    };
+  }),
 });
 
 const describeProjection = (projection: OrchestrationV2ThreadProjection) =>
@@ -296,24 +273,23 @@ const report = (name: string, projection: OrchestrationV2ThreadProjection) => {
   log(`---- projection ${name} (full copy at ${path}) ----\n${describeProjection(projection)}`);
 };
 
-const until = <E>(
+const until = Effect.fn("LiveCellDriver.until")(function* <E>(
   read: Effect.Effect<OrchestrationV2ThreadProjection, E>,
   ready: (value: OrchestrationV2ThreadProjection) => boolean,
   what: string,
-): Effect.Effect<OrchestrationV2ThreadProjection, E> =>
-  Effect.gen(function* () {
-    let last: OrchestrationV2ThreadProjection | undefined;
-    for (let attempt = 0; attempt < POLL_LIMIT; attempt++) {
-      last = yield* read;
-      if (ready(last)) return last;
-      yield* TestClock.withLive(Effect.sleep("10 millis"));
-    }
-    return yield* Effect.die(
-      new Error(
-        `Gave up waiting for ${what}:\n${last === undefined ? "(nothing read)" : describeProjection(last)}`,
-      ),
-    );
-  });
+) {
+  let last: OrchestrationV2ThreadProjection | undefined;
+  for (let attempt = 0; attempt < POLL_LIMIT; attempt++) {
+    last = yield* read;
+    if (ready(last)) return last;
+    yield* TestClock.withLive(Effect.sleep("10 millis"));
+  }
+  return yield* Effect.die(
+    new Error(
+      `Gave up waiting for ${what}:\n${last === undefined ? "(nothing read)" : describeProjection(last)}`,
+    ),
+  );
+});
 
 const strongHead = (projection: OrchestrationV2ThreadProjection) => {
   const head = projection.providerThreads[0]?.nativeConversationHeadRef;
@@ -458,11 +434,8 @@ const main = Effect.gen(function* () {
         );
         const taskId = decodeURIComponent(/\/tasks\/([^/]+)\/cancel$/.exec(sent.url)?.[1] ?? "");
         log(`delete-delegate: the cancel of task ${taskId} was sent`);
-        // The cell's state is read on its own: the adapter gives up on the
-        // answer after 3 s, while the cell has 30 s to carry the cancel out,
-        // and a cancelled task may leave the roster. The reads bypass the
-        // transport, which has no bound of its own: each gets what is left of
-        // one live-clock deadline, so a held one ends there.
+        // Read on its own: the adapter stops waiting after 3 s, the cell has 30 s to cancel, and the
+        // task may leave the roster. Each read gets what is left of one live-clock deadline.
         const tasksUrl = sent.url.replace(/\/tasks\/[^/]+\/cancel$/, "/tasks");
         const deadline = Date.now() + TASKS_READ_MS;
         let listed: string | undefined;

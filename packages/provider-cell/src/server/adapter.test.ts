@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
-import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as NodeWS from "@effect/platform-node/NodeWS";
 import {
   MessageId,
   NodeId,
@@ -68,7 +68,7 @@ const settingsFor = (baseUrl: string, token = "secret-token", enabled = true) =>
 const liveLayer = Layer.mergeAll(
   IdAllocator.layer,
   NodeHttpClient.layerUndici,
-  NodeSocket.layerWebSocketConstructorWS,
+  NodeWS.layerWebSocketConstructor,
 );
 const liveTransport = makeHttpCellTransport;
 
@@ -864,6 +864,7 @@ describe("CellAdapterV2 over the fake cell", () => {
         yield* Effect.promise(() => fake.onceIdle(project));
         const raced = yield* Effect.race(
           Effect.promise(() => connected).pipe(Effect.as("reconnected" as const)),
+          // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- proves that no reconnect happens; an absence has no event to await.
           Effect.sleep("150 millis").pipe(Effect.as("quiet" as const)),
         );
         assert.equal(raced, "quiet");
@@ -1840,6 +1841,7 @@ describe("CellAdapterV2 over a scripted socket", () => {
       assert.equal(terminal.status, "completed", failureOf(terminal)?.message);
       assert.deepEqual(assistantTexts(harness.allEvents), ["BEFORE_CLOSE"]);
       // The reconnect follows the first short-lived connection's 500 ms backoff.
+      // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- the scripted transport has no completion signal; the backoff runs on the live clock.
       yield* Effect.sleep("700 millis");
       controller.assertComplete();
     }).pipe(Effect.scoped, Effect.provide(scriptedLayer)),
@@ -2082,8 +2084,10 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
     readonly answerPrompt: (status: number, body?: string) => Effect.Effect<void>;
     /** Fails the next `POST prompt` at the transport, as a dropped socket would. */
     readonly failPrompt: (detail: string) => Effect.Effect<void>;
-    /** Answers the next `POST cancel`; without one queued, a cancel answers 204. */
+    /** Answers the next `POST cancel`; without one queued, a cancel answers 204. Status 0 fails it at the transport. */
     readonly answerCancel: (status: number, body?: string) => Effect.Effect<void>;
+    /** Leaves the next `POST cancel` unanswered for good. */
+    readonly holdCancel: Effect.Effect<void>;
     readonly replayRequests: Array<string>;
     /** The `x-request-id` of every prompt posted, in order. */
     readonly promptRequestIds: Array<string | undefined>;
@@ -2111,7 +2115,7 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
     Effect.gen(function* () {
       const incoming = yield* Queue.unbounded<ReadonlyArray<string> | "close">();
       const answers = yield* Queue.unbounded<Answer>();
-      const cancelAnswers = yield* Queue.unbounded<Answer>();
+      const cancelAnswers = yield* Queue.unbounded<Answer | "hold">();
       let opening: ReadonlyArray<Record<string, unknown>> = [];
       let replay: (
         after: number,
@@ -2152,7 +2156,16 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
           if (request.method === "POST" && url.pathname.endsWith("/cancel")) {
             cancels.push(request.headers["x-run-id"]);
             return Queue.poll(cancelAnswers).pipe(
-              Effect.map(Option.getOrElse((): Answer => ({ status: 204, body: "" }))),
+              Effect.map(Option.getOrElse((): Answer | "hold" => ({ status: 204, body: "" }))),
+              Effect.flatMap((answer) =>
+                answer === "hold"
+                  ? Effect.never
+                  : answer.status === 0
+                    ? Effect.fail(
+                        new CellTransportError({ operation: "POST cancel", detail: answer.body }),
+                      )
+                    : Effect.succeed(answer),
+              ),
             );
           }
           if (url.pathname.endsWith("/events")) {
@@ -2205,6 +2218,7 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
           Queue.offer(answers, { status: 0, body: detail }).pipe(Effect.asVoid),
         answerCancel: (status, body = "") =>
           Queue.offer(cancelAnswers, { status, body }).pipe(Effect.asVoid),
+        holdCancel: Queue.offer(cancelAnswers, "hold").pipe(Effect.asVoid),
         replayRequests,
         promptRequestIds,
         cancels,
@@ -2240,6 +2254,7 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
   /** Waits on the live clock until the cell has seen as many requests of a kind. */
   const awaitRequests = (count: () => number, expected: number) =>
     Effect.gen(function* () {
+      // oxlint-disable-next-line t3code/no-polling-loop-in-tests, t3code/no-real-time-wait-in-tests -- the driven cell's request counters expose no notification.
       while (count() < expected) yield* Effect.sleep("5 millis");
     });
   /** Starts a turn and leaves it waiting on its unanswered prompt. */
@@ -2929,6 +2944,7 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
             providerTurnId: activeTurnId(harness.allEvents),
           })
           .pipe(Effect.forkScoped);
+        // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- proves the cancel is held behind the replay; an absence has no event to await.
         yield* Effect.sleep("50 millis");
         assert.deepEqual(cell.cancels, [], "the cancel waits behind the replay");
         yield* Deferred.succeed(releaseReplay, undefined);
@@ -2941,6 +2957,104 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
         const wake = yield* runContinuation(harness, request, 2);
         assert.equal(wake.status, "completed", failureOf(wake)?.message);
         assert.deepEqual(assistantTexts(harness.allEvents, 2), ["WAKE"]);
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a Stop the cell does not confirm in time is reported unconfirmed, inside the session manager's bound, and a late done still ends the turn as interrupted",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        const harness = yield* makeHarness(cell.transport, "https://cell.test", {
+          adapterOptions: { requestTimeoutMs: 300 },
+        });
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+        yield* harness.takeEvent("provider_turn.updated");
+        yield* cell.send([{ type: "user", text: "Mine", runId: "A", seq: 1, origin: "user" }]);
+        yield* cell.answerCancel(204);
+        const stop = yield* harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: activeTurnId(harness.allEvents),
+          })
+          .pipe(Effect.flip);
+        assert.equal(stop._tag, "ProviderAdapterInterruptTimeoutError");
+        assert.deepEqual(cell.cancels, ["A"]);
+        assert.isFalse(
+          harness.allEvents.some((event) => event.type === "turn.terminal"),
+          "the unconfirmed turn stays open for the user to Force stop",
+        );
+        yield* cell.send([
+          {
+            type: "done",
+            runId: "A",
+            error: { code: "cancelled", message: "Cancelled." },
+            seq: 2,
+          },
+        ]);
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "interrupted");
+      }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
+  );
+
+  it.live(
+    "a Stop whose cancel is hung, lost or answered with any 5xx is reported unconfirmed like a missing done, and only a 4xx refuses it",
+    () =>
+      Effect.gen(function* () {
+        const cell = yield* driven();
+        cell.opensWith(prelude());
+        // Shorter than the 5 s cancel bound, so the request's own timeout is the one that fires.
+        const harness = yield* makeHarness(cell.transport, "https://cell.test", {
+          adapterOptions: { requestTimeoutMs: 300 },
+        });
+        yield* cell.answerPrompt(202, '{"runId":"A","seq":1}');
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Mine"));
+        yield* harness.takeEvent("provider_turn.updated");
+        yield* cell.send([{ type: "user", text: "Mine", runId: "A", seq: 1, origin: "user" }]);
+        const stop = harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: activeTurnId(harness.allEvents),
+          })
+          .pipe(Effect.flip);
+        yield* cell.holdCancel;
+        const hung = yield* stop;
+        assert.equal(hung._tag, "ProviderAdapterInterruptTimeoutError", hung.message);
+        yield* cell.answerCancel(0, "connection reset");
+        const lost = yield* stop;
+        assert.equal(lost._tag, "ProviderAdapterInterruptTimeoutError", lost.message);
+        // A 5xx says nothing about whether the cancel reached the run: the cell's own, or a gateway's.
+        const errors: ReadonlyArray<readonly [number, string]> = [
+          [500, '{"error":"no"}'],
+          [502, "<html><body>502 Bad Gateway</body></html>"],
+          [503, "Service Unavailable"],
+          [504, '{"runId":null,"error":"timed out"}'],
+        ];
+        for (const [status, body] of errors) {
+          yield* cell.answerCancel(status, body);
+          const unconfirmed = yield* stop;
+          assert.equal(unconfirmed._tag, "ProviderAdapterInterruptTimeoutError", `${status}`);
+        }
+        yield* cell.answerCancel(403, '{"runId":null,"error":"This cell is not yours"}');
+        const refused = yield* stop;
+        assert.equal(refused._tag, "ProviderAdapterInterruptError");
+        assert.deepEqual(cell.cancels, ["A", "A", "A", "A", "A", "A", "A"]);
+        assert.isFalse(
+          harness.allEvents.some((event) => event.type === "turn.terminal"),
+          "the unconfirmed turn stays open for the user to Force stop",
+        );
+        yield* cell.send([
+          {
+            type: "done",
+            runId: "A",
+            error: { code: "cancelled", message: "Cancelled." },
+            seq: 2,
+          },
+        ]);
+        const terminal = yield* harness.takeEvent("turn.terminal");
+        assert.equal(terminal.status, "interrupted");
       }).pipe(Effect.scoped, Effect.provide(drivenLayer)),
   );
 
@@ -3047,6 +3161,14 @@ describe("CellAdapterV2 over a hand-driven socket", () => {
           ),
           ["apply_patch failed"],
         );
+        const nodeIds = new Set(
+          harness.allEvents.flatMap((event) =>
+            event.type === "node.updated" ? [event.node.id] : [],
+          ),
+        );
+        for (const notice of itemsOfType(harness.allEvents, "system_notice")) {
+          assert.isTrue(nodeIds.has(notice.nodeId!), "a notice's node is published with it");
+        }
         yield* cell.answerPrompt(202, '{"runId":"B","seq":6}');
         yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Again", 2));
         yield* cell.send([{ type: "user", text: "Again", runId: "B", seq: 6, origin: "user" }]);

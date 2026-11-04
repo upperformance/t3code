@@ -39,7 +39,7 @@ class CellReplayTranscriptDecodeError extends Schema.TaggedError<CellReplayTrans
 }
 
 /** The base URL only shapes request URLs; replay matches paths, so any origin will do. */
-const CELL_REPLAY_SETTINGS = Schema.decodeUnknownSync(CellSettings)({
+const CELL_REPLAY_SETTINGS = Schema.decodeSync(CellSettings)({
   enabled: true,
   baseUrl: "https://cell.replay.test",
 });

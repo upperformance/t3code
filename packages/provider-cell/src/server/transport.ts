@@ -70,8 +70,8 @@ export const makeHttpCellTransport: Effect.Effect<
   const httpClient = yield* HttpClient.HttpClient;
   const webSocketConstructor = yield* Socket.WebSocketConstructor;
   return {
-    request: (input) =>
-      Effect.gen(function* () {
+    request: Effect.fn("CellTransport.request")(
+      function* (input) {
         const request = HttpClientRequest.make(input.method)(input.url, {
           headers: input.headers,
           ...(input.body === undefined
@@ -80,48 +80,50 @@ export const makeHttpCellTransport: Effect.Effect<
         });
         const response = yield* httpClient.execute(request);
         return { status: response.status, body: yield* response.text };
-      }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new CellTransportError({
-              operation: `${input.method} ${input.url}`,
-              detail: errorDetail(cause),
-              cause,
-            }),
-        ),
-      ),
-    connect: (input) =>
-      Effect.gen(function* () {
-        const socket = yield* Socket.makeWebSocket(input.url, {
-          headers: input.headers,
-          openTimeout: SOCKET_OPEN_TIMEOUT,
-        }).pipe(Effect.provideService(Socket.WebSocketConstructor, webSocketConstructor));
-        const reader = yield* socket.reader.pipe(
+      },
+      (effect, input) =>
+        effect.pipe(
           Effect.mapError(
             (cause) =>
               new CellTransportError({
-                operation: `connect ${input.url}`,
+                operation: `${input.method} ${input.url}`,
                 detail: errorDetail(cause),
                 cause,
               }),
           ),
-        );
-        return {
-          pull: reader.pull.pipe(
-            Effect.map((frames) =>
-              frames.map((frame) => (typeof frame === "string" ? frame : decoder.decode(frame))),
-            ),
-            Effect.mapError(
-              (cause) =>
-                new CellTransportError({
-                  operation: `read ${input.url}`,
-                  detail: errorDetail(cause),
-                  closed: true,
-                  cause,
-                }),
-            ),
+        ),
+    ),
+    connect: Effect.fn("CellTransport.connect")(function* (input) {
+      const socket = yield* Socket.makeWebSocket(input.url, {
+        headers: input.headers,
+        openTimeout: SOCKET_OPEN_TIMEOUT,
+      }).pipe(Effect.provideService(Socket.WebSocketConstructor, webSocketConstructor));
+      const reader = yield* socket.reader.pipe(
+        Effect.mapError(
+          (cause) =>
+            new CellTransportError({
+              operation: `connect ${input.url}`,
+              detail: errorDetail(cause),
+              cause,
+            }),
+        ),
+      );
+      return {
+        pull: reader.pull.pipe(
+          Effect.map((frames) =>
+            frames.map((frame) => (typeof frame === "string" ? frame : decoder.decode(frame))),
           ),
-        };
-      }),
+          Effect.mapError(
+            (cause) =>
+              new CellTransportError({
+                operation: `read ${input.url}`,
+                detail: errorDetail(cause),
+                closed: true,
+                cause,
+              }),
+          ),
+        ),
+      };
+    }),
   };
 });

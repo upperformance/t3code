@@ -1,11 +1,7 @@
 /**
- * The replay boundary for cell transcripts (`cell.http-ws`): outbound frames
- * are the HTTP requests and socket connects the adapter makes, inbound frames
- * are their responses and the events the socket delivered. The controller
- * walks the transcript in order on one promise chain: an outbound entry waits
- * for the adapter to make that request, inbound socket frames are delivered
- * as the walk reaches them, and a labelled frame can be held by a replay gate
- * until a scenario step releases it.
+ * The replay boundary for `cell.http-ws` transcripts: outbound entries are the adapter's requests
+ * and connects, inbound ones their answers and socket events. The controller walks the transcript
+ * in order; a labelled inbound frame can be held by a replay gate until a scenario step frees it.
  */
 import type { ProviderReplayEntry } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
@@ -24,12 +20,8 @@ import {
 export const CELL_REPLAY_PROTOCOL = "cell.http-ws";
 const PROJECT_PLACEHOLDER = "<project>";
 /**
- * Stands for the n-th distinct `x-request-id` the adapter sent, in inbound
- * frames: the recorder puts `<request-id:n>` where the cell echoed that id,
- * and replay binds each placeholder to the n-th distinct id the adapter sends,
- * so a transcript holds no minted id and a replayed opener, state or log page
- * carries exactly the id the adapter is looking for, even when one page
- * carries the openers of several turns.
+ * `<request-id:n>` stands for the n-th distinct `x-request-id` the adapter sent: the recorder writes
+ * it where the cell echoed that id and replay binds it back, so a transcript holds no minted id.
  */
 const requestIdPlaceholder = (index: number) => `<request-id:${index}>`;
 const REQUEST_ID_PLACEHOLDER_PATTERN = /<request-id:(\d+)>/g;
@@ -441,66 +433,64 @@ export function makeRecordingCellTransport(
     return label;
   };
   return {
-    request: (request) =>
-      Effect.gen(function* () {
-        const requestId = requestIdOf(request);
-        if (requestId !== undefined) requestIds.bind(requestId);
-        record("expect_outbound", {
-          kind: "http",
-          method: request.method,
-          path: anonymizeCellPath(requestPath(request.url)),
-          ...(request.body === undefined ? {} : { body: request.body }),
-        });
-        const response = yield* transport
-          .request(request)
-          .pipe(
+    request: Effect.fn("CellReplayRecorder.request")(function* (request) {
+      const requestId = requestIdOf(request);
+      if (requestId !== undefined) requestIds.bind(requestId);
+      record("expect_outbound", {
+        kind: "http",
+        method: request.method,
+        path: anonymizeCellPath(requestPath(request.url)),
+        ...(request.body === undefined ? {} : { body: request.body }),
+      });
+      const response = yield* transport
+        .request(request)
+        .pipe(
+          Effect.tapError((error) =>
+            Effect.sync(() =>
+              record("emit_inbound", { kind: "http_failure", detail: error.detail }),
+            ),
+          ),
+        );
+      record("emit_inbound", {
+        kind: "http_response",
+        status: response.status,
+        body: anonymizeRequestId(response.body),
+      });
+      return response;
+    }),
+    connect: Effect.fn("CellReplayRecorder.connect")(function* (input) {
+      record("expect_outbound", {
+        kind: "ws_connect",
+        path: anonymizeCellPath(requestPath(input.url)),
+      });
+      const connection = yield* transport.connect(input);
+      // One frame per pull, so a gated frame holds the ones behind it too.
+      const buffered: Array<string> = [];
+      const pull: CellSocketConnection["pull"] = Effect.gen(function* () {
+        if (buffered.length === 0) {
+          const frames = yield* connection.pull.pipe(
             Effect.tapError((error) =>
-              Effect.sync(() =>
-                record("emit_inbound", { kind: "http_failure", detail: error.detail }),
-              ),
+              Effect.sync(() => {
+                if (error.closed) record("emit_inbound", { kind: "ws_closed" });
+              }),
             ),
           );
-        record("emit_inbound", {
-          kind: "http_response",
-          status: response.status,
-          body: anonymizeRequestId(response.body),
-        });
-        return response;
-      }),
-    connect: (input) =>
-      Effect.gen(function* () {
-        record("expect_outbound", {
-          kind: "ws_connect",
-          path: anonymizeCellPath(requestPath(input.url)),
-        });
-        const connection = yield* transport.connect(input);
-        // One frame per pull, so a gated frame holds the ones behind it too.
-        const buffered: Array<string> = [];
-        const pull: CellSocketConnection["pull"] = Effect.gen(function* () {
-          if (buffered.length === 0) {
-            const frames = yield* connection.pull.pipe(
-              Effect.tapError((error) =>
-                Effect.sync(() => {
-                  if (error.closed) record("emit_inbound", { kind: "ws_closed" });
-                }),
-              ),
-            );
-            buffered.push(...frames);
-            if (buffered.length === 0) return [];
-          }
-          const frame = buffered.shift()!;
-          const event = yield* decodeEventFrame(anonymizeRequestId(frame)).pipe(
-            Effect.orElseSucceed((): unknown => frame),
-          );
-          const label = record("emit_inbound", { kind: "ws_event", event });
-          if (options.gate !== undefined) {
-            const gate = options.gate;
-            yield* Effect.promise((signal) => gate.beforeEmit(label, signal));
-          }
-          return [frame];
-        });
-        return { pull };
-      }),
+          buffered.push(...frames);
+          if (buffered.length === 0) return [];
+        }
+        const frame = buffered.shift()!;
+        const event = yield* decodeEventFrame(anonymizeRequestId(frame)).pipe(
+          Effect.orElseSucceed((): unknown => frame),
+        );
+        const label = record("emit_inbound", { kind: "ws_event", event });
+        if (options.gate !== undefined) {
+          const gate = options.gate;
+          yield* Effect.promise((signal) => gate.beforeEmit(label, signal));
+        }
+        return [frame];
+      });
+      return { pull };
+    }),
   };
 }
 

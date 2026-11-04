@@ -1,24 +1,12 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off - a recorder: it drives live I/O under the test clock.
 /**
- * Records a `cell.http-ws` transcript for one shared fixture by running the
- * real orchestrator and adapter against a cell over the network, then
- * verifies the recording by replaying it. Pass `--url https://<tenant>` to
- * record against a tenant; without it the fake cell from
- * `@t3tools/provider-cell/testing` answers on a local port.
- *
- *   node scripts/record-cell-replay-fixture.ts --scenario <name> [--url <cell> --version <cell version>] [--token t] [--out <file> | --write-fixture]
- *
- * The recording goes to `--out`, to the checked-in transcript with
- * `--write-fixture`, and otherwise to a scratch directory. It is written to
- * `<path>.partial` and only takes `<path>`'s place once its replay verified
- * it, so a failed recording never replaces a transcript; the failed one stays
- * at `<path>.partial` for inspection, which git ignores beside the fixtures
- * (apps/server/.gitignore). A live recording for the checked-in
- * transcript needs `--version`, the version the cell reports in `GET state`.
+ * Records a `cell.http-ws` transcript for one fixture against a cell (`--url`) or the fake cell, then
+ * verifies it by replay; it lands at `<path>.partial` and replaces `<path>` only once verified.
+ * Usage and flags: docs/internals/provider-cell.md (Testing).
  */
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as NodeWS from "@effect/platform-node/NodeWS";
 import type { ProviderReplayEntry, ProviderReplayTranscript } from "@t3tools/contracts";
 import { makeHttpCellTransport } from "@t3tools/provider-cell/server";
 import { CellSettings } from "@t3tools/provider-cell/settings";
@@ -236,7 +224,7 @@ await Effect.runPromise(
       Layer.mergeAll(
         NodeServices.layer,
         NodeHttpClient.layerUndici,
-        NodeSocket.layerWebSocketConstructorWS,
+        NodeWS.layerWebSocketConstructor,
       ),
     ),
   ),

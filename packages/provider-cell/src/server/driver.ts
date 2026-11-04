@@ -1,5 +1,5 @@
 import { ProviderDriverKind } from "@t3tools/contracts";
-import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as NodeWS from "@effect/platform-node/NodeWS";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/http/HttpClient";
@@ -53,15 +53,15 @@ export type CellDriverEnv = CellAdapterV2DriverEnv | ProviderHost.ProviderHost;
 
 const makeTransport = makeHttpCellTransport.pipe(
   // The ws-backed constructor carries the bearer token on the handshake; the global one cannot.
-  Effect.provide(NodeSocket.layerWebSocketConstructorWS),
+  Effect.provide(NodeWS.layerWebSocketConstructor),
 );
 
-export const CellAdapterV2Driver: ProviderAdapterDriver<CellSettings, CellAdapterV2DriverEnv> = {
+const CellAdapterV2Driver: ProviderAdapterDriver<CellSettings, CellAdapterV2DriverEnv> = {
   driverKind: DRIVER_KIND,
   configSchema: CellSettings,
   defaultConfig: () => decodeCellSettings({}),
-  create: ({ instanceId, enabled, config }) =>
-    Effect.gen(function* () {
+  create: Effect.fn("CellAdapterV2Driver.create")(
+    function* ({ instanceId, enabled, config }) {
       const eventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
       const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
       const transport = yield* makeTransport;
@@ -72,17 +72,20 @@ export const CellAdapterV2Driver: ProviderAdapterDriver<CellSettings, CellAdapte
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
         continuationRequests,
       });
-    }).pipe(
-      Effect.mapError(
-        (cause) =>
-          new ProviderAdapterDriverCreateError({
-            driver: DRIVER_KIND,
-            instanceId,
-            detail: "Failed to build the cell orchestration adapter.",
-            cause,
-          }),
+    },
+    (effect, { instanceId }) =>
+      effect.pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterDriverCreateError({
+              driver: DRIVER_KIND,
+              instanceId,
+              detail: "Failed to build the cell orchestration adapter.",
+              cause,
+            }),
+        ),
       ),
-    ),
+  ),
 };
 
 export const CellDriver: ProviderDriver<CellSettings, CellDriverEnv> = {
@@ -90,71 +93,77 @@ export const CellDriver: ProviderDriver<CellSettings, CellDriverEnv> = {
   metadata: { displayName: "Cell", supportsMultipleInstances: true, hasDefaultInstance: false },
   configSchema: CellSettings,
   defaultConfig: () => decodeCellSettings({}),
-  create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
-    Effect.gen(function* () {
-      const effectiveConfig = { ...config, enabled } satisfies CellSettings;
-      const continuationIdentity = defaultProviderContinuationIdentity({
-        driverKind: DRIVER_KIND,
-        instanceId,
-      });
-      const stampIdentity = withInstanceIdentity({
-        instanceId,
-        driverKind: DRIVER_KIND,
-        displayName,
-        accentColor,
-        continuationGroupKey: continuationIdentity.continuationKey,
-      });
-      const transport = yield* makeTransport;
-      const snapshotSettings = yield* makeProviderSnapshotSettingsSource(effectiveConfig);
-      const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<CellSettings>>({
-        resolveMaintenance: () => Effect.succeed(MAINTENANCE),
-        getSettings: snapshotSettings.getSettings,
-        streamSettings: snapshotSettings.streamSettings,
-        haveSettingsChanged: haveProviderSnapshotSettingsChanged,
-        initialSnapshot: (settings) =>
-          makePendingCellProvider(settings.provider).pipe(Effect.map(stampIdentity)),
-        checkProvider: checkCellProviderStatus(effectiveConfig, transport).pipe(
-          Effect.map(stampIdentity),
-        ),
-      }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderDriverError({
-              driver: DRIVER_KIND,
-              instanceId,
-              detail: "Failed to build the cell snapshot.",
-              cause,
-            }),
-        ),
-      );
-      const orchestrationAdapter = yield* CellAdapterV2Driver.create({
-        instanceId,
-        displayName,
-        accentColor,
-        environment,
-        enabled,
-        config,
-      }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderDriverError({
-              driver: DRIVER_KIND,
-              instanceId,
-              detail: "Failed to build the cell orchestration adapter.",
-              cause,
-            }),
-        ),
-      );
-      return {
-        instanceId,
-        driverKind: DRIVER_KIND,
-        continuationIdentity,
-        displayName,
-        accentColor,
-        enabled,
-        snapshot,
-        orchestrationAdapter,
-        textGeneration: cellTextGeneration,
-      } satisfies ProviderInstance;
-    }),
+  create: Effect.fn("CellDriver.create")(function* ({
+    instanceId,
+    displayName,
+    accentColor,
+    environment,
+    enabled,
+    config,
+  }) {
+    const effectiveConfig = { ...config, enabled } satisfies CellSettings;
+    const continuationIdentity = defaultProviderContinuationIdentity({
+      driverKind: DRIVER_KIND,
+      instanceId,
+    });
+    const stampIdentity = withInstanceIdentity({
+      instanceId,
+      driverKind: DRIVER_KIND,
+      displayName,
+      accentColor,
+      continuationGroupKey: continuationIdentity.continuationKey,
+    });
+    const transport = yield* makeTransport;
+    const snapshotSettings = yield* makeProviderSnapshotSettingsSource(effectiveConfig);
+    const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<CellSettings>>({
+      resolveMaintenance: () => Effect.succeed(MAINTENANCE),
+      getSettings: snapshotSettings.getSettings,
+      streamSettings: snapshotSettings.streamSettings,
+      haveSettingsChanged: haveProviderSnapshotSettingsChanged,
+      initialSnapshot: (settings) =>
+        makePendingCellProvider(settings.provider).pipe(Effect.map(stampIdentity)),
+      checkProvider: checkCellProviderStatus(effectiveConfig, transport).pipe(
+        Effect.map(stampIdentity),
+      ),
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderDriverError({
+            driver: DRIVER_KIND,
+            instanceId,
+            detail: "Failed to build the cell snapshot.",
+            cause,
+          }),
+      ),
+    );
+    const orchestrationAdapter = yield* CellAdapterV2Driver.create({
+      instanceId,
+      displayName,
+      accentColor,
+      environment,
+      enabled,
+      config,
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderDriverError({
+            driver: DRIVER_KIND,
+            instanceId,
+            detail: "Failed to build the cell orchestration adapter.",
+            cause,
+          }),
+      ),
+    );
+    return {
+      instanceId,
+      driverKind: DRIVER_KIND,
+      continuationIdentity,
+      displayName,
+      accentColor,
+      enabled,
+      snapshot,
+      orchestrationAdapter,
+      textGeneration: cellTextGeneration,
+    } satisfies ProviderInstance;
+  }),
 };
