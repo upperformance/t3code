@@ -48,7 +48,10 @@ the tenant's operator may set others.
   takes one project for good, and so does provider status's check; deleting a
   thread frees none. Once the tenant is full, a new thread's first message is
   refused: ask the operator to delete projects. A helper cell's place comes
-  back when its task is removed from the task list on the project's page.
+  back once the tenant has released it: its task shows "child released", or
+  you removed the task (**Remove** in the agent panel's task list) and the
+  cleanup that follows went through. If the place stays taken, ask the
+  operator to delete the helper's project.
 
 ## How a cell thread works
 
@@ -88,7 +91,8 @@ each, in order.
 ## Status
 
 Provider status checks that the tenant answers, that it accepts the access
-token, and whether it has a model API key. If the tenant is unreachable, messages fail until it is back.
+token, and whether it has a model API key. If the tenant is unreachable,
+messages fail until it is back.
 
 T3 Code needs a tenant that speaks cell protocol 3 or later. An older
 tenant shows an error in provider status naming the protocol it speaks and the
